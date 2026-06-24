@@ -1628,3 +1628,29 @@ Stage Summary:
 - Commit: e1c786e en main
 - Usuario debe reintentar el deploy en Coolify (mismo Dockerfile, solo cambió
   el código del repo que el git clone trae automáticamente)
+
+---
+Task ID: fix-docker-cache
+Agent: main (Z.ai Code)
+Task: Diagnosticar por qué el segundo deploy falló igual que el primero.
+El fix force-dynamic estaba en el repo pero el build seguía fallando.
+
+Work Log:
+- Analicé el segundo log de Coolify:
+  * "Export encountered an error on /page: /, exiting the build." (mismo error)
+  * PERO mirando las capas: "#11 [deps 2/4] RUN git clone ... #11 CACHED"
+  * Docker cacheó el git clone porque la URL no cambió → usó código viejo
+    sin el fix force-dynamic
+- Fix: añadí `ARG CACHEBUST=1` antes del git clone en el Dockerfile.
+  El usuario cambia CACHEBUST=1 → 2 → 3... en Coolify cada vez que
+  hace push de nuevo código, forzando un fresh git clone.
+- Commit: "Add ARG CACHEBUST to force fresh git clone on deploy"
+- Push exitoso: e1c786e..4f1475c main -> main
+
+Stage Summary:
+- Dockerfile actualizado con ARG CACHEBUST=1
+- Commit: 4f1475c en main
+- El usuario debe:
+  1. Re-pegar el Dockerfile actualizado en Coolify (con ARG CACHEBUST=1)
+  2. Cada vez que haga push de código nuevo y quiera redeployar, cambiar
+     CACHEBUST=1 a un número mayor (2, 3, 4...) en el editor de Coolify
