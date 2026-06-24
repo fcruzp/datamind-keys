@@ -1957,3 +1957,60 @@ Unresolved Issues / Risks:
 - The "undefined" stats display may still appear if the usage API returns
   401 (unauthenticated) — but user confirmed no console errors, so the
   API is likely returning 200 with proper data.
+
+---
+Task ID: 9 (main agent — debug 503 on API key creation)
+Agent: main (Z.ai Code)
+Task: User reports 503 error when creating an API key:
+"POST https://datamind-api.mooo.com/api/settings/api-keys 503 (Service Unavailable)"
+
+Work Log:
+- Read POST /api/settings/api-keys route + session.ts + api-auth.ts
+- Fetched BIweb's actual Prisma schema from GitHub — confirmed our schema
+  matches EXACTLY (api_keys columns: id, user_id, key_hash, key_prefix,
+  label, scopes, revoked_at, last_used_at, last_used_ip, expires_at,
+  created_at). Schema mismatch is NOT the cause.
+- Root cause analysis: the 503 comes from withDbSafe catching a Prisma error,
+  but the original error was hidden (only logged server-side, not in the
+  response body). The user can't see what's actually failing.
+- Most likely causes (hypotheses):
+  1. user.id is empty (getCurrentUser fallback) → FK constraint P2003
+  2. api_keys table doesn't exist (P2021) → but GET returns empty via fallback
+  3. RLS policy blocking insert (if DATABASE_URL uses anon role)
+  4. settings_audit_logs table missing (but writeAuditLog catches this)
+- Implemented 3 diagnostic improvements:
+  1. withDbSafe now includes prismaCode + message + meta in ALL error
+     responses (GET 200 fallback AND POST 503). User can see the exact
+     Prisma error in DevTools → Network → Response.
+  2. New endpoint GET /api/debug/db-health — comprehensive diagnostic:
+     - DB connectivity (SELECT 1)
+     - Auth/session state (userId, supabaseId, email)
+     - Table existence for users, api_keys, api_request_logs,
+       settings_audit_logs (count query per table)
+     - Write test: tries to INSERT into api_keys + immediately DELETE
+       (surfaces the EXACT error the real POST would get)
+  3. POST /api/settings/api-keys now logs user state (id, supabaseId,
+     idLength) and returns a clear error if user.id is empty.
+- bun run lint → clean
+- Committed: a65f6a7
+- Pushed to GitHub main
+
+Stage Summary:
+- Diagnostic tooling deployed. User needs to:
+  1. Bump CACHEBUST → 8 in Coolify
+  2. Redeploy
+  3. While logged in, open: https://datamind-api.mooo.com/api/debug/db-health
+  4. Send me the JSON output — it will tell us EXACTLY what's broken
+  5. Also retry creating an API key — the 503 response now includes
+     errorDetail.prismaCode + message in the Response body (DevTools →
+     Network → click the failed POST → Response tab)
+
+Unresolved Issues / Risks:
+- Until we see the db-health output, we can't be 100% sure of the root cause
+- Most likely fix will be one of:
+  a) If user.id is empty → the users table insert is failing; need to check
+     if the table exists or if RLS is blocking
+  b) If api_keys table doesn't exist → need to run prisma db push (requires
+     DIRECT_URL marked as "Available at Buildtime" in Coolify)
+  c) If RLS is blocking → need to use the service_role key in the DATABASE_URL
+     or add an RLS policy that allows the postgres role to insert
