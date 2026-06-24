@@ -4,6 +4,7 @@ import {
   requireScope,
   getClientIp,
   logApiRequest,
+  rateLimitHeaders,
 } from '@/lib/api-auth'
 
 // GET /api/public/v1/datasources
@@ -12,11 +13,17 @@ export async function GET(req: Request) {
   const started = Date.now()
   const auth = await authenticateApiKey(req)
   if (!auth.ok) {
-    return NextResponse.json({ error: auth.error }, { status: auth.status })
+    return NextResponse.json(
+      { error: auth.error },
+      { status: auth.status, headers: rateLimitHeaders(auth) },
+    )
   }
   const scoped = requireScope(auth, 'read')
   if (!scoped.ok) {
-    return NextResponse.json({ error: scoped.error }, { status: scoped.status })
+    return NextResponse.json(
+      { error: scoped.error },
+      { status: scoped.status, headers: rateLimitHeaders(auth) },
+    )
   }
 
   // Demo data — in real DataMind BI this would query the `DataSource` table.
@@ -62,9 +69,12 @@ export async function GET(req: Request) {
     ip: getClientIp(req),
   })
 
-  return NextResponse.json({
-    ok: true,
-    count: datasources.length,
-    datasources,
-  })
+  return NextResponse.json(
+    {
+      ok: true,
+      count: datasources.length,
+      datasources,
+    },
+    { headers: rateLimitHeaders(auth) },
+  )
 }

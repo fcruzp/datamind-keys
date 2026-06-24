@@ -22,6 +22,8 @@ import {
   Github,
   BookOpen,
   Webhook,
+  Terminal,
+  ScrollText,
 } from 'lucide-react'
 import { useTheme } from 'next-themes'
 
@@ -40,11 +42,13 @@ export function CommandPalette({
   onOpenChange,
   onCreateKey,
   onOpenRevoked,
+  onCopyCurl,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   onCreateKey: () => void
   onOpenRevoked: () => void
+  onCopyCurl: () => void
 }) {
   const { setTheme } = useTheme()
 
@@ -69,12 +73,37 @@ export function CommandPalette({
         icon: <FlaskConical className="size-4" />,
         onSelect: () => {
           onOpenChange(false)
-          // Scroll to keys table; test popover is per-row
           document
             .getElementById('keys-section')
             ?.scrollIntoView({ behavior: 'smooth' })
         },
         keywords: 'test verify validate check',
+        group: 'actions',
+      },
+      {
+        id: 'copy-curl',
+        label: 'Copy curl example',
+        description: 'Copy a curl template for /api/public/v1/me',
+        icon: <Terminal className="size-4" />,
+        onSelect: () => {
+          onOpenChange(false)
+          onCopyCurl()
+        },
+        keywords: 'copy curl example template terminal shell',
+        group: 'actions',
+      },
+      {
+        id: 'scroll-keys',
+        label: 'Jump to API keys table',
+        description: 'Scroll to the active keys list',
+        icon: <ScrollText className="size-4" />,
+        onSelect: () => {
+          onOpenChange(false)
+          document
+            .getElementById('keys-section')
+            ?.scrollIntoView({ behavior: 'smooth' })
+        },
+        keywords: 'scroll jump goto keys table',
         group: 'actions',
       },
       {
@@ -156,7 +185,7 @@ export function CommandPalette({
         group: 'navigate',
       },
     ],
-    [onOpenChange, onCreateKey, onOpenRevoked, setTheme],
+    [onOpenChange, onCreateKey, onOpenRevoked, onCopyCurl, setTheme],
   )
 
   return (
@@ -226,7 +255,11 @@ export function CommandPalette({
 /**
  * Hook that wires up the Cmd/Ctrl+K shortcut and exposes the dialog state.
  */
-export function useCommandPalette(onCreateKey: () => void, onOpenRevoked: () => void) {
+export function useCommandPalette(
+  onCreateKey: () => void,
+  onOpenRevoked: () => void,
+  onCopyCurl: () => void,
+) {
   const [open, setOpen] = React.useState(false)
 
   React.useEffect(() => {
@@ -246,8 +279,18 @@ export function useCommandPalette(onCreateKey: () => void, onOpenRevoked: () => 
       onOpenChange={setOpen}
       onCreateKey={onCreateKey}
       onOpenRevoked={onOpenRevoked}
+      onCopyCurl={onCopyCurl}
     />
   )
 
   return { open, setOpen, palette }
+}
+
+/**
+ * Default curl template the "Copy curl example" action copies to clipboard.
+ * The caller passes a host so the example is correct in any environment.
+ */
+export function buildCurlExample(host = 'https://datamind.mooo.com'): string {
+  return `curl ${host}/api/public/v1/me \\
+  -H "Authorization: Bearer dm_live_YOUR_KEY_HERE"`
 }

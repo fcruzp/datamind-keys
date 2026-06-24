@@ -5,6 +5,7 @@ import {
   requireScope,
   getClientIp,
   logApiRequest,
+  rateLimitHeaders,
 } from '@/lib/api-auth'
 
 // POST /api/public/v1/queries
@@ -23,11 +24,17 @@ export async function POST(req: Request) {
   const started = Date.now()
   const auth = await authenticateApiKey(req)
   if (!auth.ok) {
-    return NextResponse.json({ error: auth.error }, { status: auth.status })
+    return NextResponse.json(
+      { error: auth.error },
+      { status: auth.status, headers: rateLimitHeaders(auth) },
+    )
   }
   const scoped = requireScope(auth, 'execute')
   if (!scoped.ok) {
-    return NextResponse.json({ error: scoped.error }, { status: scoped.status })
+    return NextResponse.json(
+      { error: scoped.error },
+      { status: scoped.status, headers: rateLimitHeaders(auth) },
+    )
   }
 
   let body: unknown
@@ -74,12 +81,15 @@ export async function POST(req: Request) {
     ip: getClientIp(req),
   })
 
-  return NextResponse.json({
-    ok: true,
-    sql,
-    datasourceId: parsed.datasourceId ?? 'demo',
-    rowCount: rows.length,
-    durationMs,
-    rows,
-  })
+  return NextResponse.json(
+    {
+      ok: true,
+      sql,
+      datasourceId: parsed.datasourceId ?? 'demo',
+      rowCount: rows.length,
+      durationMs,
+      rows,
+    },
+    { headers: rateLimitHeaders(auth) },
+  )
 }

@@ -59,21 +59,33 @@ import { RevokedKeysAudit } from './revoked-keys-audit'
 import { ScopeBadgeList } from './scope-badge'
 import { TestKeyPopover } from './test-key-popover'
 import { UsageHistogram } from './usage-chart'
-import { useCommandPalette } from './command-palette'
+import { useCommandPalette, buildCurlExample } from './command-palette'
+import { useRowKeyboardNav } from './use-row-keyboard-nav'
 import type { ApiKeyListItem, CreatedApiKey, UsageData } from './types'
 import { cn } from '@/lib/utils'
 
 export function ApiKeysManager() {
   const qc = useQueryClient()
   const [revealKey, setRevealKey] = React.useState<CreatedApiKey | null>(null)
-
-  // Refs for the command palette to drive
   const createKeyRef = React.useRef<HTMLButtonElement>(null)
   const revokedRef = React.useRef<HTMLDivElement>(null)
+
+  const handleCopyCurl = React.useCallback(async () => {
+    const host =
+      typeof window !== 'undefined' ? window.location.origin : 'https://datamind.mooo.com'
+    const example = buildCurlExample(host)
+    try {
+      await navigator.clipboard.writeText(example)
+      toast.success('curl example copied to clipboard')
+    } catch {
+      toast.error('Copy failed — select and copy manually')
+    }
+  }, [])
 
   const { palette } = useCommandPalette(
     () => createKeyRef.current?.click(),
     () => revokedRef.current?.scrollIntoView({ behavior: 'smooth' }),
+    handleCopyCurl,
   )
 
   const keysQuery = useQuery({
@@ -127,6 +139,8 @@ export function ApiKeysManager() {
   const keys = keysQuery.data ?? []
   const usage = usageQuery.data
 
+  const keyboardNav = useRowKeyboardNav(keys.map((k) => k.id))
+
   return (
     <div className="space-y-6">
       {/* Stats row */}
@@ -152,6 +166,13 @@ export function ApiKeysManager() {
             </div>
             <p className="text-xs text-muted-foreground">
               Keys are SHA-256 hashed at rest. Plaintext is shown only at creation.
+              {keys.length > 0 && (
+                <span className="ml-2 hidden sm:inline-flex items-center gap-1 text-[10px]">
+                  <kbd className="rounded border border-border bg-background px-1 py-0.5 font-mono">↑</kbd>
+                  <kbd className="rounded border border-border bg-background px-1 py-0.5 font-mono">↓</kbd>
+                  to navigate
+                </span>
+              )}
             </p>
           </div>
           <CreateApiKeyDialog
@@ -173,7 +194,7 @@ export function ApiKeysManager() {
           ) : keys.length === 0 ? (
             <EmptyState onCreate={(k) => setRevealKey(k)} />
           ) : (
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto" {...keyboardNav.containerProps}>
               <Table>
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
@@ -188,19 +209,21 @@ export function ApiKeysManager() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {keys.map((key) => (
-                    <KeyRow
-                      key={key.id}
-                      apiKey={key}
-                      histogram24h={
-                        usage?.perKey.find((p) => p.apiKeyId === key.id)
-                          ?.histogram24h ?? []
-                      }
-                      onRevoke={(id) => revokeMutation.mutate(id)}
-                      onCopyMasked={() => copyMasked(key)}
-                      revoking={revokeMutation.isPending}
-                    />
-                  ))}
+                  {keys.map((key) => {
+                    const perKey = usage?.perKey.find((p) => p.apiKeyId === key.id)
+                    return (
+                      <KeyRow
+                        key={key.id}
+                        apiKey={key}
+                        histogram24h={perKey?.histogram24h ?? []}
+                        count7d={perKey?.count ?? 0}
+                        isActive={keyboardNav.activeRowId === key.id}
+                        onRevoke={(id) => revokeMutation.mutate(id)}
+                        onCopyMasked={() => copyMasked(key)}
+                        revoking={revokeMutation.isPending}
+                      />
+                    )
+                  })}
                 </TableBody>
               </Table>
             </div>
@@ -368,12 +391,16 @@ function EmptyState({ onCreate }: { onCreate: (key: CreatedApiKey) => void }) {
 function KeyRow({
   apiKey,
   histogram24h,
+  count7d,
+  isActive,
   onRevoke,
   onCopyMasked,
   revoking,
 }: {
   apiKey: ApiKeyListItem
   histogram24h: number[]
+  count7d: number
+  isActive: boolean
   onRevoke: (id: string) => void
   onCopyMasked: () => void
   revoking: boolean
@@ -384,7 +411,13 @@ function KeyRow({
   const total24h = histogram24h.reduce((a, b) => a + b, 0)
 
   return (
-    <TableRow className="group">
+    <TableRow
+      data-row-id={apiKey.id}
+      className={cn(
+        'group transition-colors',
+        isActive && 'bg-emerald-500/[0.04] shadow-[inset_2px_0_0_0_rgb(16_185_129)]',
+      )}
+    >
       <TableCell className="pl-6 py-3 align-top">
         <div className="font-medium text-sm">{apiKey.label}</div>
         <div className="flex flex-wrap items-center gap-1 mt-1">
@@ -458,11 +491,15 @@ function KeyRow({
               <InlineSparkline data={histogram24h} />
               <span className="text-[10px] text-muted-foreground tabular-nums">
                 {total24h}
+                {count7d > total24h && (
+                  <span className="text-muted-foreground/60"> / {count7d}</span>
+                )}
               </span>
             </div>
           </TooltipTrigger>
           <TooltipContent side="top" className="text-xs">
-            {total24h} request{total24h === 1 ? '' : 's'} in last 24h
+            <div>{total24h} request{total24h === 1 ? '' : 's'} in last 24h</div>
+            <div className="text-muted-foreground">{count7d} in last 7 days</div>
           </TooltipContent>
         </Tooltip>
       </TableCell>

@@ -30,12 +30,24 @@ export interface AuthSuccess {
   ok: true
   user: AuthenticatedUser
   apiKey: AuthenticatedApiKey
+  /** Rate-limit info to be exposed as X-RateLimit-* headers by the route. */
+  rateLimit: {
+    limit: number
+    remaining: number
+    retryAfter: null
+  }
 }
 
 export interface AuthFailure {
   ok: false
   error: string
   status: number
+  /** Set only when status === 429. */
+  rateLimit?: {
+    limit: number
+    remaining: 0
+    retryAfter: number
+  }
 }
 
 export type AuthResult = AuthSuccess | AuthFailure
@@ -211,12 +223,19 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
   }
 
   // Rate limit (token bucket per key)
-  const rate = checkRateLimit(apiKey.id, apiKey.rateLimitPerMinute)
+  const rateLimitPerMinute = apiKey.rateLimitPerMinute
+  const limit = rateLimitPerMinute ?? DEFAULT_RATE_LIMIT_PER_MINUTE
+  const rate = checkRateLimit(apiKey.id, rateLimitPerMinute)
   if (!rate.ok) {
     return {
       ok: false,
       error: `Rate limit exceeded. Try again in ${rate.retryAfter}s.`,
       status: 429,
+      rateLimit: {
+        limit,
+        remaining: 0,
+        retryAfter: rate.retryAfter,
+      },
     }
   }
 
@@ -244,9 +263,31 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
       prefix: apiKey.keyPrefix,
       lastUsedAt: apiKey.lastUsedAt,
       allowedIps: allowlist,
-      rateLimitPerMinute: apiKey.rateLimitPerMinute,
+      rateLimitPerMinute,
+    },
+    rateLimit: {
+      limit,
+      remaining: rate.remaining,
+      retryAfter: null,
     },
   }
+}
+
+/**
+ * Builds the standard rate-limit headers to attach to public API responses.
+ * Works for both success (200) and rate-limited (429) responses.
+ */
+export function rateLimitHeaders(auth: AuthResult): Record<string, string> {
+  if (!auth.rateLimit) return {}
+  const { limit, remaining, retryAfter } = auth.rateLimit
+  const headers: Record<string, string> = {
+    'X-RateLimit-Limit': String(limit),
+    'X-RateLimit-Remaining': String(remaining),
+  }
+  if (retryAfter !== null) {
+    headers['Retry-After'] = String(retryAfter)
+  }
+  return headers
 }
 
 // ---------------------------------------------------------------------------
@@ -306,8 +347,8 @@ export function serializeAllowedIps(ips: string[]): string {
 /**
  * Validates a client IP against the key's allowlist.
  * - Empty allowlist → allow all
- * - Otherwise the IP must match exactly OR fall within a CIDR range (e.g. "10.0.0.0/8")
- *   IPv4 only for simplicity; IPv6 exact-match only.
+ * - Otherwise the IP must match exactly OR fall within a CIDR range
+ *   Supports both IPv4 (e.g. "10.0.0.0/8") and IPv6 (e.g. "2001:db8::/32").
  *
  * Returns true if allowed (or if allowlist is empty / client IP unknown).
  */
@@ -319,16 +360,22 @@ export function isIpAllowed(clientIp: string | null, allowlist: string[]): boole
   const ip = clientIp.startsWith('::ffff:') ? clientIp.slice(7) : clientIp
 
   for (const rule of allowlist) {
-    if (rule === ip) return true
+    if (rule === ip || rule === clientIp) return true
     if (rule.includes('/')) {
-      // CIDR
-      if (ipInCidr(ip, rule)) return true
+      // CIDR — dispatch by IP version
+      const isV4 = ip.includes('.') && !ip.includes(':')
+      const ruleIsV4 = rule.includes('.') && !rule.includes(':')
+      if (isV4 && ruleIsV4) {
+        if (ipInV4Cidr(ip, rule)) return true
+      } else if (!isV4 && !ruleIsV4) {
+        if (ipInV6Cidr(ip, rule)) return true
+      }
     }
   }
   return false
 }
 
-function ipInCidr(ip: string, cidr: string): boolean {
+function ipInV4Cidr(ip: string, cidr: string): boolean {
   const [base, bitsStr] = cidr.split('/')
   if (!base || !bitsStr) return false
   const bits = parseInt(bitsStr, 10)
@@ -347,6 +394,87 @@ function ipInCidr(ip: string, cidr: string): boolean {
   // Note: the >>> 0 coerces to unsigned 32-bit (the bitwise ops above produce signed)
   const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
   return (ipNum >>> 0) & mask === (baseNum >>> 0) & mask
+}
+
+/**
+ * IPv6 CIDR check using BigInt (128-bit). Normalizes both IPs to full
+ * 8-group hex form before comparing.
+ */
+function ipInV6Cidr(ip: string, cidr: string): boolean {
+  const [base, bitsStr] = cidr.split('/')
+  if (!base || !bitsStr) return false
+  const bits = parseInt(bitsStr, 10)
+  if (isNaN(bits) || bits < 0 || bits > 128) return false
+
+  const ipBig = ipv6ToBigInt(ip)
+  const baseBig = ipv6ToBigInt(base)
+  if (ipBig === null || baseBig === null) return false
+
+  if (bits === 0) return true
+  if (bits === 128) return ipBig === baseBig
+
+  // Build a 128-bit mask: top `bits` bits set, rest 0
+  const mask = 0xffff_ffff_ffff_ffffn << 64n | 0xffff_ffff_ffff_ffffn
+  const shift = BigInt(128 - bits)
+  const maskShifted = (mask >> shift) << shift
+  return (ipBig & maskShifted) === (baseBig & maskShifted)
+}
+
+/**
+ * Converts an IPv6 address (possibly compressed, with ::) to a BigInt.
+ * Returns null if the input is not a valid IPv6 address.
+ */
+function ipv6ToBigInt(ip: string): bigint | null {
+  // Handle IPv4-mapped IPv6 (::ffff:1.2.3.4)
+  const v4MappedMatch = ip.match(/^(.*):(\d+)\.(\d+)\.(\d+)\.(\d+)$/)
+  if (v4MappedMatch) {
+    const [, prefix, a, b, c, d] = v4MappedMatch
+    const v4Part =
+      (BigInt(a!) << 24n) | (BigInt(b!) << 16n) | (BigInt(c!) << 8n) | BigInt(d!)
+    const v6Part = ipv6GroupsToBigInt(expandV6Groups(prefix || ''))
+    if (v6Part === null) return null
+    // Last 32 bits come from v4Part, prefix is the first 96 bits
+    const maskHigh96 = 0xffff_ffff_ffff_ffffn << 64n | 0xffff_ffff_0000_0000n
+    return (v6Part & maskHigh96) | v4Part
+  }
+
+  const groups = expandV6Groups(ip)
+  if (!groups) return null
+  return ipv6GroupsToBigInt(groups)
+}
+
+function expandV6Groups(ip: string): string[] | null {
+  if (!ip.includes(':')) return null
+  // Handle :: expansion
+  const parts = ip.split('::')
+  if (parts.length > 2) return null // only one :: allowed
+  let left: string[]
+  let right: string[]
+  if (parts.length === 2) {
+    left = parts[0] ? parts[0]!.split(':') : []
+    right = parts[1] ? parts[1]!.split(':') : []
+    const missing = 8 - left.length - right.length
+    if (missing < 0) return null
+    left = [...left, ...new Array(missing).fill('0')]
+  } else {
+    left = ip.split(':')
+    right = []
+  }
+  const groups = [...left, ...right]
+  if (groups.length !== 8) return null
+  for (const g of groups) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null
+  }
+  return groups.map((g) => g.toLowerCase().padStart(4, '0'))
+}
+
+function ipv6GroupsToBigInt(groups: string[] | null): bigint | null {
+  if (!groups) return null
+  let result = 0n
+  for (const g of groups) {
+    result = (result << 16n) | BigInt(parseInt(g, 16))
+  }
+  return result
 }
 
 // ---------------------------------------------------------------------------

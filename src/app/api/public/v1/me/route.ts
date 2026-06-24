@@ -4,6 +4,7 @@ import {
   requireScope,
   getClientIp,
   logApiRequest,
+  rateLimitHeaders,
 } from '@/lib/api-auth'
 import { db } from '@/lib/db'
 
@@ -15,14 +16,14 @@ export async function GET(req: Request) {
   if (!auth.ok) {
     return NextResponse.json(
       { error: auth.error },
-      { status: auth.status },
+      { status: auth.status, headers: rateLimitHeaders(auth) },
     )
   }
   const scoped = requireScope(auth, 'read')
   if (!scoped.ok) {
     return NextResponse.json(
       { error: scoped.error },
-      { status: scoped.status },
+      { status: scoped.status, headers: rateLimitHeaders(auth) },
     )
   }
 
@@ -48,29 +49,32 @@ export async function GET(req: Request) {
     ip,
   })
 
-  return NextResponse.json({
-    ok: true,
-    user: {
-      id: auth.user.id,
-      email: auth.user.email,
-      name: auth.user.name,
+  return NextResponse.json(
+    {
+      ok: true,
+      user: {
+        id: auth.user.id,
+        email: auth.user.email,
+        name: auth.user.name,
+      },
+      apiKey: {
+        id: auth.apiKey.id,
+        label: auth.apiKey.label,
+        scopes: auth.apiKey.scopes,
+        prefix: auth.apiKey.prefix,
+        lastUsedAt: auth.apiKey.lastUsedAt,
+        allowedIps: auth.apiKey.allowedIps,
+        rateLimitPerMinute: auth.apiKey.rateLimitPerMinute,
+      },
+      account: {
+        activeKeys,
+        totalApiRequests: totalRequests,
+      },
+      server: {
+        time: new Date().toISOString(),
+        durationMs,
+      },
     },
-    apiKey: {
-      id: auth.apiKey.id,
-      label: auth.apiKey.label,
-      scopes: auth.apiKey.scopes,
-      prefix: auth.apiKey.prefix,
-      lastUsedAt: auth.apiKey.lastUsedAt,
-      allowedIps: auth.apiKey.allowedIps,
-      rateLimitPerMinute: auth.apiKey.rateLimitPerMinute,
-    },
-    account: {
-      activeKeys,
-      totalApiRequests: totalRequests,
-    },
-    server: {
-      time: new Date().toISOString(),
-      durationMs,
-    },
-  })
+    { headers: rateLimitHeaders(auth) },
+  )
 }

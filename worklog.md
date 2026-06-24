@@ -396,3 +396,144 @@ Unresolved issues / risks / next-phase recommendations:
    - Add a per-key "last 7d" total next to the 24h sparkline
    - Add integration tests (curl) that verify PATCH persists + /public
      enforces the new fields
+
+---
+Task ID: 3 (cron-triggered review #3 — orchestrator)
+Agent: main (Z.ai Code)
+Task: Continue Round 3 — tackle next-phase recommendations from Round 2:
+rate-limit headers, IPv6 CIDR, Copy curl action, keyboard nav, 7d total,
+integration tests, CONTRIBUTING.md.
+
+Work Log:
+- Reviewed worklog.md Round 2 recommendations. App was healthy (200s on all
+  routes). Selected 8 items for this round from the 9 recommendations.
+- **Rate-limit headers** (rec #4 + #5):
+  - Extended `AuthSuccess` and `AuthFailure` types in `api-auth.ts` to carry
+    `rateLimit: { limit, remaining, retryAfter }` metadata.
+  - Updated `authenticateApiKey()` to populate the rateLimit field on both
+    success (remaining tokens) and 429 failure (retryAfter seconds).
+  - Added `rateLimitHeaders(auth)` helper that builds
+    `{ 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'Retry-After'? }`.
+  - Updated all 4 public API routes (/me, /datasources, /dashboards, /queries)
+    to attach `rateLimitHeaders(auth)` to both success and error responses.
+  - Verified via curl: 200 → `x-ratelimit-limit: 10, x-ratelimit-remaining: 9`;
+    429 → `retry-after: 30, x-ratelimit-limit: 2, x-ratelimit-remaining: 0`.
+- **IPv6 CIDR support** (rec #3):
+  - Rewrote `isIpAllowed()` to dispatch by IP version: IPv4 CIDR via 32-bit
+    bitmask, IPv6 CIDR via BigInt-based 128-bit mask.
+  - Added `ipInV6Cidr()`, `ipv6ToBigInt()`, `expandV6Groups()`,
+    `ipv6GroupsToBigInt()` helper functions.
+  - Handles compressed IPv6 (::), IPv4-mapped IPv6 (::ffff:1.2.3.4), /0
+    (match all), /128 (exact match), and arbitrary prefix lengths.
+  - Fixed a bug: `BigInt('0xffff_ffff_ffff_ffff')` (string with underscores)
+    throws — switched to `0xffff_ffff_ffff_ffffn` (numeric literal with `n`
+    suffix, which DOES accept underscores).
+  - Unit-tested 10 IPv6 CIDR cases via Node — all pass (including /32, /64,
+    /120, ::/0, exact /128, out-of-range rejection).
+  - Verified end-to-end: key with `[2001:db8::/32]` correctly 403s a 127.0.0.1
+    connection.
+- **Copy curl command palette action** (rec #7):
+  - Added `Terminal` + `ScrollText` icon imports to command-palette.tsx.
+  - Added "Copy curl example" action that copies a curl template to clipboard
+    via `navigator.clipboard.writeText(buildCurlExample(window.location.origin))`.
+  - Added "Jump to API keys table" action that scrolls to #keys-section.
+  - Added `buildCurlExample(host)` helper exported from command-palette.tsx.
+  - Updated `useCommandPalette` hook signature to accept `onCopyCurl` callback.
+  - Updated `api-keys-manager.tsx` to pass `handleCopyCurl` to the hook.
+  - Verified via agent-browser: Cmd+K → "Copy curl example" → toast
+    "curl example copied to clipboard".
+- **Keyboard navigation ↑/↓** (rec #8):
+  - Built `use-row-keyboard-nav.ts` hook: manages `activeIndex` state,
+    handles ArrowDown/ArrowUp/Home/End, wraps to first/last, scrolls active
+    row into view, exposes `containerProps` (with role=grid, tabIndex=0,
+    aria-label, onKeyDown) and `rowProps(rowId)`.
+  - Integrated into `api-keys-manager.tsx`: wrapped the keys table in a div
+    with `{...keyboardNav.containerProps}`, passed `isActive` prop to each
+    `KeyRow`, KeyRow applies `bg-emerald-500/[0.04]` + emerald inset shadow
+    when active.
+  - Added `↑↓ to navigate` kbd hint in the card header (hidden on mobile).
+  - Verified via agent-browser: click table cell → ArrowDown → row gets
+    emerald background tint, `data-row-id` matches the second key.
+- **Per-key 7d total** (rec from Round 2 stage summary):
+  - The usage endpoint already returns `perKey[i].count` (7d total).
+  - Updated `KeyRow` to accept `count7d` prop and display it in the sparkline
+    tooltip: "{total24h} requests in last 24h / {count7d} in last 7 days".
+  - The inline count now shows "24h / 7d" when 7d > 24h.
+- **Integration test script** (rec from Round 2 stage summary):
+  - Built `scripts/test-api-keys.sh` — 16 test groups, 37 assertions.
+  - Tests: GET list, POST with IP+rateLimit, /me with headers, missing auth,
+    invalid key, rate limit (2/min → 429), Retry-After header, IP allowlist,
+    scope check (read → /queries → 403), /queries with execute, non-SELECT
+    rejection, /dashboards, /datasources, PATCH, revoke + revoked audit,
+    IPv6 CIDR.
+  - Includes cleanup: revokes all test keys at the end.
+  - All 37 assertions pass. Script exits 0 on success, 1 on failure.
+- **CONTRIBUTING.md** (rec #1):
+  - Documented the Prisma + Turbopack cache issue with the fix (delete .next/
+    + restart dev server after schema changes).
+  - Documented all scripts, the auth model, API key security, rate limiting,
+    porting to production (Supabase + Postgres), and the style guide.
+- **Styling polish**:
+  - Added `transition-colors` to KeyRow.
+  - Active row gets `bg-emerald-500/[0.04]` + emerald inset shadow.
+  - kbd hint elements with bordered styling.
+  - 7d total shown in muted color next to 24h count.
+
+Stage Summary:
+- **Status**: ✅ Round 3 complete and verified end-to-end.
+- **New features shipped**:
+  1. Rate-limit response headers (X-RateLimit-Limit, X-RateLimit-Remaining,
+     Retry-After) on all public API endpoints
+  2. IPv6 CIDR support in IP allowlist (BigInt-based 128-bit mask)
+  3. "Copy curl example" command palette action
+  4. "Jump to API keys table" command palette action
+  5. Keyboard navigation (↑/↓/Home/End) through keys table with visual
+     active-row highlighting
+  6. Per-key 7d total displayed in sparkline tooltip
+  7. Integration test script (37 assertions, all passing)
+  8. CONTRIBUTING.md with Prisma/Turbopack cache fix + full dev guide
+- **Artifacts produced**:
+  - `src/lib/api-auth.ts` — extended AuthResult types, rateLimitHeaders()
+    helper, IPv6 CIDR support (ipInV6Cidr, ipv6ToBigInt, expandV6Groups)
+  - 4 public API routes updated with rateLimitHeaders on all responses
+  - `src/components/api-keys/command-palette.tsx` — 2 new actions (Copy curl,
+    Jump to keys), buildCurlExample() helper, updated hook signature
+  - `src/components/api-keys/use-row-keyboard-nav.ts` — new hook
+  - `src/components/api-keys/api-keys-manager.tsx` — keyboard nav integration,
+    7d total, kbd hint, count7d prop
+  - `scripts/test-api-keys.sh` — 37-assertion integration test suite
+  - `CONTRIBUTING.md` — developer guide
+  - QA screenshots: round3-baseline.png, round3-final.png,
+    round3-keyboard-nav.png
+- **Verification**:
+  - `bun run lint` → clean, 0 errors
+  - `bash scripts/test-api-keys.sh` → ALL PASSED (37 assertions)
+  - IPv6 CIDR unit tests → 10/10 pass
+  - agent-browser QA: command palette Copy curl works, keyboard nav works,
+    7d total renders in tooltip, rate-limit headers present in curl responses
+
+Unresolved issues / next-phase recommendations:
+1. **Rate limiter is still in-memory** — for multi-replica production, switch
+   to Redis-backed (`@upstash/ratelimit`). The `checkRateLimit()` function
+   is the single swap point.
+2. **No OpenAPI/Swagger spec** — would make third-party integration (OpenFN,
+   N8N) much easier. Could auto-generate from the route handlers.
+3. **No webhook/event system** — when a key is revoked or rate-limited, it
+   would be useful to fire a webhook to the key owner (e.g. Slack notification).
+4. **No key rotation reminder** — keys with an `expiresAt` could show a
+   "expiring soon" warning in the UI + trigger a notification.
+5. **TestKeyPopover could batch-test** — currently tests one key at a time.
+   A "bulk test" mode that fires /me against all active keys would be useful
+   for diagnosing which key in an integration is broken.
+6. **No audit log for settings changes** — PATCH (edit key) and DELETE
+   (revoke) aren't logged. Could add a `SettingsAuditLog` model.
+7. **Keyboard nav doesn't activate row actions** — pressing Enter on an
+   active row could open the Edit dialog. Currently users must click.
+8. **Cron review cadence** — the recurring webDevReview cron (job 228854)
+   fires every 15 min. Future runs should:
+   - Add OpenAPI spec generation
+   - Add webhook on revoke/rate-limit
+   - Add "expiring soon" UI warning
+   - Add Enter-key handling on active keyboard-nav row
+   - Add SettingsAuditLog model + UI
+   - Consider Redis-backed rate limiting
