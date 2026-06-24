@@ -1828,3 +1828,88 @@ Stage Summary:
 - Unauthenticated state (`initial.current === null`) is fully handled: header shows a "Sign in" button, body shows a centered `SignInCard` with heading + description, sidebar nav is hidden, and the footer renders "Not signed in" instead of crashing.
 - `DashboardView` and `AuthMenu` both defensively accept nullable `current`/`user` props so they cannot crash if called directly with null.
 - No new dependencies added; no visual styling changes (only field/logic removal + the new unauthenticated-state block, which reuses the existing `SignInCard` component).
+
+---
+Task ID: 7 (main agent — full BIweb integration)
+Agent: main (Z.ai Code)
+Task: Full integration with BIweb's shared Supabase database — no duplicate tables.
+
+Work Log:
+- Analyzed screenshot of existing Supabase tables: found `users`, `api_keys`,
+  `api_request_logs`, `settings_audit_logs` already exist (owned by BIweb).
+- Fetched BIweb's Prisma schema from `github.com/fcruzp/biweb/main/prisma/schema.prisma`
+  to get exact column definitions for the shared tables.
+- Identified schema mismatches:
+  - BIweb `users` has `supabase_id`, `company`, `avatar_url`, etc. — does NOT
+    have `tenantName`, `avatarColor`, `lastLoginAt` (our app had these).
+  - BIweb `api_keys` does NOT have `allowed_ips`, `rate_limit_per_minute`.
+  - `settings_audit_logs` exists but is NOT in BIweb's Prisma schema (created
+    by our migration 0001 with uuid/jsonb/inet types).
+- Rewrote `prisma/schema.prisma` to EXACTLY mirror BIweb's schema using
+  `@@map` / `@map` directives. SettingsAuditLog uses `@db.Uuid`, `@db.Json`,
+  `@db.Inet`, `@db.Timestamptz` for native Postgres types.
+- Removed `prisma db push` from Dockerfile — we must NEVER alter shared tables.
+  Only `prisma generate` runs at build time.
+- Rewrote `src/lib/session.ts`:
+  - Removed demo tenant seeding (would pollute shared `users` table).
+  - `getCurrentUser()` now returns `SessionUser | null` (null = not signed in).
+  - Looks up user by `supabaseId` in the `users` table; creates a minimal row
+    if not found (safe — same schema as BIweb).
+  - `tenantName` / `avatarColor` derived in-memory from company/email (NOT in DB).
+- Updated `src/lib/api-auth.ts`:
+  - Removed `allowedIps` / `rateLimitPerMinute` from `AuthenticatedApiKey`.
+  - Removed IP allowlist check from `authenticateApiKey()`.
+  - Rate limiting now uses global default (60/min) in-memory only.
+  - `AuthenticatedUser` now includes `supabaseId` (UUID for audit logs).
+  - `writeAuditLog()` passes `userId: user.supabaseId` (NOT `user.id` cuid).
+- Updated all API routes to remove dropped fields:
+  - `api-keys/route.ts` (GET/POST): removed allowedIps/rateLimitPerMinute from
+    select, create, response.
+  - `api-keys/[id]/route.ts` (PATCH/DELETE): edit now only changes `label`.
+  - `api-keys/revoked/route.ts`: removed dropped fields from select.
+  - `api-keys/audit/route.ts`: queries by `user.supabaseId`; `diff` is now
+    Json type (Prisma returns parsed object, removed JSON.parse).
+  - `auth/me/route.ts`: handles null user (returns `current: null`).
+  - `auth/switch/route.ts`: returns 404 (no demo tenant switching).
+  - `public/v1/me/route.ts`: removed allowedIps/rateLimitPerMinute from response.
+  - `openapi.json/route.ts`: removed from spec.
+- Updated `src/app/page.tsx`: handles null user → renders Sign In card.
+- Updated `src/components/portal/types.ts`: `AuthMeResponse.current` is nullable.
+- Updated `src/lib/api-wrapper.ts`: auth errors return 401 (not 503).
+- Delegated UI component cleanup to full-stack-developer subagent (Task ID 6):
+  - create-api-key-dialog.tsx: removed IP allowlist + rate limit form fields.
+  - edit-api-key-dialog.tsx: stripped to label-only edit.
+  - api-keys-manager.tsx: removed IP/rate-limit chips from key rows.
+  - audit-log-panel.tsx: removed IP/rate diff chips.
+  - portal-shell.tsx: shows SignInCard when current is null.
+  - dashboard-view.tsx: handles null user.
+  - auth-menu.tsx: shows "Sign In" button when user is null.
+- Ran `npx prisma generate` to regenerate client with new schema.
+- Fixed all TypeScript errors (bunx tsc --noEmit clean, bun run lint clean).
+- Committed as `91a42aa`, pushed to GitHub.
+- Bumped Dockerfile CACHEBUST to 6.
+
+Stage Summary:
+- The app now uses BIweb's EXACT database schema — zero duplicate tables.
+- Prisma schema mirrors `users`, `api_keys`, `api_request_logs`,
+  `settings_audit_logs` via @@map/@map.
+- Dockerfile only runs `prisma generate` (never `prisma db push`).
+- Demo tenant seeding removed — app requires Supabase Auth sign-in.
+- `allowedIps` / `rateLimitPerMinute` features removed (columns don't exist
+  in BIweb's table). Rate limiting still works (in-memory, 60/min default).
+- `tenantName` / `avatarColor` derived in-memory (not persisted).
+- Audit logs use `supabaseId` (UUID) for `user_id`, `null` for `api_key_id`
+  (cuid can't be stored in uuid column).
+- All TypeScript + lint checks pass.
+- Pushed to `fcruzp/datamind-keys` main branch (commit 91a42aa).
+- User needs to: bump CACHEBUST in Coolify, redeploy, then sign in via
+  Supabase Auth to see the API Keys Manager.
+
+Unresolved Issues / Risks:
+- `settings_audit_logs` table structure is assumed to match our migration
+  0001 SQL (uuid/jsonb/inet types). If BIweb created it differently, audit
+  log writes will silently fail (caught by try/catch) but the app won't crash.
+- A SQL verification query should be run to confirm the exact columns of
+  `settings_audit_logs` before relying on audit data.
+- Supabase Auth redirect URLs must be configured (Site URL =
+  `https://datamind-api.mooo.com`) for the sign-in flow to work.
