@@ -10,6 +10,10 @@ export interface PortalUser {
   avatarColor: string
   role: string
   isCurrent?: boolean
+  /** True when the session comes from Supabase Auth (production). */
+  isSupabase?: boolean
+  /** Avatar URL from Supabase user_metadata (if any). */
+  avatarUrl?: string | null
 }
 
 export interface PortalStats {

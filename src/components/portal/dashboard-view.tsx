@@ -26,6 +26,7 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import type { PortalUser, PortalStats } from './types'
+import { SignInCard } from './sign-in-card'
 
 // ---------------------------------------------------------------------------
 // Inline mini usage chart (no chart lib needed — pure SVG)
@@ -70,7 +71,7 @@ function StatCard({
   icon: LucideIcon
   label: string
   value: string
-  hint?: string
+  hint?: React.ReactNode
   tone: 'emerald' | 'sky' | 'amber' | 'rose'
   loading?: boolean
 }) {
@@ -248,10 +249,12 @@ export function DashboardView({
   current,
   stats,
   onNavigateToApiKeys,
+  onScrollToSignIn,
 }: {
   current: PortalUser
   stats: PortalStats
   onNavigateToApiKeys: () => void
+  onScrollToSignIn?: () => void
 }) {
   // Fetch the 24h histogram for the hero sparkline (tenant-scoped)
   const usageQuery = useQuery({
@@ -398,6 +401,40 @@ export function DashboardView({
           Supabase org-switch behavior.
         </div>
       </section>
+
+      {/* Sign-in upgrade CTA (only shown when on the demo session) */}
+      {!current.isSupabase && (
+        <section id="signin" className="scroll-mt-20 grid gap-4 lg:grid-cols-[1fr_auto] items-start">
+          <div className="space-y-2">
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              You&apos;re on a demo session
+            </h2>
+            <p className="text-sm text-muted-foreground leading-relaxed max-w-prose">
+              The current session is a sandbox cookie — great for exploring the
+              portal, but not a real account. Sign in with Supabase to get a
+              persistent JWT-backed session that works across the production
+              deployment at <code className="font-mono text-[11px]">datamind-api.mooo.com</code>.
+              Your API keys and audit trail remain intact; only the session
+              transport changes.
+            </p>
+            <ul className="text-xs text-muted-foreground space-y-1 pt-1">
+              <li className="flex items-center gap-1.5">
+                <ShieldCheck className="size-3 text-emerald-500" />
+                JWT-backed sessions, validated server-side
+              </li>
+              <li className="flex items-center gap-1.5">
+                <ShieldCheck className="size-3 text-emerald-500" />
+                Row-Level Security on every table — even if Prisma is bypassed
+              </li>
+              <li className="flex items-center gap-1.5">
+                <ShieldCheck className="size-3 text-emerald-500" />
+                Works on the production domain without re-issuing keys
+              </li>
+            </ul>
+          </div>
+          <SignInCard />
+        </section>
+      )}
     </div>
   )
 }

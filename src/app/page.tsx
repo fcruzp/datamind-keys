@@ -46,8 +46,10 @@ export default async function Home() {
       tenantName: user.tenantName,
       avatarColor: user.avatarColor,
       role: user.role,
+      isSupabase: user.isSupabase ?? false,
+      avatarUrl: user.avatarUrl ?? null,
     },
-    switchable: switchable.map((u) => ({
+    switchable: (user.isSupabase ? [] : switchable).map((u) => ({
       id: u.id,
       email: u.email,
       name: u.name,
@@ -60,7 +62,7 @@ export default async function Home() {
       activeKeys,
       revokedKeys,
       requests7d,
-      lastRequestAt: lastLogAt?.createdAt ?? null,
+      lastRequestAt: lastLogAt?.createdAt?.toISOString() ?? null,
     },
   }
 

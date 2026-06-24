@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Github, KeyRound, Menu, X, BookOpen, Webhook } from 'lucide-react'
+import { Github, KeyRound, Menu, X, BookOpen, Webhook, ShieldCheck } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/sheet'
 import { ThemeToggle } from '@/components/theme-toggle'
 import { TenantSwitcher } from './tenant-switcher'
+import { AuthMenu, SignInCTA } from './auth-menu'
 import { Sidebar } from './sidebar'
 import { DashboardView } from './dashboard-view'
 import { ApiKeysManager } from '@/components/api-keys/api-keys-manager'
@@ -157,7 +158,28 @@ export function PortalShell({ initial }: { initial: AuthMeResponse }) {
 
             <div className="h-5 w-px bg-border/60 hidden md:block mx-1" />
 
-            <TenantSwitcher current={current} switchable={switchable} />
+            {/* Auth surface:
+                - Supabase session → AuthMenu (avatar + sign out)
+                - Demo session w/ switchable tenants → TenantSwitcher
+                - Demo session w/ no switcher → SignInCTA */}
+            {current.isSupabase ? (
+              <AuthMenu user={current} />
+            ) : switchable.length > 0 ? (
+              <TenantSwitcher current={current} switchable={switchable} />
+            ) : (
+              <SignInCTA
+                onClick={() => {
+                  setView('dashboard')
+                  if (typeof window !== 'undefined') {
+                    window.setTimeout(() => {
+                      document
+                        .getElementById('signin')
+                        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                    }, 50)
+                  }
+                }}
+              />
+            )}
             <ThemeToggle />
           </div>
         </div>
@@ -192,6 +214,13 @@ export function PortalShell({ initial }: { initial: AuthMeResponse }) {
               current={current}
               stats={stats}
               onNavigateToApiKeys={() => setView('api-keys')}
+              onScrollToSignIn={() => {
+                if (typeof window !== 'undefined') {
+                  document
+                    .getElementById('signin')
+                    ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                }
+              }}
             />
           )}
           {view === 'api-keys' && <ApiKeysManager />}
@@ -229,11 +258,21 @@ export function PortalShell({ initial }: { initial: AuthMeResponse }) {
               Tenant: <strong className="text-foreground">{current.tenantName}</strong>{' '}
               · {current.email}
             </span>
+            {current.isSupabase && (
+              <Badge
+                variant="outline"
+                className="text-[9px] font-mono px-1 py-0 gap-0.5 text-emerald-600 border-emerald-500/40 bg-emerald-500/5"
+              >
+                <ShieldCheck className="size-2.5" />
+                Supabase
+              </Badge>
+            )}
           </div>
           <div className="flex items-center gap-3">
             <span>
               Built with Next.js 16 · Prisma ·{' '}
-              <span className="font-mono">SQLite</span> (sandbox)
+              <span className="font-mono">SQLite</span> (sandbox) ·{' '}
+              <span className="text-emerald-600 dark:text-emerald-400">Supabase Auth</span>
             </span>
           </div>
         </div>

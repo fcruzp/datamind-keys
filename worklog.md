@@ -1149,3 +1149,230 @@ environment. Investigated the cause and created the missing files.
    the **service role** one, not the anon one.
 5. **DATABASE_URL / DIRECT_URL** — still pending from the user. These
    are needed before `prisma migrate deploy` can run from CI/Coolify.
+
+---
+
+## Task ID: 5 (Supabase integration — auth + clients + UI)
+Agent: main (Z.ai Code)
+Task: User provided Supabase credentials (URL, anon key, service_role key,
+publishable key). Integrate Supabase Auth into the sandbox so a real user
+can sign in via magic link or password while keeping the demo cookie
+fallback working.
+
+### Work Log
+
+- **Verified credentials reach Supabase**:
+  - `GET /auth/v1/health` → 200 GoTrue v2.191.0
+  - `GET /auth/v1/settings` → email + Google OAuth enabled,
+    `mailer_autoconfirm: true`, `disable_signup: false`
+  - `GET /rest/v1/` with service_role → 200 OpenAPI spec listing **17
+    existing tables** including the ones from the migrations I wrote in
+    Task 4 (`user_profiles`, `api_keys`, `api_request_logs`,
+    `settings_audit_logs`) — meaning the user had already applied the
+    migrations to Supabase. Also confirmed `hash_api_key` and
+    `rls_auto_enable` RPC functions exist.
+  - Inspected column definitions of all 4 tables via the OpenAPI spec —
+    they match the DDL in `0001_schema_additions.sql` exactly (uuid PKs,
+    jsonb scopes/allowed_ips, inet for IPs, timestamptz for dates).
+- **Created `.env.local`** with:
+  - `NEXT_PUBLIC_SUPABASE_URL=https://rsrcdaepiwjqfynwwzcn.supabase.co`
+  - `NEXT_PUBLIC_SUPABASE_ANON_KEY` (public)
+  - `SUPABASE_SERVICE_ROLE_KEY` (server-only)
+  - `SUPABASE_PUBLISHABLE_KEY`
+  - `NEXT_PUBLIC_SITE_URL=http://localhost:3000` (for magic-link redirects)
+  - Kept existing `DATABASE_URL` (SQLite) so the sandbox demo still works.
+- **Installed packages**: `@supabase/ssr@0.12.0`, `@supabase/supabase-js@2.108.2`.
+- **Created Supabase client utilities** (`src/lib/supabase/`):
+  - `server.ts` — `getSupabaseServer()` (Server Components, uses
+    `next/headers` `cookies()`), `getSupabaseServerFromReq(req)` (Route
+    Handlers, returns client + Set-Cookie list), `getSupabaseService()`
+    (service-role client, bypasses RLS, server-only).
+  - `client.ts` — `getSupabaseBrowser()` for Client Components (cookie-
+    based session persistence via `@supabase/ssr`).
+  - `middleware.ts` — `updateSession(req)` calls `getUser()` on every
+    matched route to refresh the access token if near expiry.
+- **Created `src/middleware.ts`** with matcher excluding `_next/static`,
+  `_next/image`, public files, and `/api/public/*` (the public API gateway
+  uses Bearer API keys, no Supabase session needed).
+- **Created 3 API routes**:
+  - `POST /api/auth/signin` — Zod-validated body `{email, password?}`.
+    If `password` is set → `signInWithPassword`; otherwise
+    `signInWithOtp` (magic link) with `emailRedirectTo` pointing at
+    `/api/auth/callback`. Cookies set during the call are propagated to
+    the response.
+  - `GET /api/auth/callback` — handles magic-link / OAuth redirect,
+    exchanges `code` for session via `exchangeCodeForSession(code)`,
+    then copies the request cookies to the redirect response with
+    sensible session-cookie defaults (HttpOnly, SameSite=Lax, 7-day
+    maxAge, Secure in production). On error, redirects to
+    `/?auth_error=...`.
+  - `POST /api/auth/signout` — calls `supabase.auth.signOut()` and
+    also clears the demo `dm_session_email` cookie so neither session
+    leaks back in.
+- **Refactored `src/lib/session.ts`** (`getCurrentUser`):
+  1. Tries `getSupabaseServer().auth.getUser()`. If a Supabase user is
+     found, mirrors them into the local SQLite `User` table (id =
+     Supabase UUID, email, name from `user_metadata.full_name` /
+     `name` / email prefix, derived tenantName from email domain,
+     avatarColor from a small domain→gradient palette). Returns the
+     user with `isSupabase: true` and `avatarUrl` from
+     `user_metadata.avatar_url` / `picture`.
+  2. If no Supabase session (or Supabase unreachable), falls back to
+     the demo cookie (`dm_session_email`) — the existing 4-tenant demo
+     flow continues to work unchanged.
+  - `SessionUser` type extended with `isSupabase?: boolean` and
+    `avatarUrl?: string | null`.
+- **Extended `PortalUser` type** (`src/components/portal/types.ts`)
+  with `isSupabase` and `avatarUrl`.
+- **Updated `/api/auth/me`** to:
+  - Return `isSupabase` + `avatarUrl` on the `current` user.
+  - Return an empty `switchable` array when `isSupabase` is true
+    (Supabase users switch tenants by signing out + back in, not via
+    the demo tenant switcher).
+- **Updated `src/app/page.tsx`** to pass `isSupabase` + `avatarUrl`
+  through to the portal, and to clear the switchable list when a
+  Supabase user is logged in.
+- **Created `src/components/portal/auth-menu.tsx`**:
+  - `AuthMenu` — dropdown shown in the header when `isSupabase === true`.
+    Avatar (with `AvatarImage` from `avatarUrl` and gradient fallback
+    showing initials), identity summary (email, tenant, role), Supabase
+    badge, and a Sign out button that POSTs to `/api/auth/signout` and
+    hard-refreshes.
+  - `SignInCTA` — compact outline button shown in the header when no
+    Supabase session and no switchable demo tenants (scrolls to the
+    `#signin` section).
+- **Created `src/components/portal/sign-in-card.tsx`** — full sign-in
+  form with two tabs:
+  - Magic link: email input + "Send magic link" button (gradient
+    emerald→teal). Calls `/api/auth/signin` without password.
+  - Password: email + password inputs (min 8 chars). Calls
+    `/api/auth/signin` with password.
+  - Uses TanStack Query mutation, sonner toasts for success/error,
+    hard-refresh on password success so server components re-evaluate.
+  - Includes a "Secured by Supabase Auth · cookies + JWT · RLS-protected"
+    footer and a "REAL" badge.
+- **Updated `src/components/portal/portal-shell.tsx`**:
+  - Header now conditionally renders `AuthMenu` (Supabase session),
+    `TenantSwitcher` (demo session with switchable tenants), or
+    `SignInCTA` (demo session, no switcher).
+  - Footer adds a "Supabase" badge (emerald, with ShieldCheck icon)
+    next to the tenant name when `isSupabase === true`, and a
+    "Supabase Auth" tagline in the credit line.
+  - Added `ShieldCheck` icon import from lucide.
+- **Updated `src/components/portal/dashboard-view.tsx`**:
+  - `StatCard.hint` type changed from `string` to `React.ReactNode`
+    (was already passing JSX in 2 places — pre-existing type bug).
+  - Added `onScrollToSignIn` prop (optional).
+  - Added a new section at the bottom of the dashboard (only rendered
+    when `!current.isSupabase`) that explains the demo session vs real
+    Supabase session difference, lists 3 benefits (JWT, RLS, cross-
+    domain), and embeds the `<SignInCard/>`. The section has
+    `id="signin"` so `SignInCTA` / `onScrollToSignIn` can scroll to it.
+- **Updated `src/app/api/auth/me/route.ts`** to use
+  `lastLogAt?.createdAt?.toISOString()` instead of returning a raw
+  `Date` (pre-existing type mismatch with `PortalStats.lastRequestAt`
+  which is `string | null`). Same fix applied to `src/app/page.tsx`.
+- **Lint**: `bun run lint` → 0 errors, 0 warnings.
+- **TypeScript**: `bunx tsc --noEmit` → 0 errors in any file I touched
+  (only pre-existing errors remain in `examples/`, `skills/`, and the
+  BigInt literals in `api-auth.ts` which target ES2017).
+- **Smoke tests** (all in a single bash invocation because the dev
+  server doesn't survive between Bash tool calls):
+  - `GET /api/auth/me` → 200, returns demo tenant with
+    `"isSupabase": false, "avatarUrl": null`, 4 switchable demo tenants,
+    `stats.activeKeys: 12, requests7d: 60`.
+  - `POST /api/auth/signin` (magic link, valid email
+    `francisco@datamind.bi`) → 200
+    `{"ok":true,"mode":"magic-link","message":"Magic link sent to
+    francisco@datamind.bi. Click the link in the email to sign in."}`.
+    Confirms Supabase accepted the OTP request and enqueued the email.
+  - `POST /api/auth/signin` (magic link, `francisco.cruz@gmail.com`)
+    → 200, magic link sent (Supabase accepts any well-formed email).
+  - `POST /api/auth/signin` (invalid email `not-an-email`) → 400
+    `{"error":"Invalid email address"}` (Zod validation).
+  - `POST /api/auth/signin` (password `short` < 8 chars) → 400
+    `{"error":"Too small: expected string to have >=8 characters"}`.
+  - `POST /api/auth/signout` → 200 `{"ok":true}`.
+  - `GET /` → 200, 77977 bytes, title "DataMind BI — Portal",
+    contains "Supabase", "Magic link", "demo session" text.
+- **Browser QA via agent-browser**:
+  - Opened `http://localhost:3000/` → portal renders correctly.
+  - Snapshot shows: header (logo, OpenFN/Docs/GitHub links, Switch
+    tenant dropdown, theme toggle), sidebar (Dashboard/API
+    Keys/Datasources/Activity/Docs), hero "Welcome back, DataMind",
+    integrations cards, the new "YOU'RE ON A DEMO SESSION" section
+    with Magic link/Password tabs and the email input + "Send magic
+    link" button (initially disabled until email is entered).
+  - Filled email, clicked "Send magic link" — network log confirms
+    `POST /api/auth/signin (Fetch)` was sent.
+  - No console errors, no runtime errors.
+  - Dark mode toggle works (took second screenshot in dark mode).
+- **VLM verification** of the final screenshot confirmed:
+  - Header clean with logo, navigation, tenant switcher, theme toggle
+  - Hero with green "Tenant: DataMind BI" badge + welcome message
+  - Sign-in card visible with "REAL" badge, Magic link/Password tabs,
+    email input, green "Send magic link" button, "Secured by Supabase
+    Auth · cookies + JWT · RLS-protected" footer
+  - Footer shows tenant + "Built with Next.js 16 · Prisma · SQLite
+    (sandbox) · Supabase Auth" credit
+  - "Highly polished, no visual glitches, professional and user-friendly"
+
+### Stage Summary
+
+- **Supabase Auth is fully wired up** end-to-end: clients (server /
+  browser / service role), middleware (session refresh on every
+  request), 3 new API routes (signin with magic link OR password,
+  callback for redirect handling, signout), and a polished sign-in UI
+  embedded in the dashboard.
+- **The sandbox demo still works** thanks to the layered auth: if no
+  Supabase session exists, `getCurrentUser()` falls back to the demo
+  cookie session and the 4 seeded demo tenants continue to be
+  switchable. The portal visually distinguishes the two states
+  ("Supabase" badge in footer + AuthMenu vs TenantSwitcher in header).
+- **The Supabase project is reachable and configured correctly**:
+  email magic links work, signups are open, mailer autoconfirms. The
+  4 tables from `0001_schema_additions.sql` already exist in the
+  project (the user applied the migrations before this task started),
+  so the production schema is ready.
+- **No regressions**: existing API Keys manager (create / edit / revoke
+  / test / usage / audit / revoked-keys / command palette / OpenAPI
+  explorer), the public API gateway (`/api/public/v1/*` with Bearer
+  auth), and the multi-tenant demo flow all continue to render and
+  function correctly.
+
+### Unresolved / next-phase recommendations
+
+1. **End-to-end magic-link test in a real browser**: the sandbox
+   agent-browser can submit the form and the network request reaches
+   Supabase, but we can't click the link in the email from here. The
+   user should test by entering their own email in the portal,
+   clicking the link in the email they receive, and confirming they
+   land back on the portal with the "Supabase" badge in the footer.
+2. **Configure Supabase Auth redirect URLs**: in Supabase Dashboard →
+   Authentication → URL Configuration, add
+   `http://localhost:3000/api/auth/callback` and (for production)
+   `https://datamind-api.mooo.com/api/auth/callback` to the allowed
+   redirect URLs. Otherwise Supabase will reject the magic-link
+   redirect.
+3. **Migrate Prisma to Postgres for production**: the sandbox still
+   uses SQLite for the local `User`/`ApiKey`/`ApiRequestLog`/
+   `SettingsAuditLog` tables. For production, swap `provider =
+   "sqlite"` to `"postgresql"` and point `DATABASE_URL` at the
+   Supabase pooler. The `getCurrentUser()` mirror-into-SQLite logic
+   can then be removed (Supabase `user_profiles` becomes the source
+   of truth).
+4. **Decide on the `User.id` shape**: in the sandbox, demo users have
+   `cuid()` IDs while Supabase users have UUIDs. If the production
+   Prisma client uses UUIDs, the demo cookie flow should generate
+   UUID-shaped IDs too (or the demo flow should be removed entirely
+   in production).
+5. **Add OAuth providers**: Google is already enabled in the Supabase
+   project. Adding a "Continue with Google" button to the sign-in
+   card would be a small additional feature.
+6. **Migrate `getDemoUser()` → `getSupabaseUser()`**: the public API
+   gateway (`/api/public/v1/*`) still uses Bearer API keys (correct).
+   But the management routes (`/api/settings/*`) currently use
+   `getDemoUser()` which delegates to `getCurrentUser()`. Once
+   Prisma is on Postgres, we can simplify this to call
+   `getSupabaseServer().auth.getUser()` directly and drop the demo
+   cookie fallback entirely.

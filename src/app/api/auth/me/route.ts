@@ -49,9 +49,13 @@ export async function GET(req: NextRequest) {
       tenantName: user.tenantName,
       avatarColor: user.avatarColor,
       role: user.role,
+      isSupabase: user.isSupabase ?? false,
+      avatarUrl: user.avatarUrl ?? null,
       isDefault: !cookieEmail || cookieEmail === user.email,
     },
-    switchable: switchable.map((u) => ({
+    // When a real Supabase user is logged in, we hide the demo tenant
+    // switcher entirely — they should sign out + back in to switch accounts.
+    switchable: (user.isSupabase ? [] : switchable).map((u) => ({
       id: u.id,
       email: u.email,
       name: u.name,
@@ -64,7 +68,7 @@ export async function GET(req: NextRequest) {
       activeKeys,
       revokedKeys,
       requests7d,
-      lastRequestAt: lastLogAt?.createdAt ?? null,
+      lastRequestAt: lastLogAt?.createdAt?.toISOString() ?? null,
     },
   })
 }
