@@ -18,7 +18,6 @@ import { TenantSwitcher } from './tenant-switcher'
 import { AuthMenu, SignInCTA } from './auth-menu'
 import { Sidebar } from './sidebar'
 import { DashboardView } from './dashboard-view'
-import { DeploymentView } from './deployment-view'
 import { ApiKeysManager } from '@/components/api-keys/api-keys-manager'
 import { ComingSoon } from './coming-soon'
 import type { AuthMeResponse, PortalView } from './types'
@@ -243,7 +242,6 @@ export function PortalShell({ initial }: { initial: AuthMeResponse }) {
               description="Interactive OpenAPI explorer with copy-paste curl examples. Available today as the OpenAPI Explorer panel under API Keys."
             />
           )}
-          {view === 'deployment' && <DeploymentView />}
         </main>
       </div>
 

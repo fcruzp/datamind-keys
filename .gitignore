@@ -52,3 +52,22 @@ prompt
 server.log
 # Skills directory
 /skills/
+
+# ── DataMind Keys specifics ──────────────────────────────────────────────────
+# SQLite sandbox DB (no se sube — en prod usamos Postgres/Supabase)
+/db/
+*.db
+*.db-journal
+
+# Screenshots / artefactos de QA del sandbox
+/download/
+/tool-results/
+
+# Ejemplos del scaffold (no parte de la app)
+/examples/
+
+# Bun
+bun.lockb
+
+# Cron / config interna del sandbox
+.coolify

@@ -30,13 +30,7 @@ export interface AuthMeResponse {
 }
 
 /** The set of views the portal can show. */
-export type PortalView =
-  | 'dashboard'
-  | 'api-keys'
-  | 'datasources'
-  | 'activity'
-  | 'docs'
-  | 'deployment'
+export type PortalView = 'dashboard' | 'api-keys' | 'datasources' | 'activity' | 'docs'
 
 export interface NavItem {
   id: PortalView

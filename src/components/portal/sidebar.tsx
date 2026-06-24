@@ -7,7 +7,6 @@ import {
   Database,
   Activity,
   BookOpen,
-  Rocket,
   type LucideIcon,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -55,12 +54,6 @@ const NAV: NavEntry[] = [
     icon: BookOpen,
     description: 'OpenAPI spec + quickstart',
     soon: true,
-  },
-  {
-    id: 'deployment',
-    label: 'Deployment',
-    icon: Rocket,
-    description: 'Coolify · Docker · YAML files',
   },
 ]
 
