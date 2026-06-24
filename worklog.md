@@ -1025,3 +1025,127 @@ user support so each tenant has its own API key management.
 - Consider adding a "tenant-scoped request volume" chart on the dashboard
   that compares the current tenant's 24h volume against the platform
   average — requires a small aggregate endpoint.
+
+---
+
+## Task ID: 4 (supabase migrations creation)
+Agent: main (Z.ai Code)
+Task: The user reported that `supabase/migrations/0001_schema_additions.sql`
+and `supabase/migrations/0002_rls_policies.sql` were missing from the source
+environment. Investigated the cause and created the missing files.
+
+### Work Log
+
+- Verified the user's claim: `ls /home/z/my-project/supabase/` returned
+  "No such file or directory". The folder had never been created.
+- Root cause: every prior task in this worklog was sandbox-only (SQLite +
+  cookie-based demo session). The Prisma schema (`prisma/schema.prisma`)
+  still uses `provider = "sqlite"` and changes were applied with
+  `bun run db:push` to `db/custom.db`. The migration to production
+  Postgres/Supabase Auth + RLS was planned but never started in this
+  environment, so the Supabase SQL migration files were never generated.
+- Created `supabase/migrations/0001_schema_additions.sql` (181 lines):
+  - `CREATE EXTENSION IF NOT EXISTS pgcrypto` (idempotent).
+  - `public.user_profiles` table (uuid PK, `user_id` UNIQUE FK to
+    `auth.users(id) ON DELETE CASCADE`, `tenant_name`, `avatar_color`,
+    `role` CHECK in owner/admin/viewer, `last_login_at`, timestamps).
+  - `public.api_keys` table (uuid PK, `user_id` FK to `auth.users`,
+    `key_hash` UNIQUE, `key_prefix`, `label`, `scopes` JSONB,
+    `allowed_ips` JSONB, `rate_limit_per_minute` INT, `revoked_at`,
+    `last_used_at`, `last_used_ip` inet, `expires_at`, `created_at`).
+    Indexes on `user_id`, `key_hash`, and a partial index
+    `idx_api_keys_user_active WHERE revoked_at IS NULL`.
+  - `public.api_request_logs` table (uuid PK, `api_key_id` FK to
+    `api_keys(id) ON DELETE CASCADE`, `endpoint`, `method`, `status_code`,
+    `duration_ms`, `row_count`, `ip` inet, `created_at`). Indexes on
+    `(api_key_id, created_at DESC)` and `created_at DESC`.
+  - `public.settings_audit_logs` table (uuid PK, `user_id` FK to
+    `auth.users`, `action`, `api_key_id`, `api_key_label`, `diff` JSONB,
+    `ip` inet, `user_agent`, `created_at`). Indexes on
+    `(user_id, created_at DESC)`, `api_key_id`, `action`.
+  - `public.touch_updated_at()` plpgsql function + BEFORE UPDATE trigger
+    on `user_profiles`.
+  - `public.hash_api_key(raw_key text)` IMMUTABLE PARALLEL SAFE function
+    using `pgcrypto.digest(...,'sha256')` so the DB can compute the same
+    hash the Node app computes (`sha256(raw).digest('hex')`).
+  - `COMMENT ON TABLE / COLUMN` for every table and the non-obvious
+    columns so they show up nicely in Supabase Studio / `psql \d+`.
+- Created `supabase/migrations/0002_rls_policies.sql` (168 lines):
+  - `ENABLE ROW LEVEL SECURITY` + `FORCE ROW LEVEL SECURITY` on all four
+    tables (FORCE = even table owners are subject to RLS; only the
+    service role bypasses, by design).
+  - 9 policies total:
+    - `user_profiles`: SELECT/INSERT/UPDATE own row (`user_id = auth.uid()`).
+    - `api_keys`: SELECT/INSERT/UPDATE/DELETE own rows.
+    - `api_request_logs`: SELECT own rows via EXISTS subquery joining
+      `api_keys` to check `k.user_id = auth.uid()`. INSERT/UPDATE/DELETE
+      intentionally NOT granted to `authenticated` because writes happen
+      server-side via the service role (RLS bypass).
+    - `settings_audit_logs`: SELECT own rows. Same reason for no write
+      policies.
+  - `public.handle_new_user()` SECURITY DEFINER plpgsql function + an
+    `AFTER INSERT ON auth.users` trigger named `on_auth_user_created`
+    that auto-provisions a `user_profiles` row (`tenant_name='Personal'`,
+    `role='owner'`) on signup, with `ON CONFLICT (user_id) DO NOTHING`
+    so it's safe to re-run.
+  - Sanity-check query at the bottom (commented) to verify all four
+    tables show `relrowsecurity=true` and `relforcerowsecurity=true`.
+- Created `supabase/README.md` (92 lines) documenting:
+  - What each migration file does.
+  - Three ways to apply them (Supabase Studio SQL Editor, `supabase db
+    push` via CLI, or `psql -f`).
+  - A post-apply checklist (verify RLS is on, test signup triggers a
+    profile row, test isolation).
+  - An RLS posture summary table (which role can do what on each table).
+  - The explanation that the public API gateway uses Bearer API keys +
+    the service role (RLS bypass), while the management surface
+    (portal + `/api/settings/*`) uses Supabase JWT + RLS.
+  - A rollback script that drops everything in the right order without
+    touching any existing BIweb table.
+- Verified file structure:
+  - 4 `CREATE TABLE` statements in 0001 ↔ 4 closing `);` lines ✓
+  - 9 `CREATE POLICY` statements in 0002 ✓
+  - 4 `ENABLE ROW LEVEL SECURITY` in 0002 (one per table) ✓
+  - No duplicate policy or table names across both files ✓
+  - All FKs reference either `auth.users(id)` or
+    `public.api_keys(id)`, all with `ON DELETE CASCADE` ✓
+
+### Stage Summary
+
+- The two missing Supabase migration files now exist at:
+  - `/home/z/my-project/supabase/migrations/0001_schema_additions.sql`
+  - `/home/z/my-project/supabase/migrations/0002_rls_policies.sql`
+- Plus a `supabase/README.md` with apply instructions for three methods
+  (Studio, CLI, psql) and an RLS posture matrix.
+- The SQL is PostgreSQL/Supabase-flavoured (uses `uuid`, `timestamptz`,
+  `jsonb`, `inet`, `gen_random_uuid()`, `auth.uid()`, `auth.users`),
+  NOT SQLite. It maps 1:1 to the models in `prisma/schema.prisma` but
+  with the production adjustments: `cuid()` → `uuid`, `String` →
+  `text`/`jsonb`/`inet`, `DateTime` → `timestamptz`, `User` model →
+  `user_profiles` table joined to `auth.users`.
+- The migrations are **additive** — they do not touch any existing
+  BIweb table, so they can be applied to the live Supabase project
+  (`rsrcdaepiwjqfynwwzcn`) without risk to existing data.
+
+### Unresolved / next-phase recommendations
+
+1. **Apply the migrations to Supabase** — the user should run them via
+   one of the three methods in `supabase/README.md`. Once applied,
+   `bun run db:push` from the production Prisma client should be a
+   no-op (Prisma will see the schema already matches).
+2. **Adapt the Prisma schema for production** — change `provider =
+   "sqlite"` to `provider = "postgresql"`, `@default(cuid())` to
+   `@default(dbgenerated("gen_random_uuid()")) @db.Uuid`, etc. The
+   sandbox schema stays on SQLite for local dev; production uses a
+   separate `schema.prod.prisma` (or env-conditional config).
+3. **Replace the sandbox session layer** — `src/lib/session.ts` (cookie
+   demo) must be replaced by `@supabase/ssr` session resolution. The
+   `getDemoUser()` wrapper in `src/lib/api-auth.ts` should be renamed
+   to `getSupabaseUser()` and read from `cookies()` + Supabase client.
+4. **Wire the public API gateway to use the service role** — currently
+   `authenticateApiKey()` uses Prisma directly. In production this is
+   fine (Prisma with the service role URL bypasses RLS), but we should
+   make sure the connection string used by the public API routes is
+   the **service role** one, not the anon one.
+5. **DATABASE_URL / DIRECT_URL** — still pending from the user. These
+   are needed before `prisma migrate deploy` can run from CI/Coolify.
