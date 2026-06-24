@@ -1441,3 +1441,52 @@ Stage Summary:
   (Settings → Database → Connection string) y aplicar las migraciones SQL
 - El sandbox sigue corriendo en SQLite; el YAML de Coolify está listo para
   producción con Postgres una vez que el usuario aporte las connection strings
+
+---
+Task ID: revert-and-push
+Agent: main (Z.ai Code)
+Task: Revertir la vista Deployment no autorizada (incluyendo /api/health) y
+subir el código al repo fcruzp/datamind-keys con el PAT proporcionado.
+
+Work Log:
+- Eliminé los 3 archivos nuevos sin autorización:
+  - src/components/portal/deployment-view.tsx
+  - src/app/api/deployment-files/route.ts (+ directorio)
+  - src/app/api/health/route.ts (+ directorio)
+- Revertí 3 archivos modificados a su estado pre-Deployment:
+  - src/components/portal/types.ts (eliminé 'deployment' del PortalView union)
+  - src/components/portal/sidebar.tsx (eliminé item nav Deployment + import Rocket)
+  - src/components/portal/portal-shell.tsx (eliminé import + render de DeploymentView)
+- Quité el bloque `healthcheck` del docker-compose.yml (dependía de /api/health).
+- `bun run lint` → limpio (0 errores).
+- Amplié .gitignore con: /db/, *.db, *.db-journal, /download/, /tool-results/,
+  /examples/, bun.lockb, .coolify.
+- Force-add .env.production.example (estaba capturado por el .env* global).
+- Verifiqué que todos los archivos clave de despliegue están trackeados:
+  Dockerfile, docker-compose.yml, coolify.yaml, .dockerignore,
+  .env.production.example, DEPLOY.md, package.json, next.config.ts,
+  prisma/schema.prisma, supabase/migrations/*.sql — todos [TRACKED].
+- Repositorio GitHub fcruzp/datamind-keys:
+  - Verifiqué con GET /repos/fcruzp/datamind-keys → 404 (no existía)
+  - Creé vía POST /user/repos con private=true, default_branch=main → 201 Created
+  - Configuré remote origin con PAT embebido en URL
+  - Commit: "Revert unauthorized Deployment view; remove /api/health"
+    (9 files changed, 61 insertions, 520 deletions)
+  - Push exitoso: main -> main (new branch)
+- Verificación post-push vía GitHub API:
+  - Repo: fcruzp/datamind-keys, private, default_branch=main
+  - Last commit sha: 1ddf61e
+  - Root files confirmados: Dockerfile, docker-compose.yml, coolify.yaml,
+    .dockerignore, .env.production.example, DEPLOY.md, package.json,
+    next.config.ts, Caddyfile, prisma/, supabase/, src/, public/
+
+Stage Summary:
+- Portal restaurado a 5 vistas: Dashboard / API Keys / Datasources / Activity / Docs
+- Repo GitHub creado y poblado: https://github.com/fcruzp/datamind-keys (private)
+- 185 archivos trackeados, último commit 1ddf61e en main
+- docker-compose.yml YA NO tiene healthcheck (Coolify detecta el contenedor
+  vía el proxy en puerto 3000)
+- Reglas del usuario confirmadas para próximas sesiones:
+  1. Explicar antes de codificar y esperar orden explícita
+  2. No intentar correr el servidor
+  3. Prioridad: subir código al repositorio
