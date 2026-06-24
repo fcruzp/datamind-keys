@@ -1734,3 +1734,45 @@ Stage Summary:
   4. Si quiere que los stats funcionen, debe verificar que DIRECT_URL y
      DATABASE_URL están marcadas como "Available at Buildtime" en Coolify
      para que prisma db push funcione
+
+---
+Task ID: fix-api-resilience
+Agent: main (Z.ai Code)
+Task: Eliminar los errores 500 en /api/settings/api-keys/usage y otras
+rutas. La página / ya carga pero las llamadas API fallan porque las tablas
+no existen en Postgres.
+
+Work Log:
+- Causa raíz: prisma db push en el Dockerfile probablemente falló porque
+  DIRECT_URL no estaba marcada como "Available at Buildtime" en Coolify.
+  Sin tablas, todos los queries DB fallan → 500.
+- En vez de depender de que el usuario reconfigure Coolify, hice todas las
+  rutas API resilientes:
+  1. Creé src/lib/api-wrapper.ts con helper `withDbSafe(handler)` que:
+     - Envuelve el handler en try/catch
+     - Si es GET y falla DB: devuelve 200 con payload vacío
+       ({keys:[], logs:[], stats:{...zeros}, error:'Database unavailable'})
+     - Si es POST/PATCH/DELETE y falla DB: devuelve 503
+  2. Envuelto todos los handlers:
+     - GET /api/settings/api-keys (list)
+     - POST /api/settings/api-keys (create)
+     - GET /api/settings/api-keys/usage
+     - GET /api/settings/api-keys/audit
+     - GET /api/settings/api-keys/revoked
+     - GET /api/auth/me (con try/catch adicionales para listSwitchableUsers
+       y stats queries)
+- bun run lint → limpio (0 errores).
+- Commit: "Wrap all API routes with withDbSafe to prevent 500 on DB errors"
+- Push exitoso: 2ce1de2..18a4ec7 main -> main
+
+Stage Summary:
+- Todas las rutas API son ahora resilientes a errores de DB
+- El portal renderizará sin errores 500 aunque las tablas no existan
+- Commit: 18a4ec7 en main
+- Usuario debe:
+  1. Bump CACHEBUST=4 → CACHEBUST=5 en Coolify
+  2. Deploy
+  3. La página cargará sin errores de consola
+  4. Para que los datos funcionen de verdad, debe marcar DATABASE_URL y
+     DIRECT_URL como "Available at Buildtime" en Coolify y redeployar
+     (así prisma db push creará las tablas)
