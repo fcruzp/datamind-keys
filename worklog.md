@@ -1541,3 +1541,59 @@ Stage Summary:
   * Domains: datamind-api.mooo.com
   * Ports Exposes: 3000
   * Env vars: solo las 3 secretas
+
+---
+Task ID: autonomous-dockerfile
+Agent: main (Z.ai Code)
+Task: Adaptar el Dockerfile para que funcione con la opción "Dockerfile" de
+Coolify (sin contexto de build, sin Git). El usuario tiene otra app
+(datamind.mooo.com / BIweb) que funciona así y quiere replicar el patrón.
+
+Work Log:
+- Verifiqué que el repo fcruzp/datamind-keys es ahora público (200 OK,
+  visibility=public).
+- Analicé el Dockerfile de BIweb que proporcionó el usuario:
+  - node:20-alpine como base
+  - 3 stages: deps → builder → runner
+  - npm install (con fallback de lockfiles)
+  - npx prisma generate
+  - npm run build
+  - CMD ["node", "server.js"]
+  - Usuario nextjs non-root
+- Clave: el Dockerfile de BIweb usa COPY . . (copia del contexto). Pero la
+  opción "Dockerfile" de Coolify NO provee contexto — solo el texto del
+  Dockerfile. Solución: reemplazar COPY con git clone del repo público.
+- Reescribí el Dockerfile (autónomo):
+  - Stage deps: git clone --depth 1 https://github.com/fcruzp/datamind-keys.git .
+  - npm install (works with bun.lock present)
+  - npx prisma generate
+  - Stage builder: COPY --from=deps /app . + env vars + npm run build
+  - Stage runner: copia standalone + static + prisma + env vars baked-in
+  - CMD ["node", "server.js"]
+- Añadí openssl al apk install (Prisma query engine lo necesita en alpine).
+- Baked-in 8 variables públicas como ENV:
+  - NODE_ENV, NEXT_TELEMETRY_DISABLED, PORT, HOSTNAME
+  - NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY
+  - SUPABASE_PUBLISHABLE_KEY, NEXT_PUBLIC_SITE_URL
+- NEXT_PUBLIC_* vars también en el builder stage (Next.js las inlineda en
+  build time).
+- Actualicé DEPLOY.md para el flujo "Dockerfile" (no "Public Repository"):
+  - Seleccionar "Dockerfile" en + New Resource
+  - Pegar el contenido del Dockerfile en el editor
+  - Solo 3 env vars secretas en Coolify
+- Commit: "Autonomous Dockerfile: git clone repo (no build context needed)"
+- Push exitoso: 7ec784d..7544562 main -> main
+
+Stage Summary:
+- Dockerfile ahora es autónomo: hace git clone del repo público, no necesita
+  contexto de build ni conexión Git en Coolify
+- Patrón replicado del Dockerfile de BIweb (datamind.mooo.com)
+- Commit: 7544562 en main
+- Configuración Coolify final:
+  * Recurso: "Dockerfile" (NO "Public Repository")
+  * Pegar el texto del Dockerfile en el editor
+  * Domains: datamind-api.mooo.com
+  * Ports Exposes: 3000
+  * Env vars: solo 3 secretas (SUPABASE_SERVICE_ROLE_KEY, DATABASE_URL, DIRECT_URL)
+- Requisito: el repo fcruzp/datamind-keys debe mantenerse público para que
+  el git clone funcione sin credenciales
