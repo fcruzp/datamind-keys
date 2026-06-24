@@ -1490,3 +1490,54 @@ Stage Summary:
   1. Explicar antes de codificar y esperar orden explícita
   2. No intentar correr el servidor
   3. Prioridad: subir código al repositorio
+
+---
+Task ID: dockerfile-only-deploy
+Agent: main (Z.ai Code)
+Task: Revertir el enfoque docker-compose y volver a Dockerfile puro (igual que
+datamind.mooo.com / BIweb). Reducir las env vars que el usuario debe configurar
+en Coolify de 11 a 3.
+
+Work Log:
+- Eliminé docker-compose.yml y coolify.yaml del repo (no se necesitan con
+  Build Pack = Dockerfile).
+- Modifiqué Dockerfile para baked-in las variables PÚBLICAS como ENV en el
+  stage runner:
+  - NODE_ENV, NEXT_TELEMETRY_DISABLED, PORT, HOSTNAME (ya estaban)
+  - NEXT_PUBLIC_SUPABASE_URL (pública)
+  - NEXT_PUBLIC_SUPABASE_ANON_KEY (pública por diseño)
+  - SUPABASE_PUBLISHABLE_KEY (pública)
+  - NEXT_PUBLIC_SITE_URL (pública)
+- También añadí NEXT_PUBLIC_* vars al stage builder (Next.js las inlineda
+  en BUILD time, no runtime).
+- Actualicé .env.production.example: ahora solo documenta las 3 variables
+  SECRETAS que el usuario debe configurar en Coolify:
+  - SUPABASE_SERVICE_ROLE_KEY
+  - DATABASE_URL (transaction pooler 6543)
+  - DIRECT_URL (direct pooler 5432)
+- Reescribí DEPLOY.md para el flujo Dockerfile-only:
+  - Build Pack: Dockerfile (NO Docker Compose)
+  - Dockerfile Location: /Dockerfile (default)
+  - Solo 3 env vars en Coolify
+  - Eliminé la sección de "labels Traefik + Caddy" (Coolify los genera
+    automáticamente al poner el dominio en el campo Domains)
+  - Eliminé las opciones A/B (compose vacío) — solo una opción clara
+- bun run lint → limpio (0 errores)
+- Commit: "Switch to Dockerfile-only deploy; bake public env vars into image"
+  (5 files changed, 80 insertions, 294 deletions)
+- Push exitoso: 1ddf61e..7ec784d main -> main
+
+Stage Summary:
+- Repo ahora usa Dockerfile puro, igual que datamind.mooo.com (BIweb)
+- Eliminados: docker-compose.yml, coolify.yaml
+- 8 variables públicas baked-in en el Dockerfile
+- Solo 3 variables secretas requieren configuración manual en Coolify:
+  SUPABASE_SERVICE_ROLE_KEY, DATABASE_URL, DIRECT_URL
+- Commit: 7ec784d en main
+- Configuración Coolify final (simple):
+  * Build Pack: Dockerfile
+  * Dockerfile Location: /Dockerfile
+  * Repository: fcruzp/datamind-keys, Branch: main
+  * Domains: datamind-api.mooo.com
+  * Ports Exposes: 3000
+  * Env vars: solo las 3 secretas
