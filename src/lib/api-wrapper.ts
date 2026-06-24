@@ -61,7 +61,13 @@ export function withDbSafe<T extends NextRequest>(
             },
             recentLogs: [],
             perKeyStats: [],
-            totals: { total: 0, success: 0, errors: 0 },
+            // Dashboard usage query expects these fields:
+            totals: {
+              requests7d: 0,
+              avgDurationMs: 0,
+              lastRequestAt: null,
+            },
+            hourlyHistogram: new Array(24).fill(0),
             logs24h: 0,
             auditLogs: [],
             revokedKeys: [],
