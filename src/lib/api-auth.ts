@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'crypto'
 import { db } from '@/lib/db'
 import type { NextRequest } from 'next/server'
+import { getCurrentUser, type SessionUser } from '@/lib/session'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -14,6 +15,10 @@ export interface AuthenticatedUser {
   id: string
   email: string
   name: string | null
+  /** Tenant / workspace name this user belongs to. */
+  tenantName?: string
+  /** User role within the tenant: "owner" | "admin" | "viewer". */
+  role?: string
 }
 
 export interface AuthenticatedApiKey {
@@ -53,27 +58,35 @@ export interface AuthFailure {
 export type AuthResult = AuthSuccess | AuthFailure
 
 // ---------------------------------------------------------------------------
-// Demo user bootstrap (no Supabase in this sandbox)
-// In production DataMind BI, replace this with Supabase session resolution.
+// Current-user resolution (multi-tenant)
+//
+// The sandbox simulates "logged-in user" with a cookie (see src/lib/session.ts).
+// In real DataMind BI this would resolve the Supabase session user instead.
+//
+// `getDemoUser()` is kept as a thin backwards-compatible wrapper, but new
+// code should call `getCurrentUser(req)` directly so the cookie is honoured.
 // ---------------------------------------------------------------------------
 
-const DEMO_USER_EMAIL = 'demo@datamind.bi'
-const DEMO_USER_NAME = 'DataMind Demo'
-
 /**
- * Returns the sandbox demo user, creating it on first call.
- * In real DataMind BI this would resolve the Supabase session user instead.
+ * @deprecated Use `getCurrentUser(req)` from `@/lib/session` instead.
+ * Returns the sandbox user bound to the current request's session cookie,
+ * falling back to the default demo tenant when no cookie is set.
  */
-export async function getDemoUser(): Promise<AuthenticatedUser> {
-  let user = await db.user.findUnique({
-    where: { email: DEMO_USER_EMAIL },
-  })
-  if (!user) {
-    user = await db.user.create({
-      data: { email: DEMO_USER_EMAIL, name: DEMO_USER_NAME },
-    })
+export async function getDemoUser(
+  req?: NextRequest,
+): Promise<AuthenticatedUser> {
+  const u = await getCurrentUser(req)
+  return toAuthenticatedUser(u)
+}
+
+export function toAuthenticatedUser(u: SessionUser): AuthenticatedUser {
+  return {
+    id: u.id,
+    email: u.email,
+    name: u.name,
+    tenantName: u.tenantName,
+    role: u.role,
   }
-  return { id: user.id, email: user.email, name: user.name }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +268,8 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
       id: apiKey.user.id,
       email: apiKey.user.email,
       name: apiKey.user.name,
+      tenantName: apiKey.user.tenantName,
+      role: apiKey.user.role,
     },
     apiKey: {
       id: apiKey.id,

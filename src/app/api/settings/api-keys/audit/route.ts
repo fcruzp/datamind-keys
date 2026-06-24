@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
 import { getDemoUser } from '@/lib/api-auth'
 import { db } from '@/lib/db'
 
@@ -6,8 +7,8 @@ import { db } from '@/lib/db'
 // Returns the most recent settings-audit entries for the current user.
 // Used by the AuditLogPanel UI to show "who did what, when" for compliance.
 
-export async function GET() {
-  const user = await getDemoUser()
+export async function GET(req: NextRequest) {
+  const user = await getDemoUser(req)
 
   const entries = await db.settingsAuditLog.findMany({
     where: { userId: user.id },

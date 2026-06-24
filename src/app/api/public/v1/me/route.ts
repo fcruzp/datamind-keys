@@ -56,6 +56,8 @@ export async function GET(req: Request) {
         id: auth.user.id,
         email: auth.user.email,
         name: auth.user.name,
+        tenantName: auth.user.tenantName ?? null,
+        role: auth.user.role ?? null,
       },
       apiKey: {
         id: auth.apiKey.id,

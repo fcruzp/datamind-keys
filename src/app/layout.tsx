@@ -18,15 +18,16 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "DataMind BI — API Keys",
+  title: "DataMind BI — Portal",
   description:
-    "Manage per-user API keys for DataMind BI integrations (OpenFN, N8N, etc.). SHA-256 hashed, scope-aware, with full request logging.",
+    "DataMind BI portal: manage per-tenant API keys for OpenFN / N8N integrations, monitor usage, and switch between tenant workspaces. SHA-256 hashed, scope-aware, with full request logging.",
   keywords: [
     "DataMind BI",
     "API Keys",
     "OpenFN",
     "N8N",
     "Business Intelligence",
+    "Multi-tenant",
     "Next.js",
   ],
   authors: [{ name: "DataMind BI" }],
@@ -34,17 +35,17 @@ export const metadata: Metadata = {
     icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
   },
   openGraph: {
-    title: "DataMind BI — API Keys",
+    title: "DataMind BI — Portal",
     description:
-      "Per-user API keys for OpenFN / N8N integrations. Hashed, scoped, logged.",
+      "Per-tenant API keys for OpenFN / N8N integrations. Hashed, scoped, logged.",
     siteName: "DataMind BI",
     type: "website",
   },
   twitter: {
     card: "summary_large_image",
-    title: "DataMind BI — API Keys",
+    title: "DataMind BI — Portal",
     description:
-      "Per-user API keys for OpenFN / N8N integrations. Hashed, scoped, logged.",
+      "Per-tenant API keys for OpenFN / N8N integrations. Hashed, scoped, logged.",
   },
 };
 

@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import {
@@ -19,8 +20,8 @@ import {
 // Lists active (non-revoked) keys for the current user. Never returns plaintext.
 // ---------------------------------------------------------------------------
 
-export async function GET() {
-  const user = await getDemoUser()
+export async function GET(req: NextRequest) {
+  const user = await getDemoUser(req)
 
   const keys = await db.apiKey.findMany({
     where: {
@@ -95,7 +96,7 @@ const createSchema = z.object({
     .or(z.literal(null)),
 })
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   let body: unknown
   try {
     body = await req.json()
@@ -119,7 +120,7 @@ export async function POST(req: Request) {
 
   const { label, scopes, expiresInDays, allowedIps, rateLimitPerMinute } =
     parsed.data
-  const user = await getDemoUser()
+  const user = await getDemoUser(req)
 
   // Cap active keys per user to prevent runaway growth
   const activeCount = await db.apiKey.count({

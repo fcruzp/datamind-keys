@@ -1,11 +1,12 @@
 import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { getDemoUser } from '@/lib/api-auth'
 
 // GET /api/settings/api-keys/usage
 // Returns recent request logs aggregated by API key, for the dashboard widget.
-export async function GET() {
-  const user = await getDemoUser()
+export async function GET(req: NextRequest) {
+  const user = await getDemoUser(req)
 
   const since7d = new Date(Date.now() - 1000 * 60 * 60 * 24 * 7) // 7 days
   const since24h = new Date(Date.now() - 1000 * 60 * 60 * 24) // 24 hours

@@ -1,22 +1,22 @@
-import { getCurrentUser, listSwitchableUsers } from '@/lib/session'
+import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
+import {
+  getCurrentUser,
+  listSwitchableUsers,
+  SESSION_COOKIE,
+} from '@/lib/session'
 import { db } from '@/lib/db'
-import { PortalShell } from '@/components/portal/portal-shell'
-import type { AuthMeResponse } from '@/components/portal/types'
 
-// ---------------------------------------------------------------------------
-// /  —  DataMind BI Portal (sandbox)
-//
-// Server Component: resolves the current tenant from the session cookie,
-// pulls quick stats from the DB (no HTTP round-trip), and hands the bundle
-// to the client-side <PortalShell/> which owns view switching + mutations.
-// ---------------------------------------------------------------------------
+// GET /api/auth/me
+// Returns the currently-logged-in user (resolved from the session cookie),
+// the list of switchable demo tenants, and quick stats so the portal shell
+// can render the sidebar / dashboard without N round-trips.
 
-export default async function Home() {
-  const user = await getCurrentUser()
+export async function GET(req: NextRequest) {
+  const user = await getCurrentUser(req)
   const switchable = await listSwitchableUsers()
 
-  // Quick stats — same shape as /api/auth/me, computed server-side to avoid
-  // a waterfall of fetches on first paint.
+  // Quick stats for the dashboard — active keys + 7d request count for THIS tenant only.
   const since7d = new Date(Date.now() - 1000 * 60 * 60 * 24 * 7)
   const [activeKeys, revokedKeys, requests7d, lastLogAt] = await Promise.all([
     db.apiKey.count({
@@ -38,7 +38,10 @@ export default async function Home() {
     }),
   ])
 
-  const initial: AuthMeResponse = {
+  // The cookie that's actually set (may be undefined → defaults to demo@datamind.bi)
+  const cookieEmail = req.cookies.get(SESSION_COOKIE)?.value
+
+  return NextResponse.json({
     current: {
       id: user.id,
       email: user.email,
@@ -46,6 +49,7 @@ export default async function Home() {
       tenantName: user.tenantName,
       avatarColor: user.avatarColor,
       role: user.role,
+      isDefault: !cookieEmail || cookieEmail === user.email,
     },
     switchable: switchable.map((u) => ({
       id: u.id,
@@ -62,7 +66,5 @@ export default async function Home() {
       requests7d,
       lastRequestAt: lastLogAt?.createdAt ?? null,
     },
-  }
-
-  return <PortalShell initial={initial} />
+  })
 }

@@ -1,0 +1,1011 @@
+     1→'use client'
+     2→
+     3→import * as React from 'react'
+     4→import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+     5→import { formatDistanceToNow, format } from 'date-fns'
+     6→import {
+     7→  AlertTriangle,
+     8→  Clock,
+     9→  Copy,
+    10→  FlaskConical,
+    11→  Gauge,
+    12→  Globe,
+    13→  Hash,
+    14→  KeyRound,
+    15→  Loader2,
+    16→  Pencil,
+    17→  Plus,
+    18→  Shield,
+    19→  ShieldCheck,
+    20→  Trash2,
+    21→  Activity,
+    22→  CheckCircle2,
+    23→  CalendarClock,
+    24→  Filter,
+    25→} from 'lucide-react'
+    26→import { toast } from 'sonner'
+    27→
+    28→import { Button } from '@/components/ui/button'
+    29→import { Card, CardContent, CardHeader } from '@/components/ui/card'
+    30→import { Badge } from '@/components/ui/badge'
+    31→import {
+    32→  Table,
+    33→  TableBody,
+    34→  TableCell,
+    35→  TableHead,
+    36→  TableHeader,
+    37→  TableRow,
+    38→} from '@/components/ui/table'
+    39→import {
+    40→  AlertDialog,
+    41→  AlertDialogAction,
+    42→  AlertDialogCancel,
+    43→  AlertDialogContent,
+    44→  AlertDialogDescription,
+    45→  AlertDialogFooter,
+    46→  AlertDialogHeader,
+    47→  AlertDialogTitle,
+    48→  AlertDialogTrigger,
+    49→} from '@/components/ui/alert-dialog'
+    50→import {
+    51→  Tooltip,
+    52→  TooltipContent,
+    53→  TooltipTrigger,
+    54→} from '@/components/ui/tooltip'
+    55→
+    56→import { CreateApiKeyDialog } from './create-api-key-dialog'
+    57→import { EditApiKeyDialog } from './edit-api-key-dialog'
+    58→import { InlineSparkline } from './inline-sparkline'
+    59→import { NewKeyRevealDialog } from './new-key-reveal-dialog'
+    60→import { RevokedKeysAudit } from './revoked-keys-audit'
+    61→import { AuditLogPanel } from './audit-log-panel'
+    62→import { OpenApiExplorer } from './openapi-explorer'
+    63→import { ScopeBadgeList } from './scope-badge'
+    64→import { TestKeyPopover } from './test-key-popover'
+    65→import { UsageHistogram } from './usage-chart'
+    66→import { useCommandPalette, buildCurlExample } from './command-palette'
+    67→import { useRowKeyboardNav } from './use-row-keyboard-nav'
+    68→import type { ApiKeyListItem, CreatedApiKey, UsageData } from './types'
+    69→import { cn } from '@/lib/utils'
+    70→
+    71→export function ApiKeysManager() {
+    72→  const qc = useQueryClient()
+    73→  const [revealKey, setRevealKey] = React.useState<CreatedApiKey | null>(null)
+    74→  const [expiringOnly, setExpiringOnly] = React.useState(false)
+    75→  const createKeyRef = React.useRef<HTMLButtonElement>(null)
+    76→  const revokedRef = React.useRef<HTMLDivElement>(null)
+    77→
+    78→  // Open the Edit dialog for a key by programmatically clicking its row's Edit button.
+    79→  // Used by the keyboard-nav Enter handler.
+    80→  const handleActivateRow = React.useCallback((rowId: string) => {
+    81→    const btn = document.querySelector(
+    82→      `[data-row-id="${rowId}"] [aria-label^="Edit "]`,
+    83→    ) as HTMLButtonElement | null
+    84→    btn?.click()
+    85→  }, [])
+    86→
+    87→  const handleCopyCurl = React.useCallback(async () => {
+    88→    const host =
+    89→      typeof window !== 'undefined' ? window.location.origin : 'https://datamind.mooo.com'
+    90→    const example = buildCurlExample(host)
+    91→    try {
+    92→      await navigator.clipboard.writeText(example)
+    93→      toast.success('curl example copied to clipboard')
+    94→    } catch {
+    95→      toast.error('Copy failed — select and copy manually')
+    96→    }
+    97→  }, [])
+    98→
+    99→  const { palette } = useCommandPalette(
+   100→    () => createKeyRef.current?.click(),
+   101→    () => revokedRef.current?.scrollIntoView({ behavior: 'smooth' }),
+   102→    handleCopyCurl,
+   103→  )
+   104→
+   105→  const keysQuery = useQuery({
+   106→    queryKey: ['api-keys'],
+   107→    queryFn: async () => {
+   108→      const res = await fetch('/api/settings/api-keys')
+   109→      if (!res.ok) throw new Error('Failed to load API keys')
+   110→      const json = (await res.json()) as { keys: ApiKeyListItem[] }
+   111→      return json.keys
+   112→    },
+   113→  })
+   114→
+   115→  const usageQuery = useQuery({
+   116→    queryKey: ['api-keys-usage'],
+   117→    queryFn: async () => {
+   118→      const res = await fetch('/api/settings/api-keys/usage')
+   119→      if (!res.ok) throw new Error('Failed to load usage stats')
+   120→      return (await res.json()) as UsageData
+   121→    },
+   122→  })
+   123→
+   124→  const revokeMutation = useMutation({
+   125→    mutationFn: async (id: string) => {
+   126→      const res = await fetch(`/api/settings/api-keys/${id}`, {
+   127→        method: 'DELETE',
+   128→      })
+   129→      if (!res.ok) {
+   130→        const j = (await res.json().catch(() => ({}))) as { error?: string }
+   131→        throw new Error(j.error ?? 'Failed to revoke key')
+   132→      }
+   133→    },
+   134→    onSuccess: () => {
+   135→      qc.invalidateQueries({ queryKey: ['api-keys'] })
+   136→      qc.invalidateQueries({ queryKey: ['api-keys-usage'] })
+   137→      toast.success('API key revoked')
+   138→    },
+   139→    onError: (err: Error) => toast.error(err.message),
+   140→  })
+   141→
+   142→  const copyMasked = async (key: ApiKeyListItem) => {
+   143→    // We copy the masked prefix only — never have plaintext client-side after creation
+   144→    try {
+   145→      await navigator.clipboard.writeText(key.keyMasked)
+   146→      toast.success('Masked key copied (for reference only)')
+   147→    } catch {
+   148→      toast.error('Copy failed')
+   149→    }
+   150→  }
+   151→
+   152→  const isLoading = keysQuery.isLoading
+   153→  const allKeys = keysQuery.data ?? []
+   154→  const usage = usageQuery.data
+   155→
+   156→  // Filter to "expiring soon" (within 7 days or already expired) when the
+   157→  // filter toggle is on. Helps users find keys that need rotation.
+   158→  const EXPIRING_SOON_DAYS = 7
+   159→  const isExpiringSoon = (k: ApiKeyListItem): boolean => {
+   160→    if (!k.expiresAt) return false
+   161→    const ms = new Date(k.expiresAt).getTime() - Date.now()
+   162→    return ms < EXPIRING_SOON_DAYS * 24 * 60 * 60 * 1000
+   163→  }
+   164→  const expiringCount = allKeys.filter(isExpiringSoon).length
+   165→  const keys = expiringOnly ? allKeys.filter(isExpiringSoon) : allKeys
+   166→
+   167→  const keyboardNav = useRowKeyboardNav(keys.map((k) => k.id), {
+   168→    onActivate: handleActivateRow,
+   169→  })
+   170→
+   171→  return (
+   172→    <div className="space-y-6">
+   173→      {/* Stats row */}
+   174→      <StatsRow
+   175→        activeCount={keys.length}
+   176→        usage={usage}
+   177→        usageLoading={usageQuery.isLoading}
+   178→      />
+   179→
+   180→      {/* Keys card */}
+   181→      <Card
+   182→        id="keys-section"
+   183→        className="overflow-hidden border-border/60 shadow-sm scroll-mt-24"
+   184→      >
+   185→        <CardHeader className="flex flex-row items-center justify-between gap-4 border-b bg-muted/30 py-4">
+   186→          <div className="space-y-0.5">
+   187→            <div className="flex items-center gap-2 flex-wrap">
+   188→              <KeyRound className="size-4 text-muted-foreground" />
+   189→              <h2 className="text-sm font-semibold">Active API keys</h2>
+   190→              <Badge variant="secondary" className="font-mono text-[11px]">
+   191→                {keys.length}/25
+   192→              </Badge>
+   193→              {expiringCount > 0 && (
+   194→                <button
+   195→                  onClick={() => setExpiringOnly((v) => !v)}
+   196→                  className={cn(
+   197→                    'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium transition-colors',
+   198→                    expiringOnly
+   199→                      ? 'border-amber-500/40 bg-amber-500/15 text-amber-700 dark:text-amber-300'
+   200→                      : 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20',
+   201→                  )}
+   202→                  title="Toggle filter: only show keys expiring within 7 days"
+   203→                >
+   204→                  <CalendarClock className="size-3" />
+   205→                  {expiringCount} expiring
+   206→                  {expiringOnly && <span className="ml-1">· filtered</span>}
+   207→                </button>
+   208→              )}
+   209→            </div>
+   210→            <p className="text-xs text-muted-foreground">
+   211→              Keys are SHA-256 hashed at rest. Plaintext is shown only at creation.
+   212→              {keys.length > 0 && (
+   213→                <span className="ml-2 hidden sm:inline-flex items-center gap-1 text-[10px]">
+   214→                  <kbd className="rounded border border-border bg-background px-1 py-0.5 font-mono">↑</kbd>
+   215→                  <kbd className="rounded border border-border bg-background px-1 py-0.5 font-mono">↓</kbd>
+   216→                  to navigate
+   217→                  <kbd className="ml-1 rounded border border-border bg-background px-1 py-0.5 font-mono">Enter</kbd>
+   218→                  to edit
+   219→                </span>
+   220→              )}
+   221→            </p>
+   222→          </div>
+   223→          <div className="flex items-center gap-2">
+   224→            {expiringCount > 0 && (
+   225→              <Button
+   226→                size="sm"
+   227→                variant={expiringOnly ? 'secondary' : 'ghost'}
+   228→                className="gap-1.5"
+   229→                onClick={() => setExpiringOnly((v) => !v)}
+   230→                title="Toggle 'expiring soon' filter"
+   231→              >
+   232→                <Filter className="size-3.5" />
+   233→                <span className="hidden sm:inline">
+   234→                  {expiringOnly ? 'Show all' : 'Expiring soon'}
+   235→                </span>
+   236→              </Button>
+   237→            )}
+   238→            <CreateApiKeyDialog
+   239→              onCreated={setRevealKey}
+   240→              trigger={
+   241→                <Button ref={createKeyRef} className="gap-2 shadow-sm">
+   242→                  <Plus className="size-4" />
+   243→                  Generate new key
+   244→                </Button>
+   245→              }
+   246→            />
+   247→          </div>
+   248→        </CardHeader>
+   249→
+   250→        <CardContent className="p-0">
+   251→          {isLoading ? (
+   252→            <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
+   253→              <Loader2 className="size-4 animate-spin" /> Loading keys…
+   254→            </div>
+   255→          ) : allKeys.length === 0 ? (
+   256→            <EmptyState onCreate={(k) => setRevealKey(k)} />
+   257→          ) : expiringOnly && keys.length === 0 ? (
+   258→            <div className="flex flex-col items-center justify-center py-12 px-6 text-center">
+   259→              <div className="grid size-10 place-items-center rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 mb-3">
+   260→                <CheckCircle2 className="size-5" />
+   261→              </div>
+   262→              <p className="text-sm font-medium">No keys expiring soon</p>
+   263→              <p className="mt-1 text-xs text-muted-foreground max-w-sm">
+   264→                All your active keys have more than 7 days of life remaining,
+   265→                or never expire.
+   266→              </p>
+   267→              <Button
+   268→                size="sm"
+   269→                variant="ghost"
+   270→                className="mt-3"
+   271→                onClick={() => setExpiringOnly(false)}
+   272→              >
+   273→                Clear filter
+   274→              </Button>
+   275→            </div>
+   276→          ) : (
+   277→            <div className="overflow-x-auto" {...keyboardNav.containerProps}>
+   278→              <Table>
+   279→                <TableHeader>
+   280→                  <TableRow className="hover:bg-transparent">
+   281→                    <TableHead className="pl-6">Label</TableHead>
+   282→                    <TableHead>Key</TableHead>
+   283→                    <TableHead>Scopes</TableHead>
+   284→                    <TableHead className="text-center">24h</TableHead>
+   285→                    <TableHead>Last used</TableHead>
+   286→                    <TableHead>Created</TableHead>
+   287→                    <TableHead>Expires</TableHead>
+   288→                    <TableHead className="pr-6 text-right">Actions</TableHead>
+   289→                  </TableRow>
+   290→                </TableHeader>
+   291→                <TableBody>
+   292→                  {keys.map((key) => {
+   293→                    const perKey = usage?.perKey.find((p) => p.apiKeyId === key.id)
+   294→                    return (
+   295→                      <KeyRow
+   296→                        key={key.id}
+   297→                        apiKey={key}
+   298→                        histogram24h={perKey?.histogram24h ?? []}
+   299→                        count7d={perKey?.count ?? 0}
+   300→                        isActive={keyboardNav.activeRowId === key.id}
+   301→                        onRevoke={(id) => revokeMutation.mutate(id)}
+   302→                        onCopyMasked={() => copyMasked(key)}
+   303→                        revoking={revokeMutation.isPending}
+   304→                      />
+   305→                    )
+   306→                  })}
+   307→                </TableBody>
+   308→              </Table>
+   309→            </div>
+   310→          )}
+   311→        </CardContent>
+   312→      </Card>
+   313→
+   314→      {/* Recent requests table */}
+   315→      <RecentRequests usage={usage} loading={usageQuery.isLoading} />
+   316→
+   317→      {/* OpenAPI spec explorer */}
+   318→      <OpenApiExplorer />
+   319→
+   320→      {/* Revoked keys audit */}
+   321→      <div ref={revokedRef} className="scroll-mt-24">
+   322→        <RevokedKeysAudit />
+   323→      </div>
+   324→
+   325→      {/* Settings audit log (create / edit / revoke history) */}
+   326→      <AuditLogPanel />
+   327→
+   328→      {/* Security note */}
+   329→      <SecurityNote />
+   330→
+   331→      {/* One-time reveal modal */}
+   332→      <NewKeyRevealDialog
+   333→        created={revealKey}
+   334→        onClose={() => setRevealKey(null)}
+   335→      />
+   336→
+   337→      {/* Command palette (Cmd/Ctrl+K) */}
+   338→      {palette}
+   339→    </div>
+   340→  )
+   341→}
+   342→
+   343→// ---------------------------------------------------------------------------
+   344→// Stats row
+   345→// ---------------------------------------------------------------------------
+   346→
+   347→function StatsRow({
+   348→  activeCount,
+   349→  usage,
+   350→  usageLoading,
+   351→}: {
+   352→  activeCount: number
+   353→  usage?: UsageData
+   354→  usageLoading: boolean
+   355→}) {
+   356→  return (
+   357→    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+   358→      <StatCard
+   359→        icon={<KeyRound className="size-4" />}
+   360→        label="Active keys"
+   361→        value={String(activeCount)}
+   362→        hint="non-revoked"
+   363→        tone="emerald"
+   364→      />
+   365→      <StatCard
+   366→        icon={<Activity className="size-4" />}
+   367→        label="Requests (7d)"
+   368→        value={usage ? String(usage.totals.requests7d) : '—'}
+   369→        hint={
+   370→          usage?.totals.lastRequestAt
+   371→            ? `last ${formatDistanceToNow(new Date(usage.totals.lastRequestAt), { addSuffix: true })}`
+   372→            : 'no activity yet'
+   373→        }
+   374→        tone="sky"
+   375→        loading={usageLoading}
+   376→      />
+   377→      <StatCard
+   378→        icon={<Clock className="size-4" />}
+   379→        label="Avg latency"
+   380→        value={usage ? `${usage.totals.avgDurationMs}ms` : '—'}
+   381→        hint="last 7 days"
+   382→        tone="amber"
+   383→        loading={usageLoading}
+   384→      />
+   385→      <Card className="overflow-hidden border-border/60">
+   386→        <CardContent className="p-4">
+   387→          <div className="flex items-center justify-between mb-2">
+   388→            <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+   389→              24h activity
+   390→            </span>
+   391→            <Activity className="size-3.5 text-muted-foreground" />
+   392→          </div>
+   393→          {usageLoading ? (
+   394→            <div className="h-20 flex items-center justify-center">
+   395→              <Loader2 className="size-4 animate-spin text-muted-foreground" />
+   396→            </div>
+   397→          ) : (
+   398→            <>
+   399→              <UsageHistogram data={usage?.hourlyHistogram ?? new Array(24).fill(0)} />
+   400→              <p className="mt-2 text-[11px] text-muted-foreground">
+   401→                Hourly request volume, current hour on the right
+   402→              </p>
+   403→            </>
+   404→          )}
+   405→        </CardContent>
+   406→      </Card>
+   407→    </div>
+   408→  )
+   409→}
+   410→
+   411→function StatCard({
+   412→  icon,
+   413→  label,
+   414→  value,
+   415→  hint,
+   416→  tone,
+   417→  loading,
+   418→}: {
+   419→  icon: React.ReactNode
+   420→  label: string
+   421→  value: string
+   422→  hint?: string
+   423→  tone: 'emerald' | 'sky' | 'amber'
+   424→  loading?: boolean
+   425→}) {
+   426→  const tones = {
+   427→    emerald: 'text-emerald-600 dark:text-emerald-400 bg-emerald-500/10',
+   428→    sky: 'text-sky-600 dark:text-sky-400 bg-sky-500/10',
+   429→    amber: 'text-amber-600 dark:text-amber-400 bg-amber-500/10',
+   430→  } as const
+   431→  return (
+   432→    <Card className="overflow-hidden border-border/60">
+   433→      <CardContent className="p-4">
+   434→        <div className="flex items-center justify-between mb-2">
+   435→          <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+   436→            {label}
+   437→          </span>
+   438→          <span className={cn('grid size-7 place-items-center rounded-md', tones[tone])}>
+   439→            {icon}
+   440→          </span>
+   441→        </div>
+   442→        <div className="text-2xl font-semibold tabular-nums tracking-tight">
+   443→          {loading ? <Loader2 className="size-5 animate-spin text-muted-foreground" /> : value}
+   444→        </div>
+   445→        {hint && <p className="mt-1 text-[11px] text-muted-foreground">{hint}</p>}
+   446→      </CardContent>
+   447→    </Card>
+   448→  )
+   449→}
+   450→
+   451→// ---------------------------------------------------------------------------
+   452→// Empty state
+   453→// ---------------------------------------------------------------------------
+   454→
+   455→function EmptyState({ onCreate }: { onCreate: (key: CreatedApiKey) => void }) {
+   456→  return (
+   457→    <div className="flex flex-col items-center justify-center py-16 px-6 text-center">
+   458→      <div className="grid size-14 place-items-center rounded-2xl bg-gradient-to-br from-emerald-500/15 to-sky-500/10 text-emerald-600 dark:text-emerald-400 mb-4">
+   459→        <KeyRound className="size-7" />
+   460→      </div>
+   461→      <h3 className="text-base font-semibold">No active API keys yet</h3>
+   462→      <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+   463→        Generate your first key to let tools like OpenFN or N8N read
+   464→        datasources and run queries against your DataMind BI account.
+   465→      </p>
+   466→      <div className="mt-5">
+   467→        <CreateApiKeyDialog onCreated={onCreate} />
+   468→      </div>
+   469→    </div>
+   470→  )
+   471→}
+   472→
+   473→// ---------------------------------------------------------------------------
+   474→// Table row
+   475→// ---------------------------------------------------------------------------
+   476→
+   477→function KeyRow({
+   478→  apiKey,
+   479→  histogram24h,
+   480→  count7d,
+   481→  isActive,
+   482→  onRevoke,
+   483→  onCopyMasked,
+   484→  revoking,
+   485→}: {
+   486→  apiKey: ApiKeyListItem
+   487→  histogram24h: number[]
+   488→  count7d: number
+   489→  isActive: boolean
+   490→  onRevoke: (id: string) => void
+   491→  onCopyMasked: () => void
+   492→  revoking: boolean
+   493→}) {
+   494→  const isExpired =
+   495→    apiKey.expiresAt && new Date(apiKey.expiresAt).getTime() < Date.now()
+   496→
+   497→  const total24h = histogram24h.reduce((a, b) => a + b, 0)
+   498→
+   499→  return (
+   500→    <TableRow
+   501→      data-row-id={apiKey.id}
+   502→      className={cn(
+   503→        'group transition-colors',
+   504→        isActive && 'bg-emerald-500/[0.04] shadow-[inset_2px_0_0_0_rgb(16_185_129)]',
+   505→      )}
+   506→    >
+   507→      <TableCell className="pl-6 py-3 align-top">
+   508→        <div className="font-medium text-sm">{apiKey.label}</div>
+   509→        <div className="flex flex-wrap items-center gap-1 mt-1">
+   510→          {/* IP allowlist chip */}
+   511→          {apiKey.allowedIps.length > 0 ? (
+   512→            <Tooltip>
+   513→              <TooltipTrigger asChild>
+   514→                <span className="inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-300 cursor-default">
+   515→                  <Shield className="size-3" />
+   516→                  {apiKey.allowedIps.length} IP
+   517→                  {apiKey.allowedIps.length === 1 ? '' : 's'}
+   518→                </span>
+   519→              </TooltipTrigger>
+   520→              <TooltipContent side="top" className="text-xs">
+   521→                <div className="font-medium mb-1">IP allowlist</div>
+   522→                {apiKey.allowedIps.map((ip) => (
+   523→                  <div key={ip} className="font-mono">
+   524→                    {ip}
+   525→                  </div>
+   526→                ))}
+   527→              </TooltipContent>
+   528→            </Tooltip>
+   529→          ) : (
+   530→            <span className="inline-flex items-center gap-1 rounded-md border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+   531→              <Globe className="size-3" />
+   532→              any IP
+   533→            </span>
+   534→          )}
+   535→          {/* Rate limit chip */}
+   536→          <Tooltip>
+   537→            <TooltipTrigger asChild>
+   538→              <span
+   539→                className={cn(
+   540→                  'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium cursor-default',
+   541→                  apiKey.rateLimitPerMinute === null
+   542→                    ? 'border-border/60 bg-muted/40 text-muted-foreground'
+   543→                    : 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+   544→                )}
+   545→              >
+   546→                <Gauge className="size-3" />
+   547→                {apiKey.rateLimitPerMinute === null
+   548→                  ? '60/min (default)'
+   549→                  : `${apiKey.rateLimitPerMinute}/min`}
+   550→              </span>
+   551→            </TooltipTrigger>
+   552→            <TooltipContent side="top" className="text-xs">
+   553→              Per-key rate limit (token bucket)
+   554→            </TooltipContent>
+   555→          </Tooltip>
+   556→        </div>
+   557→      </TableCell>
+   558→      <TableCell className="py-3 align-top">
+   559→        <button
+   560→          onClick={onCopyMasked}
+   561→          className="inline-flex items-center gap-2 font-mono text-xs text-muted-foreground hover:text-foreground transition-colors"
+   562→          title="Copy masked key"
+   563→        >
+   564→          <span className="rounded bg-muted px-2 py-1 border border-border/60">
+   565→            {apiKey.keyMasked}
+   566→          </span>
+   567→          <Copy className="size-3 opacity-0 group-hover:opacity-100 transition-opacity" />
+   568→        </button>
+   569→      </TableCell>
+   570→      <TableCell className="py-3 align-top">
+   571→        <ScopeBadgeList scopes={apiKey.scopes} />
+   572→      </TableCell>
+   573→      <TableCell className="py-3 align-top text-center">
+   574→        <Tooltip>
+   575→          <TooltipTrigger asChild>
+   576→            <div className="inline-flex flex-col items-center gap-0.5 cursor-default">
+   577→              <InlineSparkline data={histogram24h} />
+   578→              <span className="text-[10px] text-muted-foreground tabular-nums">
+   579→                {total24h}
+   580→                {count7d > total24h && (
+   581→                  <span className="text-muted-foreground/60"> / {count7d}</span>
+   582→                )}
+   583→              </span>
+   584→            </div>
+   585→          </TooltipTrigger>
+   586→          <TooltipContent side="top" className="text-xs">
+   587→            <div>{total24h} request{total24h === 1 ? '' : 's'} in last 24h</div>
+   588→            <div className="text-muted-foreground">{count7d} in last 7 days</div>
+   589→          </TooltipContent>
+   590→        </Tooltip>
+   591→      </TableCell>
+   592→      <TableCell className="py-3 align-top">
+   593→        {apiKey.lastUsedAt ? (
+   594→          <Tooltip>
+   595→            <TooltipTrigger asChild>
+   596→              <span className="text-xs text-muted-foreground cursor-default">
+   597→                {formatDistanceToNow(new Date(apiKey.lastUsedAt), { addSuffix: true })}
+   598→              </span>
+   599→            </TooltipTrigger>
+   600→            <TooltipContent side="top" className="text-xs">
+   601→              <div>{format(new Date(apiKey.lastUsedAt), 'PPpp')}</div>
+   602→              {apiKey.lastUsedIp && (
+   603→                <div className="text-muted-foreground flex items-center gap-1 mt-0.5">
+   604→                  <Globe className="size-3" /> {apiKey.lastUsedIp}
+   605→                </div>
+   606→              )}
+   607→            </TooltipContent>
+   608→          </Tooltip>
+   609→        ) : (
+   610→          <span className="text-xs text-muted-foreground italic">never</span>
+   611→        )}
+   612→      </TableCell>
+   613→      <TableCell className="py-3 align-top">
+   614→        <Tooltip>
+   615→          <TooltipTrigger asChild>
+   616→            <span className="text-xs text-muted-foreground cursor-default">
+   617→              {formatDistanceToNow(new Date(apiKey.createdAt), { addSuffix: true })}
+   618→            </span>
+   619→          </TooltipTrigger>
+   620→          <TooltipContent side="top" className="text-xs">
+   621→            {format(new Date(apiKey.createdAt), 'PPpp')}
+   622→          </TooltipContent>
+   623→        </Tooltip>
+   624→      </TableCell>
+   625→      <TableCell className="py-3 align-top">
+   626→        {apiKey.expiresAt ? (
+   627→          <ExpiryCell expiresAt={apiKey.expiresAt} isExpired={!!isExpired} />
+   628→        ) : (
+   629→          <span className="text-xs text-muted-foreground">Never</span>
+   630→        )}
+   631→      </TableCell>
+   632→      <TableCell className="pr-6 py-3 text-right align-top">
+   633→        <div className="inline-flex items-center gap-1">
+   634→          {/* Edit */}
+   635→          <EditApiKeyDialog
+   636→            apiKey={apiKey}
+   637→            trigger={
+   638→              <Button
+   639→                size="sm"
+   640→                variant="ghost"
+   641→                className="h-8 px-2 text-muted-foreground hover:text-foreground hover:bg-muted/60"
+   642→                aria-label={`Edit ${apiKey.label}`}
+   643→                title="Edit label, rate limit, IPs"
+   644→              >
+   645→                <Pencil className="size-3.5" />
+   646→              </Button>
+   647→            }
+   648→          />
+   649→
+   650→          {/* Test */}
+   651→          <TestKeyPopover expectedPrefix={apiKey.keyMasked}>
+   652→            <Button
+   653→              size="sm"
+   654→              variant="ghost"
+   655→              className="h-8 px-2 text-muted-foreground hover:text-emerald-600 hover:bg-emerald-500/10"
+   656→              aria-label={`Test ${apiKey.label}`}
+   657→              title="Test key against /api/public/v1/me"
+   658→            >
+   659→              <FlaskConical className="size-3.5" />
+   660→            </Button>
+   661→          </TestKeyPopover>
+   662→
+   663→          {/* Revoke */}
+   664→          <AlertDialog>
+   665→            <Tooltip>
+   666→              <TooltipTrigger asChild>
+   667→                <AlertDialogTrigger asChild>
+   668→                  <Button
+   669→                    size="sm"
+   670→                    variant="ghost"
+   671→                    className="h-8 px-2 text-muted-foreground hover:text-rose-600 hover:bg-rose-500/10"
+   672→                    disabled={revoking}
+   673→                    aria-label={`Revoke ${apiKey.label}`}
+   674→                  >
+   675→                    <Trash2 className="size-3.5" />
+   676→                  </Button>
+   677→                </AlertDialogTrigger>
+   678→              </TooltipTrigger>
+   679→              <TooltipContent side="top" className="text-xs">
+   680→                Revoke key
+   681→              </TooltipContent>
+   682→            </Tooltip>
+   683→            <AlertDialogContent>
+   684→              <AlertDialogHeader>
+   685→                <AlertDialogTitle className="flex items-center gap-2">
+   686→                  <AlertTriangle className="size-5 text-amber-500" />
+   687→                  Revoke API key?
+   688→                </AlertDialogTitle>
+   689→                <AlertDialogDescription>
+   690→                  This will immediately disable the key{' '}
+   691→                  <span className="font-medium text-foreground">{apiKey.label}</span>.
+   692→                  Any integration using it will start receiving{' '}
+   693→                  <code className="text-foreground">401 Unauthorized</code> responses.
+   694→                  This action cannot be undone.
+   695→                </AlertDialogDescription>
+   696→              </AlertDialogHeader>
+   697→              <div className="rounded-md bg-muted/50 border p-3 space-y-1.5">
+   698→                <div className="flex items-center gap-2 text-xs">
+   699→                  <Hash className="size-3 text-muted-foreground" />
+   700→                  <span className="font-mono">{apiKey.keyMasked}</span>
+   701→                </div>
+   702→                <div className="flex items-center gap-2 text-xs">
+   703→                  <ShieldCheck className="size-3 text-muted-foreground" />
+   704→                  <span>Scopes: {apiKey.scopes.join(', ') || 'none'}</span>
+   705→                </div>
+   706→                {apiKey.allowedIps.length > 0 && (
+   707→                  <div className="flex items-center gap-2 text-xs">
+   708→                    <Shield className="size-3 text-muted-foreground" />
+   709→                    <span>
+   710→                      IP allowlist:{' '}
+   711→                      <span className="font-mono">
+   712→                        {apiKey.allowedIps.join(', ')}
+   713→                      </span>
+   714→                    </span>
+   715→                  </div>
+   716→                )}
+   717→                <div className="flex items-center gap-2 text-xs">
+   718→                  <Gauge className="size-3 text-muted-foreground" />
+   719→                  <span>
+   720→                    Rate limit:{' '}
+   721→                    {apiKey.rateLimitPerMinute === null
+   722→                      ? '60/min (default)'
+   723→                      : `${apiKey.rateLimitPerMinute}/min`}
+   724→                  </span>
+   725→                </div>
+   726→              </div>
+   727→              <AlertDialogFooter>
+   728→                <AlertDialogCancel>Cancel</AlertDialogCancel>
+   729→                <AlertDialogAction
+   730→                  onClick={() => onRevoke(apiKey.id)}
+   731→                  className="bg-rose-600 hover:bg-rose-700 text-white"
+   732→                >
+   733→                  Revoke key
+   734→                </AlertDialogAction>
+   735→              </AlertDialogFooter>
+   736→            </AlertDialogContent>
+   737→          </AlertDialog>
+   738→        </div>
+   739→      </TableCell>
+   740→    </TableRow>
+   741→  )
+   742→}
+   743→
+   744→// ---------------------------------------------------------------------------
+   745→// Recent requests
+   746→// ---------------------------------------------------------------------------
+   747→
+   748→function RecentRequests({
+   749→  usage,
+   750→  loading,
+   751→}: {
+   752→  usage?: UsageData
+   753→  loading: boolean
+   754→}) {
+   755→  const recent = usage?.recent ?? []
+   756→  return (
+   757→    <Card className="overflow-hidden border-border/60">
+   758→      <CardHeader className="border-b bg-muted/30 py-4">
+   759→        <div className="flex items-center gap-2">
+   760→          <Activity className="size-4 text-muted-foreground" />
+   761→          <h2 className="text-sm font-semibold">Recent API requests</h2>
+   762→          <Badge variant="secondary" className="font-mono text-[11px]">
+   763→            last 25 / 7d
+   764→          </Badge>
+   765→        </div>
+   766→      </CardHeader>
+   767→      <CardContent className="p-0">
+   768→        {loading ? (
+   769→          <div className="flex items-center justify-center py-10 text-sm text-muted-foreground">
+   770→            <Loader2 className="size-4 animate-spin mr-2" /> Loading…
+   771→          </div>
+   772→        ) : recent.length === 0 ? (
+   773→          <div className="flex flex-col items-center justify-center py-12 px-6 text-center">
+   774→            <div className="grid size-10 place-items-center rounded-xl bg-muted text-muted-foreground mb-3">
+   775→              <CheckCircle2 className="size-5" />
+   776→            </div>
+   777→            <p className="text-sm font-medium">No requests yet</p>
+   778→            <p className="mt-1 text-xs text-muted-foreground max-w-sm">
+   779→              Once a third-party tool calls a{' '}
+   780→              <code className="text-foreground">/api/public/v1/*</code>{' '}
+   781→              endpoint with one of your keys, requests will appear here.
+   782→            </p>
+   783→          </div>
+   784→        ) : (
+   785→          <div className="max-h-96 overflow-y-auto">
+   786→            <Table>
+   787→              <TableHeader className="sticky top-0 bg-background z-10">
+   788→                <TableRow className="hover:bg-transparent">
+   789→                  <TableHead className="pl-6">Time</TableHead>
+   790→                  <TableHead>Method</TableHead>
+   791→                  <TableHead>Endpoint</TableHead>
+   792→                  <TableHead>Key</TableHead>
+   793→                  <TableHead>Status</TableHead>
+   794→                  <TableHead className="pr-6 text-right">Latency</TableHead>
+   795→                </TableRow>
+   796→              </TableHeader>
+   797→              <TableBody>
+   798→                {recent.map((log) => (
+   799→                  <TableRow key={log.id}>
+   800→                    <TableCell className="pl-6 py-2.5">
+   801→                      <span className="text-xs text-muted-foreground tabular-nums">
+   802→                        {formatDistanceToNow(new Date(log.createdAt), {
+   803→                          addSuffix: true,
+   804→                        })}
+   805→                      </span>
+   806→                    </TableCell>
+   807→                    <TableCell className="py-2.5">
+   808→                      <MethodBadge method={log.method} />
+   809→                    </TableCell>
+   810→                    <TableCell className="py-2.5">
+   811→                      <code className="text-xs font-mono">{log.endpoint}</code>
+   812→                    </TableCell>
+   813→                    <TableCell className="py-2.5">
+   814→                      <span className="text-xs text-muted-foreground">
+   815→                        {log.apiKeyLabel}
+   816→                      </span>
+   817→                    </TableCell>
+   818→                    <TableCell className="py-2.5">
+   819→                      <StatusBadge status={log.statusCode} />
+   820→                    </TableCell>
+   821→                    <TableCell className="pr-6 py-2.5 text-right">
+   822→                      <span className="text-xs text-muted-foreground tabular-nums">
+   823→                        {log.durationMs}ms
+   824→                      </span>
+   825→                    </TableCell>
+   826→                  </TableRow>
+   827→                ))}
+   828→              </TableBody>
+   829→            </Table>
+   830→          </div>
+   831→        )}
+   832→      </CardContent>
+   833→    </Card>
+   834→  )
+   835→}
+   836→
+   837→function MethodBadge({ method }: { method: string }) {
+   838→  const tones: Record<string, string> = {
+   839→    GET: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+   840→    POST: 'bg-sky-500/10 text-sky-700 dark:text-sky-300',
+   841→    DELETE: 'bg-rose-500/10 text-rose-700 dark:text-rose-300',
+   842→    PUT: 'bg-amber-500/10 text-amber-700 dark:text-amber-300',
+   843→    PATCH: 'bg-violet-500/10 text-violet-700 dark:text-violet-300',
+   844→  }
+   845→  return (
+   846→    <span
+   847→      className={cn(
+   848→        'inline-block rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold',
+   849→        tones[method] ?? 'bg-muted text-muted-foreground',
+   850→      )}
+   851→    >
+   852→      {method}
+   853→    </span>
+   854→  )
+   855→}
+   856→
+   857→function StatusBadge({ status }: { status: number }) {
+   858→  let tone = 'bg-muted text-muted-foreground'
+   859→  if (status >= 200 && status < 300)
+   860→    tone = 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+   861→  else if (status >= 300 && status < 400)
+   862→    tone = 'bg-sky-500/10 text-sky-700 dark:text-sky-300'
+   863→  else if (status >= 400 && status < 500)
+   864→    tone = 'bg-amber-500/10 text-amber-700 dark:text-amber-300'
+   865→  else if (status >= 500) tone = 'bg-rose-500/10 text-rose-700 dark:text-rose-300'
+   866→  return (
+   867→    <span className={cn('font-mono text-xs px-1.5 py-0.5 rounded', tone)}>
+   868→      {status}
+   869→    </span>
+   870→  )
+   871→}
+   872→
+   873→// ---------------------------------------------------------------------------
+   874→// Expiry cell — shows date + warning chip if expiring soon
+   875→// ---------------------------------------------------------------------------
+   876→
+   877→function ExpiryCell({
+   878→  expiresAt,
+   879→  isExpired,
+   880→}: {
+   881→  expiresAt: string
+   882→  isExpired: boolean
+   883→}) {
+   884→  const date = new Date(expiresAt)
+   885→  const msRemaining = date.getTime() - Date.now()
+   886→  const daysRemaining = Math.ceil(msRemaining / (24 * 60 * 60 * 1000))
+   887→
+   888→  // Expired
+   889→  if (isExpired) {
+   890→    return (
+   891→      <Tooltip>
+   892→        <TooltipTrigger asChild>
+   893→          <span className="inline-flex items-center gap-1 text-xs text-rose-500 font-medium cursor-default">
+   894→            <CalendarClock className="size-3" />
+   895→            Expired
+   896→          </span>
+   897→        </TooltipTrigger>
+   898→        <TooltipContent side="top" className="text-xs">
+   899→          Expired {format(date, 'PPpp')}
+   900→        </TooltipContent>
+   901→      </Tooltip>
+   902→    )
+   903→  }
+   904→
+   905→  // Expiring soon (within 7 days)
+   906→  if (daysRemaining <= 7) {
+   907→    return (
+   908→      <Tooltip>
+   909→        <TooltipTrigger asChild>
+   910→          <span className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300 cursor-default">
+   911→            <CalendarClock className="size-3" />
+   912→            {daysRemaining <= 0
+   913→              ? 'today'
+   914→              : daysRemaining === 1
+   915→                ? '1 day'
+   916→                : `${daysRemaining}d`}
+   917→          </span>
+   918→        </TooltipTrigger>
+   919→        <TooltipContent side="top" className="text-xs">
+   920→          <div>Expires {format(date, 'PPpp')}</div>
+   921→          <div className="text-muted-foreground">
+   922→            Consider rotating this key soon.
+   923→          </div>
+   924→        </TooltipContent>
+   925→      </Tooltip>
+   926→    )
+   927→  }
+   928→
+   929→  // Normal expiry
+   930→  return (
+   931→    <Tooltip>
+   932→      <TooltipTrigger asChild>
+   933→        <span className="text-xs text-muted-foreground cursor-default">
+   934→          {format(date, 'PP')}
+   935→        </span>
+   936→      </TooltipTrigger>
+   937→      <TooltipContent side="top" className="text-xs">
+   938→        {format(date, 'PPpp')}
+   939→      </TooltipContent>
+   940→    </Tooltip>
+   941→  )
+   942→}
+   943→
+   944→// ---------------------------------------------------------------------------
+   945→// Security note
+   946→// ---------------------------------------------------------------------------
+   947→
+   948→function SecurityNote() {
+   949→  return (
+   950→    <div className="rounded-lg border border-border/60 bg-muted/20 p-4">
+   951→      <div className="flex gap-3">
+   952→        <ShieldCheck className="size-5 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
+   953→        <div className="space-y-1.5 text-sm">
+   954→          <p className="font-medium">Security best practices</p>
+   955→          <ul className="space-y-1 text-muted-foreground text-[13px] leading-relaxed">
+   956→            <li className="flex gap-2">
+   957→              <span className="text-emerald-500">•</span>
+   958→              <span>
+   959→                Keys are stored as <strong className="text-foreground">SHA-256 hashes</strong> —
+   960→                plaintext is never persisted, only shown once at creation.
+   961→              </span>
+   962→            </li>
+   963→            <li className="flex gap-2">
+   964→              <span className="text-emerald-500">•</span>
+   965→              <span>
+   966→                Use the <ScopeInlineBadge scope="read" /> scope for
+   967→                integrations that only need to read data. Reserve{' '}
+   968→                <ScopeInlineBadge scope="admin" /> for trusted internal tools.
+   969→              </span>
+   970→            </li>
+   971→            <li className="flex gap-2">
+   972→              <span className="text-emerald-500">•</span>
+   973→              <span>
+   974→                Set an expiry for short-lived syncs, and{' '}
+   975→                <strong className="text-foreground">rotate keys</strong>{' '}
+   976→                periodically. Revoking is instant and irreversible.
+   977→              </span>
+   978→            </li>
+   979→            <li className="flex gap-2">
+   980→              <span className="text-emerald-500">•</span>
+   981→              <span>
+   982→                Restrict keys to known IPs with the{' '}
+   983→                <Shield className="inline size-3 -mt-0.5" /> allowlist, and
+   984→                cap burst traffic with a per-key{' '}
+   985→                <Gauge className="inline size-3 -mt-0.5" /> rate limit. Excess
+   986→                calls return <code className="text-foreground">429</code>.
+   987→              </span>
+   988→            </li>
+   989→            <li className="flex gap-2">
+   990→              <span className="text-emerald-500">•</span>
+   991→              <span>
+   992→                All API requests are logged with endpoint, status, latency and
+   993→                IP — visible above and via{' '}
+   994→                <code className="text-foreground">/api/public/v1/usage</code>.
+   995→              </span>
+   996→            </li>
+   997→          </ul>
+   998→        </div>
+   999→      </div>
+  1000→    </div>
+  1001→  )
+  1002→}
+  1003→
+  1004→function ScopeInlineBadge({ scope }: { scope: 'read' | 'execute' | 'admin' }) {
+  1005→  return (
+  1006→    <code className="font-mono text-[11px] bg-muted px-1 py-0.5 rounded border border-border/60">
+  1007→      {scope}
+  1008→    </code>
+  1009→  )
+  1010→}
+  1011→

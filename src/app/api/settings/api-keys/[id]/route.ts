@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import {
@@ -36,11 +37,11 @@ const patchSchema = z.object({
 })
 
 export async function PATCH(
-  req: Request,
+  req: NextRequest,
   ctx: { params: Promise<{ id: string }> },
 ) {
   const { id } = await ctx.params
-  const user = await getDemoUser()
+  const user = await getDemoUser(req)
 
   let body: unknown
   try {
@@ -155,11 +156,11 @@ export async function PATCH(
 // ---------------------------------------------------------------------------
 
 export async function DELETE(
-  req: Request,
+  req: NextRequest,
   ctx: { params: Promise<{ id: string }> },
 ) {
   const { id } = await ctx.params
-  const user = await getDemoUser()
+  const user = await getDemoUser(req)
 
   const apiKey = await db.apiKey.findFirst({
     where: { id, userId: user.id },

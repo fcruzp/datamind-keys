@@ -10,12 +10,24 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/// A DataMind BI account. In production this is provisioned by Supabase Auth;
+/// in the sandbox we seed a handful of deterministic demo users (one per
+/// "tenant") so the per-tenant API key flows can be exercised end-to-end.
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id          String   @id @default(cuid())
+  email       String   @unique
+  name        String?
+  /// Display name of the tenant/workspace this user owns (e.g. "Acme Analytics").
+  /// In production this maps to the Supabase org/tenant; in the sandbox it
+  /// lets us render a clear "Logged in as <tenant>" badge in the portal.
+  tenantName  String   @default("Personal")
+  /// Tailwind gradient class used to colour the avatar in the switcher.
+  avatarColor String   @default("from-emerald-500 to-teal-600")
+  /// "owner" | "admin" | "viewer" — drives what the portal shows.
+  role        String   @default("owner")
+  lastLoginAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   apiKeys ApiKey[]
 }

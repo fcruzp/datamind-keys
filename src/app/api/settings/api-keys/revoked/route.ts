@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import {
   getDemoUser,
@@ -9,8 +10,8 @@ import {
 
 // GET /api/settings/api-keys/revoked
 // Lists revoked keys for audit (no plaintext). Newest-revoked first.
-export async function GET() {
-  const user = await getDemoUser()
+export async function GET(req: NextRequest) {
+  const user = await getDemoUser(req)
 
   const keys = await db.apiKey.findMany({
     where: {

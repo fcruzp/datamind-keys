@@ -912,3 +912,116 @@ i18n/UI patterns.
 5. **Audit log retention** — add a `pruneOldAuditEntries(days=365)` cron.
 6. **CSV audit export** — compliance teams may want `?format=csv` on the
    `/revoked` endpoint.
+
+---
+
+## Task ID: 3 (multi-tenant portal refactor)
+Agent: main (Z.ai Code)
+Task: Convert the API Keys page from being the root index into a navigable
+section of a proper DataMind BI portal, and add multi-tenant / per-logged-in-
+user support so each tenant has its own API key management.
+
+### Work Log
+
+- **Schema migration** (`prisma/schema.prisma`): extended `User` model with
+  `tenantName`, `avatarColor`, `role`, `lastLoginAt`. Ran `bun run db:push`
+  and `bunx prisma generate` (the second was required because Next.js dev
+  server cached the old Prisma client and a 500 was thrown on first render).
+- **Session layer** (`src/lib/session.ts`, new file): cookie-based session
+  that simulates "logged-in user" via `dm_session_email` cookie. Seeds 4
+  deterministic demo tenants on first call (DataMind BI, Acme Analytics ×2,
+  Norte Logistics) using `upsert` so older sandbox DBs get the right
+  `tenantName` / `avatarColor` even if a `demo@datamind.bi` user already
+  existed from a previous round.
+- **Auth library refactor** (`src/lib/api-auth.ts`): `getDemoUser()` is now a
+  thin backwards-compatible wrapper that delegates to `getCurrentUser(req)`
+  from the new session module — so every existing route automatically
+  honours the session cookie. `AuthenticatedUser` type extended with
+  optional `tenantName` / `role`; `authenticateApiKey()` now populates them
+  from `apiKey.user`, so public API responses include tenant metadata.
+- **Settings routes** updated to thread `NextRequest` through `getDemoUser(req)`:
+  `/api/settings/api-keys` (GET+POST), `/api/settings/api-keys/[id]`
+  (PATCH+DELETE), `/api/settings/api-keys/usage`, `/api/settings/api-keys/revoked`,
+  `/api/settings/api-keys/audit`. All tenant-scoped queries are unchanged —
+  the `userId` filter already provides isolation.
+- **Public API**: `/api/public/v1/me` now returns `user.tenantName` and
+  `user.role` so consumers (OpenFN/N8N) know which tenant a key belongs to.
+- **New auth routes**: `GET /api/auth/me` (returns current user + switchable
+  tenants + quick stats in a single round-trip), `POST /api/auth/switch`
+  (sets the session cookie to a different seeded tenant, validates the
+  target email is in the switchable list, touches `lastLoginAt`).
+- **Portal components** (new folder `src/components/portal/`):
+  - `types.ts` — shared `PortalUser`, `PortalStats`, `AuthMeResponse`,
+    `PortalView` types.
+  - `tenant-switcher.tsx` — dropdown with avatar gradient + initials per
+    tenant; POSTs to `/api/auth/switch` and calls `qc.invalidateQueries()`
+    so every tenant-scoped query refetches.
+  - `sidebar.tsx` — nav with Dashboard / API Keys / Datasources / Activity /
+    Docs (last three marked "soon" with stub `ComingSoon` view).
+  - `dashboard-view.tsx` — hero with tenant badge + welcome, 4 stat cards
+    (active keys / 7d requests / avg latency / 24h sparkline), quickstart
+    curl card, endpoint reference, integration cards (OpenFN/N8N/Custom),
+    tenant-isolation explainer.
+  - `coming-soon.tsx` — placeholder for unbuilt views.
+  - `portal-shell.tsx` — orchestrates header (logo + links + tenant
+    switcher + theme toggle), desktop sidebar + mobile sheet sidebar,
+    main content that swaps based on `view` state. Resets to dashboard on
+    tenant switch. Sticky footer with tenant context.
+- **Root page rewrite** (`src/app/page.tsx`): Server Component that calls
+  `getCurrentUser()` + `listSwitchableUsers()` + counts directly via Prisma
+  (no HTTP round-trip on first paint) and hands the bundle to the client
+  `<PortalShell/>`.
+- **Layout metadata** updated from "DataMind BI — API Keys" to
+  "DataMind BI — Portal" to reflect the broader scope.
+- **Lint**: `bun run lint` clean.
+- **QA via agent-browser + VLM**:
+  1. Loaded `/` → portal dashboard renders with sidebar, header, 4 stat
+     cards, quickstart, endpoints, integrations, footer. No errors.
+  2. Clicked "Manage API Keys" → switched to API Keys view, showed
+     existing 12/25 keys for DataMind BI tenant.
+  3. Opened tenant switcher → all 4 tenants visible with correct names,
+     roles, avatars; current tenant (DataMind BI) marked with check.
+  4. Switched to Acme Analytics → toast "Switched to Acme Analytics",
+     dashboard re-rendered with 0 active keys (proving isolation).
+  5. Navigated to API Keys view for Acme → empty state (0/25), clicked
+     "Generate new key", filled label "Acme OpenFN nightly", generated
+     key starting `dm_live_aD3f...`, closed reveal dialog.
+  6. Verified Acme API Keys table now shows 1/25 with the new key.
+  7. Switched back to DataMind BI → API Keys view shows 12/25, and the
+     "Acme OpenFN nightly" key is NOT present (isolation confirmed).
+  8. Verified via raw `curl` that `/api/settings/api-keys` returns
+     different key sets per tenant cookie, and `/api/auth/switch` correctly
+     sets the session cookie.
+
+### Stage Summary
+
+- **Portal structure**: `/` is now a multi-view portal (Dashboard default,
+  API Keys as a navigable section, three "soon" stubs) instead of dumping
+  the API Keys manager directly on the index.
+- **Multi-tenant**: 4 seeded demo tenants, switchable via the header
+  dropdown. Every settings/public API route is cookie-aware and isolates
+  data by `userId`. The same `dm_session_email` cookie concept maps 1:1
+  to a Supabase org-switch in production.
+- **Tenant isolation verified end-to-end**: created a key under Acme
+  Analytics, confirmed it appears only in Acme's list and not in
+  DataMind BI's list — both via UI and via raw API.
+- **Backwards compatibility**: `getDemoUser()` still works (deprecated
+  wrapper), so any future code that calls it continues to function; the
+  only behavioural change is that it now respects the session cookie.
+- **No regressions**: existing API Keys manager (create / edit / revoke /
+  test / usage / audit / revoked-keys / command palette / OpenAPI explorer)
+  all still render correctly inside the portal shell.
+
+### Unresolved / next-phase recommendations
+
+- The "Datasources", "Activity", and "Docs" sidebar items are stubs
+  (`ComingSoon`). The `/api/public/v1/datasources` endpoint already
+  returns demo data — wiring up a real Datasources view per tenant would
+  be the natural next step.
+- The session cookie is plain (not signed). Fine for the sandbox; in
+  production it MUST be replaced with a Supabase JWT validation.
+- The 4 demo tenants share the same demo datasources payload. Per-tenant
+  datasource rows in the DB would make the isolation even more convincing.
+- Consider adding a "tenant-scoped request volume" chart on the dashboard
+  that compares the current tenant's 24h volume against the platform
+  average — requires a small aggregate endpoint.
