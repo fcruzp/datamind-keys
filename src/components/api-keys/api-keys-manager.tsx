@@ -7,14 +7,18 @@ import {
   AlertTriangle,
   Clock,
   Copy,
+  FlaskConical,
+  Gauge,
+  Globe,
+  Hash,
   KeyRound,
   Loader2,
+  Pencil,
   Plus,
+  Shield,
   ShieldCheck,
   Trash2,
   Activity,
-  Globe,
-  Hash,
   CheckCircle2,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -48,15 +52,29 @@ import {
 } from '@/components/ui/tooltip'
 
 import { CreateApiKeyDialog } from './create-api-key-dialog'
+import { EditApiKeyDialog } from './edit-api-key-dialog'
+import { InlineSparkline } from './inline-sparkline'
 import { NewKeyRevealDialog } from './new-key-reveal-dialog'
+import { RevokedKeysAudit } from './revoked-keys-audit'
 import { ScopeBadgeList } from './scope-badge'
+import { TestKeyPopover } from './test-key-popover'
 import { UsageHistogram } from './usage-chart'
+import { useCommandPalette } from './command-palette'
 import type { ApiKeyListItem, CreatedApiKey, UsageData } from './types'
 import { cn } from '@/lib/utils'
 
 export function ApiKeysManager() {
   const qc = useQueryClient()
   const [revealKey, setRevealKey] = React.useState<CreatedApiKey | null>(null)
+
+  // Refs for the command palette to drive
+  const createKeyRef = React.useRef<HTMLButtonElement>(null)
+  const revokedRef = React.useRef<HTMLDivElement>(null)
+
+  const { palette } = useCommandPalette(
+    () => createKeyRef.current?.click(),
+    () => revokedRef.current?.scrollIntoView({ behavior: 'smooth' }),
+  )
 
   const keysQuery = useQuery({
     queryKey: ['api-keys'],
@@ -119,7 +137,10 @@ export function ApiKeysManager() {
       />
 
       {/* Keys card */}
-      <Card className="overflow-hidden border-border/60 shadow-sm">
+      <Card
+        id="keys-section"
+        className="overflow-hidden border-border/60 shadow-sm scroll-mt-24"
+      >
         <CardHeader className="flex flex-row items-center justify-between gap-4 border-b bg-muted/30 py-4">
           <div className="space-y-0.5">
             <div className="flex items-center gap-2">
@@ -133,7 +154,15 @@ export function ApiKeysManager() {
               Keys are SHA-256 hashed at rest. Plaintext is shown only at creation.
             </p>
           </div>
-          <CreateApiKeyDialog onCreated={setRevealKey} />
+          <CreateApiKeyDialog
+            onCreated={setRevealKey}
+            trigger={
+              <Button ref={createKeyRef} className="gap-2 shadow-sm">
+                <Plus className="size-4" />
+                Generate new key
+              </Button>
+            }
+          />
         </CardHeader>
 
         <CardContent className="p-0">
@@ -144,36 +173,48 @@ export function ApiKeysManager() {
           ) : keys.length === 0 ? (
             <EmptyState onCreate={(k) => setRevealKey(k)} />
           ) : (
-            <Table>
-              <TableHeader>
-                <TableRow className="hover:bg-transparent">
-                  <TableHead className="pl-6">Label</TableHead>
-                  <TableHead>Key</TableHead>
-                  <TableHead>Scopes</TableHead>
-                  <TableHead>Last used</TableHead>
-                  <TableHead>Created</TableHead>
-                  <TableHead>Expires</TableHead>
-                  <TableHead className="pr-6 text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {keys.map((key) => (
-                  <KeyRow
-                    key={key.id}
-                    apiKey={key}
-                    onRevoke={(id) => revokeMutation.mutate(id)}
-                    onCopyMasked={() => copyMasked(key)}
-                    revoking={revokeMutation.isPending}
-                  />
-                ))}
-              </TableBody>
-            </Table>
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead className="pl-6">Label</TableHead>
+                    <TableHead>Key</TableHead>
+                    <TableHead>Scopes</TableHead>
+                    <TableHead className="text-center">24h</TableHead>
+                    <TableHead>Last used</TableHead>
+                    <TableHead>Created</TableHead>
+                    <TableHead>Expires</TableHead>
+                    <TableHead className="pr-6 text-right">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {keys.map((key) => (
+                    <KeyRow
+                      key={key.id}
+                      apiKey={key}
+                      histogram24h={
+                        usage?.perKey.find((p) => p.apiKeyId === key.id)
+                          ?.histogram24h ?? []
+                      }
+                      onRevoke={(id) => revokeMutation.mutate(id)}
+                      onCopyMasked={() => copyMasked(key)}
+                      revoking={revokeMutation.isPending}
+                    />
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
           )}
         </CardContent>
       </Card>
 
       {/* Recent requests table */}
       <RecentRequests usage={usage} loading={usageQuery.isLoading} />
+
+      {/* Revoked keys audit */}
+      <div ref={revokedRef} className="scroll-mt-24">
+        <RevokedKeysAudit />
+      </div>
 
       {/* Security note */}
       <SecurityNote />
@@ -183,6 +224,9 @@ export function ApiKeysManager() {
         created={revealKey}
         onClose={() => setRevealKey(null)}
       />
+
+      {/* Command palette (Cmd/Ctrl+K) */}
+      {palette}
     </div>
   )
 }
@@ -226,7 +270,7 @@ function StatsRow({
         label="Avg latency"
         value={usage ? `${usage.totals.avgDurationMs}ms` : '—'}
         hint="last 7 days"
-        tone="violet"
+        tone="amber"
         loading={usageLoading}
       />
       <Card className="overflow-hidden border-border/60">
@@ -267,13 +311,13 @@ function StatCard({
   label: string
   value: string
   hint?: string
-  tone: 'emerald' | 'sky' | 'violet'
+  tone: 'emerald' | 'sky' | 'amber'
   loading?: boolean
 }) {
   const tones = {
     emerald: 'text-emerald-600 dark:text-emerald-400 bg-emerald-500/10',
     sky: 'text-sky-600 dark:text-sky-400 bg-sky-500/10',
-    violet: 'text-violet-600 dark:text-violet-400 bg-violet-500/10',
+    amber: 'text-amber-600 dark:text-amber-400 bg-amber-500/10',
   } as const
   return (
     <Card className="overflow-hidden border-border/60">
@@ -323,11 +367,13 @@ function EmptyState({ onCreate }: { onCreate: (key: CreatedApiKey) => void }) {
 
 function KeyRow({
   apiKey,
+  histogram24h,
   onRevoke,
   onCopyMasked,
   revoking,
 }: {
   apiKey: ApiKeyListItem
+  histogram24h: number[]
   onRevoke: (id: string) => void
   onCopyMasked: () => void
   revoking: boolean
@@ -335,12 +381,62 @@ function KeyRow({
   const isExpired =
     apiKey.expiresAt && new Date(apiKey.expiresAt).getTime() < Date.now()
 
+  const total24h = histogram24h.reduce((a, b) => a + b, 0)
+
   return (
     <TableRow className="group">
-      <TableCell className="pl-6 py-3">
+      <TableCell className="pl-6 py-3 align-top">
         <div className="font-medium text-sm">{apiKey.label}</div>
+        <div className="flex flex-wrap items-center gap-1 mt-1">
+          {/* IP allowlist chip */}
+          {apiKey.allowedIps.length > 0 ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-300 cursor-default">
+                  <Shield className="size-3" />
+                  {apiKey.allowedIps.length} IP
+                  {apiKey.allowedIps.length === 1 ? '' : 's'}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="text-xs">
+                <div className="font-medium mb-1">IP allowlist</div>
+                {apiKey.allowedIps.map((ip) => (
+                  <div key={ip} className="font-mono">
+                    {ip}
+                  </div>
+                ))}
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            <span className="inline-flex items-center gap-1 rounded-md border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+              <Globe className="size-3" />
+              any IP
+            </span>
+          )}
+          {/* Rate limit chip */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                className={cn(
+                  'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium cursor-default',
+                  apiKey.rateLimitPerMinute === null
+                    ? 'border-border/60 bg-muted/40 text-muted-foreground'
+                    : 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+                )}
+              >
+                <Gauge className="size-3" />
+                {apiKey.rateLimitPerMinute === null
+                  ? '60/min (default)'
+                  : `${apiKey.rateLimitPerMinute}/min`}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="text-xs">
+              Per-key rate limit (token bucket)
+            </TooltipContent>
+          </Tooltip>
+        </div>
       </TableCell>
-      <TableCell className="py-3">
+      <TableCell className="py-3 align-top">
         <button
           onClick={onCopyMasked}
           className="inline-flex items-center gap-2 font-mono text-xs text-muted-foreground hover:text-foreground transition-colors"
@@ -352,10 +448,25 @@ function KeyRow({
           <Copy className="size-3 opacity-0 group-hover:opacity-100 transition-opacity" />
         </button>
       </TableCell>
-      <TableCell className="py-3">
+      <TableCell className="py-3 align-top">
         <ScopeBadgeList scopes={apiKey.scopes} />
       </TableCell>
-      <TableCell className="py-3">
+      <TableCell className="py-3 align-top text-center">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div className="inline-flex flex-col items-center gap-0.5 cursor-default">
+              <InlineSparkline data={histogram24h} />
+              <span className="text-[10px] text-muted-foreground tabular-nums">
+                {total24h}
+              </span>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="text-xs">
+            {total24h} request{total24h === 1 ? '' : 's'} in last 24h
+          </TooltipContent>
+        </Tooltip>
+      </TableCell>
+      <TableCell className="py-3 align-top">
         {apiKey.lastUsedAt ? (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -376,7 +487,7 @@ function KeyRow({
           <span className="text-xs text-muted-foreground italic">never</span>
         )}
       </TableCell>
-      <TableCell className="py-3">
+      <TableCell className="py-3 align-top">
         <Tooltip>
           <TooltipTrigger asChild>
             <span className="text-xs text-muted-foreground cursor-default">
@@ -388,7 +499,7 @@ function KeyRow({
           </TooltipContent>
         </Tooltip>
       </TableCell>
-      <TableCell className="py-3">
+      <TableCell className="py-3 align-top">
         {apiKey.expiresAt ? (
           <span
             className={cn(
@@ -404,60 +515,113 @@ function KeyRow({
           <span className="text-xs text-muted-foreground">Never</span>
         )}
       </TableCell>
-      <TableCell className="pr-6 py-3 text-right">
-        <AlertDialog>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <AlertDialogTrigger asChild>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-8 px-2 text-muted-foreground hover:text-rose-600 hover:bg-rose-500/10"
-                  disabled={revoking}
-                >
-                  <Trash2 className="size-3.5" />
-                </Button>
-              </AlertDialogTrigger>
-            </TooltipTrigger>
-            <TooltipContent side="top" className="text-xs">
-              Revoke key
-            </TooltipContent>
-          </Tooltip>
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle className="flex items-center gap-2">
-                <AlertTriangle className="size-5 text-amber-500" />
-                Revoke API key?
-              </AlertDialogTitle>
-              <AlertDialogDescription>
-                This will immediately disable the key{' '}
-                <span className="font-medium text-foreground">{apiKey.label}</span>.
-                Any integration using it will start receiving{' '}
-                <code className="text-foreground">401 Unauthorized</code> responses.
-                This action cannot be undone.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <div className="rounded-md bg-muted/50 border p-3 space-y-1.5">
-              <div className="flex items-center gap-2 text-xs">
-                <Hash className="size-3 text-muted-foreground" />
-                <span className="font-mono">{apiKey.keyMasked}</span>
-              </div>
-              <div className="flex items-center gap-2 text-xs">
-                <ShieldCheck className="size-3 text-muted-foreground" />
-                <span>Scopes: {apiKey.scopes.join(', ') || 'none'}</span>
-              </div>
-            </div>
-            <AlertDialogFooter>
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction
-                onClick={() => onRevoke(apiKey.id)}
-                className="bg-rose-600 hover:bg-rose-700 text-white"
+      <TableCell className="pr-6 py-3 text-right align-top">
+        <div className="inline-flex items-center gap-1">
+          {/* Edit */}
+          <EditApiKeyDialog
+            apiKey={apiKey}
+            trigger={
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-8 px-2 text-muted-foreground hover:text-foreground hover:bg-muted/60"
+                aria-label={`Edit ${apiKey.label}`}
+                title="Edit label, rate limit, IPs"
               >
+                <Pencil className="size-3.5" />
+              </Button>
+            }
+          />
+
+          {/* Test */}
+          <TestKeyPopover expectedPrefix={apiKey.keyMasked}>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-8 px-2 text-muted-foreground hover:text-emerald-600 hover:bg-emerald-500/10"
+              aria-label={`Test ${apiKey.label}`}
+              title="Test key against /api/public/v1/me"
+            >
+              <FlaskConical className="size-3.5" />
+            </Button>
+          </TestKeyPopover>
+
+          {/* Revoke */}
+          <AlertDialog>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <AlertDialogTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-8 px-2 text-muted-foreground hover:text-rose-600 hover:bg-rose-500/10"
+                    disabled={revoking}
+                    aria-label={`Revoke ${apiKey.label}`}
+                  >
+                    <Trash2 className="size-3.5" />
+                  </Button>
+                </AlertDialogTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="text-xs">
                 Revoke key
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
+              </TooltipContent>
+            </Tooltip>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle className="flex items-center gap-2">
+                  <AlertTriangle className="size-5 text-amber-500" />
+                  Revoke API key?
+                </AlertDialogTitle>
+                <AlertDialogDescription>
+                  This will immediately disable the key{' '}
+                  <span className="font-medium text-foreground">{apiKey.label}</span>.
+                  Any integration using it will start receiving{' '}
+                  <code className="text-foreground">401 Unauthorized</code> responses.
+                  This action cannot be undone.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <div className="rounded-md bg-muted/50 border p-3 space-y-1.5">
+                <div className="flex items-center gap-2 text-xs">
+                  <Hash className="size-3 text-muted-foreground" />
+                  <span className="font-mono">{apiKey.keyMasked}</span>
+                </div>
+                <div className="flex items-center gap-2 text-xs">
+                  <ShieldCheck className="size-3 text-muted-foreground" />
+                  <span>Scopes: {apiKey.scopes.join(', ') || 'none'}</span>
+                </div>
+                {apiKey.allowedIps.length > 0 && (
+                  <div className="flex items-center gap-2 text-xs">
+                    <Shield className="size-3 text-muted-foreground" />
+                    <span>
+                      IP allowlist:{' '}
+                      <span className="font-mono">
+                        {apiKey.allowedIps.join(', ')}
+                      </span>
+                    </span>
+                  </div>
+                )}
+                <div className="flex items-center gap-2 text-xs">
+                  <Gauge className="size-3 text-muted-foreground" />
+                  <span>
+                    Rate limit:{' '}
+                    {apiKey.rateLimitPerMinute === null
+                      ? '60/min (default)'
+                      : `${apiKey.rateLimitPerMinute}/min`}
+                  </span>
+                </div>
+              </div>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  onClick={() => onRevoke(apiKey.id)}
+                  className="bg-rose-600 hover:bg-rose-700 text-white"
+                >
+                  Revoke key
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </div>
       </TableCell>
     </TableRow>
   )
@@ -625,6 +789,16 @@ function SecurityNote() {
                 Set an expiry for short-lived syncs, and{' '}
                 <strong className="text-foreground">rotate keys</strong>{' '}
                 periodically. Revoking is instant and irreversible.
+              </span>
+            </li>
+            <li className="flex gap-2">
+              <span className="text-emerald-500">•</span>
+              <span>
+                Restrict keys to known IPs with the{' '}
+                <Shield className="inline size-3 -mt-0.5" /> allowlist, and
+                cap burst traffic with a per-key{' '}
+                <Gauge className="inline size-3 -mt-0.5" /> rate limit. Excess
+                calls return <code className="text-foreground">429</code>.
               </span>
             </li>
             <li className="flex gap-2">

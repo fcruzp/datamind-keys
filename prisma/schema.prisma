@@ -38,6 +38,10 @@ model ApiKey {
   keyPrefix   String
   label       String
   scopes      String    @default("[]")
+  /// JSON array of allowed IPs/CIDRs. Empty = allow all.
+  allowedIps  String    @default("[]")
+  /// Per-key rate limit (requests per minute). Null = use global default (60).
+  rateLimitPerMinute Int?
   revokedAt   DateTime?
   lastUsedAt  DateTime?
   lastUsedIp  String?

@@ -6,10 +6,26 @@ export interface ApiKeyListItem {
   keyMasked: string
   keyPrefix: string
   scopes: ApiScope[]
+  allowedIps: string[]
+  rateLimitPerMinute: number | null
   lastUsedAt: string | null
   lastUsedIp: string | null
   expiresAt: string | null
   createdAt: string
+}
+
+export interface RevokedApiKey {
+  id: string
+  label: string
+  keyMasked: string
+  scopes: ApiScope[]
+  allowedIps: string[]
+  rateLimitPerMinute: number | null
+  lastUsedAt: string | null
+  lastUsedIp: string | null
+  expiresAt: string | null
+  createdAt: string
+  revokedAt: string | null
 }
 
 export interface CreatedApiKey {
@@ -18,6 +34,8 @@ export interface CreatedApiKey {
   plaintext: string
   keyMasked: string
   scopes: ApiScope[]
+  allowedIps: string[]
+  rateLimitPerMinute: number | null
   expiresAt: string | null
   createdAt: string
 }
@@ -28,7 +46,12 @@ export interface UsageData {
     avgDurationMs: number
     lastRequestAt: string | null
   }
-  perKey: Array<{ apiKeyId: string; count: number; avgDurationMs: number }>
+  perKey: Array<{
+    apiKeyId: string
+    count: number
+    avgDurationMs: number
+    histogram24h: number[]
+  }>
   recent: Array<{
     id: string
     endpoint: string

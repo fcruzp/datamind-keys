@@ -22,6 +22,8 @@ export interface AuthenticatedApiKey {
   scopes: ApiScope[]
   prefix: string
   lastUsedAt: Date | null
+  allowedIps: string[]
+  rateLimitPerMinute: number | null
 }
 
 export interface AuthSuccess {
@@ -197,12 +199,32 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
     return { ok: false, error: 'API key has expired.', status: 401 }
   }
 
+  // IP allowlist check (strict if allowlist non-empty)
+  const clientIp = getClientIp(req)
+  const allowlist = parseAllowedIps(apiKey.allowedIps)
+  if (!isIpAllowed(clientIp, allowlist)) {
+    return {
+      ok: false,
+      error: `IP ${clientIp ?? '(unknown)'} is not in this key's IP allowlist.`,
+      status: 403,
+    }
+  }
+
+  // Rate limit (token bucket per key)
+  const rate = checkRateLimit(apiKey.id, apiKey.rateLimitPerMinute)
+  if (!rate.ok) {
+    return {
+      ok: false,
+      error: `Rate limit exceeded. Try again in ${rate.retryAfter}s.`,
+      status: 429,
+    }
+  }
+
   // Fire-and-forget: update lastUsedAt + IP without blocking the response
-  const ip = getClientIp(req)
   db.apiKey
     .update({
       where: { id: apiKey.id },
-      data: { lastUsedAt: new Date(), lastUsedIp: ip },
+      data: { lastUsedAt: new Date(), lastUsedIp: clientIp },
     })
     .catch(() => {
       /* best-effort, ignore */
@@ -221,6 +243,8 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
       scopes: parseScopes(apiKey.scopes),
       prefix: apiKey.keyPrefix,
       lastUsedAt: apiKey.lastUsedAt,
+      allowedIps: allowlist,
+      rateLimitPerMinute: apiKey.rateLimitPerMinute,
     },
   }
 }
@@ -253,5 +277,144 @@ export async function logApiRequest(params: {
     })
   } catch {
     /* best-effort */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// IP allowlist
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_RATE_LIMIT_PER_MINUTE = 60
+
+export function parseAllowedIps(json: string): string[] {
+  try {
+    const parsed = JSON.parse(json) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((x): x is string => typeof x === 'string')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+export function serializeAllowedIps(ips: string[]): string {
+  return JSON.stringify([...new Set(ips.map((s) => s.trim()).filter(Boolean))])
+}
+
+/**
+ * Validates a client IP against the key's allowlist.
+ * - Empty allowlist → allow all
+ * - Otherwise the IP must match exactly OR fall within a CIDR range (e.g. "10.0.0.0/8")
+ *   IPv4 only for simplicity; IPv6 exact-match only.
+ *
+ * Returns true if allowed (or if allowlist is empty / client IP unknown).
+ */
+export function isIpAllowed(clientIp: string | null, allowlist: string[]): boolean {
+  if (!allowlist.length) return true
+  if (!clientIp) return false // strict: if allowlist set but no IP detected, deny
+
+  // Strip IPv6-mapped IPv4 prefix "::ffff:"
+  const ip = clientIp.startsWith('::ffff:') ? clientIp.slice(7) : clientIp
+
+  for (const rule of allowlist) {
+    if (rule === ip) return true
+    if (rule.includes('/')) {
+      // CIDR
+      if (ipInCidr(ip, rule)) return true
+    }
+  }
+  return false
+}
+
+function ipInCidr(ip: string, cidr: string): boolean {
+  const [base, bitsStr] = cidr.split('/')
+  if (!base || !bitsStr) return false
+  const bits = parseInt(bitsStr, 10)
+  if (isNaN(bits) || bits < 0 || bits > 32) return false
+
+  const ipParts = ip.split('.').map((p) => parseInt(p, 10))
+  const baseParts = base.split('.').map((p) => parseInt(p, 10))
+  if (ipParts.length !== 4 || baseParts.length !== 4) return false
+  if (ipParts.some((p) => isNaN(p) || p < 0 || p > 255)) return false
+  if (baseParts.some((p) => isNaN(p) || p < 0 || p > 255)) return false
+
+  const ipNum =
+    (ipParts[0]! << 24) | (ipParts[1]! << 16) | (ipParts[2]! << 8) | ipParts[3]!
+  const baseNum =
+    (baseParts[0]! << 24) | (baseParts[1]! << 16) | (baseParts[2]! << 8) | baseParts[3]!
+  // Note: the >>> 0 coerces to unsigned 32-bit (the bitwise ops above produce signed)
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
+  return (ipNum >>> 0) & mask === (baseNum >>> 0) & mask
+}
+
+// ---------------------------------------------------------------------------
+// In-memory rate limiting (token bucket per API key)
+// ---------------------------------------------------------------------------
+
+interface RateBucket {
+  tokens: number
+  lastRefill: number
+}
+
+const DEFAULT_REFILL_INTERVAL_MS = 60_000 // 1 minute
+
+// Persisted across hot reloads in dev
+const globalForRate = globalThis as unknown as {
+  __rateBuckets?: Map<string, RateBucket>
+}
+const buckets: Map<string, RateBucket> =
+  globalForRate.__rateBuckets ?? new Map<string, RateBucket>()
+globalForRate.__rateBuckets = buckets
+
+/**
+ * Token-bucket rate limiter.
+ * Returns { ok: true } if the request is allowed, or { ok: false, retryAfter }
+ * with seconds-to-wait if the bucket is empty.
+ *
+ * Bucket capacity = rateLimitPerMinute tokens, refilled continuously at
+ * rateLimitPerMinute/60 tokens per ms.
+ */
+export function checkRateLimit(
+  apiKeyId: string,
+  rateLimitPerMinute: number | null,
+): { ok: true; remaining: number } | { ok: false; retryAfter: number; remaining: 0 } {
+  const capacity = rateLimitPerMinute ?? DEFAULT_RATE_LIMIT_PER_MINUTE
+  const now = Date.now()
+
+  let bucket = buckets.get(apiKeyId)
+  if (!bucket) {
+    bucket = { tokens: capacity, lastRefill: now }
+    buckets.set(apiKeyId, bucket)
+  }
+
+  // Refill: tokens added = (elapsed_ms / 60_000) * capacity
+  const elapsed = now - bucket.lastRefill
+  const refill = (elapsed / DEFAULT_REFILL_INTERVAL_MS) * capacity
+  bucket.tokens = Math.min(capacity, bucket.tokens + refill)
+  bucket.lastRefill = now
+
+  if (bucket.tokens >= 1) {
+    bucket.tokens -= 1
+    return { ok: true, remaining: Math.floor(bucket.tokens) }
+  }
+
+  // Empty: time until 1 token refills
+  const msUntilNext = Math.ceil((1 - bucket.tokens) * (DEFAULT_REFILL_INTERVAL_MS / capacity))
+  const retryAfter = Math.max(1, Math.ceil(msUntilNext / 1000))
+  return { ok: false, retryAfter, remaining: 0 }
+}
+
+// Lightweight cleanup: drop empty stale buckets occasionally to bound memory
+export function pruneRateBuckets(maxSize = 10_000): void {
+  if (buckets.size < maxSize) return
+  // Drop the oldest 25% by lastRefill
+  const entries = [...buckets.entries()].sort(
+    (a, b) => a[1].lastRefill - b[1].lastRefill,
+  )
+  const dropCount = Math.floor(entries.length * 0.25)
+  for (let i = 0; i < dropCount; i++) {
+    buckets.delete(entries[i]![0])
   }
 }

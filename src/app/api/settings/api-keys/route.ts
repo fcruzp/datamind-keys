@@ -5,7 +5,9 @@ import {
   generateApiKey,
   getDemoUser,
   maskApiKey,
+  parseAllowedIps,
   parseScopes,
+  serializeAllowedIps,
   serializeScopes,
   type ApiScope,
 } from '@/lib/api-auth'
@@ -29,6 +31,8 @@ export async function GET() {
       label: true,
       keyPrefix: true,
       scopes: true,
+      allowedIps: true,
+      rateLimitPerMinute: true,
       lastUsedAt: true,
       lastUsedIp: true,
       expiresAt: true,
@@ -43,6 +47,8 @@ export async function GET() {
       keyMasked: maskApiKey(k.keyPrefix),
       keyPrefix: k.keyPrefix,
       scopes: parseScopes(k.scopes),
+      allowedIps: parseAllowedIps(k.allowedIps),
+      rateLimitPerMinute: k.rateLimitPerMinute,
       lastUsedAt: k.lastUsedAt,
       lastUsedIp: k.lastUsedIp,
       expiresAt: k.expiresAt,
@@ -72,6 +78,19 @@ const createSchema = z.object({
     .nullable()
     .optional()
     .or(z.literal(null)),
+  allowedIps: z
+    .array(z.string().trim().min(1))
+    .max(20, 'Max 20 IPs per allowlist')
+    .optional()
+    .default([]),
+  rateLimitPerMinute: z
+    .number()
+    .int()
+    .min(1, 'Rate limit must be at least 1 req/min')
+    .max(10_000, 'Rate limit cannot exceed 10,000 req/min')
+    .nullable()
+    .optional()
+    .or(z.literal(null)),
 })
 
 export async function POST(req: Request) {
@@ -96,7 +115,8 @@ export async function POST(req: Request) {
     )
   }
 
-  const { label, scopes, expiresInDays } = parsed.data
+  const { label, scopes, expiresInDays, allowedIps, rateLimitPerMinute } =
+    parsed.data
   const user = await getDemoUser()
 
   // Cap active keys per user to prevent runaway growth
@@ -125,6 +145,8 @@ export async function POST(req: Request) {
       keyPrefix: prefix,
       label,
       scopes: serializeScopes(scopes as ApiScope[]),
+      allowedIps: serializeAllowedIps(allowedIps ?? []),
+      rateLimitPerMinute: rateLimitPerMinute ?? null,
       expiresAt,
     },
   })
@@ -136,6 +158,8 @@ export async function POST(req: Request) {
       plaintext, // ← returned ONCE. Never retrievable again.
       keyMasked: maskApiKey(prefix),
       scopes: parseScopes(created.scopes),
+      allowedIps: parseAllowedIps(created.allowedIps),
+      rateLimitPerMinute: created.rateLimitPerMinute,
       expiresAt: created.expiresAt,
       createdAt: created.createdAt,
     },

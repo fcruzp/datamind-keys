@@ -3,7 +3,16 @@
 import * as React from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Loader2, Plus, Sparkles } from 'lucide-react'
+import {
+  Loader2,
+  Plus,
+  Sparkles,
+  Shield,
+  Gauge,
+  ChevronDown,
+  X,
+  Globe,
+} from 'lucide-react'
 import { z } from 'zod'
 
 import {
@@ -26,6 +35,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { ScopeBadge } from './scope-badge'
 import { SCOPE_META, type ApiScope, type CreatedApiKey } from './types'
 import { cn } from '@/lib/utils'
@@ -40,6 +54,15 @@ const schema = z.object({
     .array(z.enum(['read', 'execute', 'admin']))
     .min(1, 'Pick at least one scope'),
   expiresInDays: z.number().nullable(),
+  allowedIps: z.array(z.string().trim().min(1)).max(20).optional().default([]),
+  rateLimitPerMinute: z
+    .number()
+    .int()
+    .min(1)
+    .max(10_000)
+    .nullable()
+    .optional()
+    .or(z.literal(null)),
 })
 
 type FormValues = z.infer<typeof schema>
@@ -55,6 +78,18 @@ const EXPIRY_OPTIONS: Array<{
   { label: '1 year', value: '365', days: 365 },
 ]
 
+const RATE_LIMIT_OPTIONS: Array<{
+  label: string
+  value: string
+  rpm: number | null
+}> = [
+  { label: 'Default (60/min)', value: 'default', rpm: null },
+  { label: '10/min — conservative', value: '10', rpm: 10 },
+  { label: '60/min — default', value: '60', rpm: 60 },
+  { label: '300/min — bursty', value: '300', rpm: 300 },
+  { label: '1000/min — high volume', value: '1000', rpm: 1000 },
+]
+
 export function CreateApiKeyDialog({
   onCreated,
   trigger,
@@ -66,6 +101,10 @@ export function CreateApiKeyDialog({
   const [label, setLabel] = React.useState('')
   const [scopes, setScopes] = React.useState<ApiScope[]>(['read'])
   const [expiry, setExpiry] = React.useState<string>('never')
+  const [rateLimit, setRateLimit] = React.useState<string>('default')
+  const [ipInput, setIpInput] = React.useState('')
+  const [allowedIps, setAllowedIps] = React.useState<string[]>([])
+  const [advancedOpen, setAdvancedOpen] = React.useState(false)
   const [errors, setErrors] = React.useState<Record<string, string>>({})
 
   const qc = useQueryClient()
@@ -74,24 +113,49 @@ export function CreateApiKeyDialog({
     setLabel('')
     setScopes(['read'])
     setExpiry('never')
+    setRateLimit('default')
+    setIpInput('')
+    setAllowedIps([])
+    setAdvancedOpen(false)
     setErrors({})
   }
 
   React.useEffect(() => {
     if (!open) {
-      // small delay so closing animation doesn't show the reset flash
       const t = setTimeout(reset, 200)
       return () => clearTimeout(t)
     }
   }, [open])
 
+  const addIp = () => {
+    const v = ipInput.trim()
+    if (!v) return
+    if (allowedIps.includes(v)) {
+      setIpInput('')
+      return
+    }
+    if (allowedIps.length >= 20) {
+      toast.warning('Max 20 IPs per allowlist')
+      return
+    }
+    setAllowedIps([...allowedIps, v])
+    setIpInput('')
+  }
+
+  const removeIp = (ip: string) => {
+    setAllowedIps(allowedIps.filter((x) => x !== ip))
+  }
+
   const mutation = useMutation({
     mutationFn: async () => {
       const expiryOpt = EXPIRY_OPTIONS.find((o) => o.value === expiry)
+      const rateOpt = RATE_LIMIT_OPTIONS.find((o) => o.value === rateLimit)
       const body = {
         label: label.trim(),
         scopes,
         expiresInDays: expiryOpt?.days ?? null,
+        allowedIps,
+        rateLimitPerMinute: rateOpt?.rpm ?? null,
       }
       const parsed = schema.safeParse(body)
       if (!parsed.success) {
@@ -146,7 +210,7 @@ export function CreateApiKeyDialog({
           </Button>
         )}
       </DialogTrigger>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Sparkles className="size-5 text-emerald-500" />
@@ -242,6 +306,112 @@ export function CreateApiKeyDialog({
               integrations.
             </p>
           </div>
+
+          {/* Advanced (IP allowlist + rate limit) */}
+          <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+            <CollapsibleTrigger asChild>
+              <button
+                type="button"
+                className="flex w-full items-center justify-between rounded-lg border border-dashed border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-accent/50 transition-colors"
+              >
+                <span className="flex items-center gap-2">
+                  <Shield className="size-3.5" />
+                  Advanced: IP allowlist & rate limit
+                  {allowedIps.length > 0 && (
+                    <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300">
+                      {allowedIps.length} IP{allowedIps.length === 1 ? '' : 's'}
+                    </span>
+                  )}
+                </span>
+                <ChevronDown
+                  className={cn(
+                    'size-3.5 transition-transform',
+                    advancedOpen && 'rotate-180',
+                  )}
+                />
+              </button>
+            </CollapsibleTrigger>
+            <CollapsibleContent className="space-y-4 pt-3">
+              {/* Rate limit */}
+              <div className="space-y-2">
+                <Label className="flex items-center gap-1.5 text-xs">
+                  <Gauge className="size-3.5" /> Rate limit
+                </Label>
+                <Select value={rateLimit} onValueChange={setRateLimit}>
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {RATE_LIMIT_OPTIONS.map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  Per-key token-bucket limit. Excess requests return{' '}
+                  <code className="text-foreground">429</code>.
+                </p>
+              </div>
+
+              {/* IP allowlist */}
+              <div className="space-y-2">
+                <Label className="flex items-center gap-1.5 text-xs">
+                  <Globe className="size-3.5" /> IP allowlist
+                </Label>
+                <div className="flex gap-2">
+                  <Input
+                    placeholder="127.0.0.1 or 10.0.0.0/8"
+                    value={ipInput}
+                    onChange={(e) => setIpInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        addIp()
+                      }
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    onClick={addIp}
+                    className="shrink-0"
+                  >
+                    Add
+                  </Button>
+                </div>
+                {allowedIps.length > 0 ? (
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {allowedIps.map((ip) => (
+                      <span
+                        key={ip}
+                        className="inline-flex items-center gap-1 rounded-md bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 font-mono text-[11px] text-emerald-700 dark:text-emerald-300"
+                      >
+                        <Globe className="size-3" />
+                        {ip}
+                        <button
+                          type="button"
+                          onClick={() => removeIp(ip)}
+                          className="ml-0.5 hover:text-rose-500 transition-colors"
+                          aria-label={`Remove ${ip}`}
+                        >
+                          <X className="size-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Leave empty to allow all IPs. Add IPs or CIDR ranges
+                    (e.g. <code className="text-foreground">10.0.0.0/8</code>)
+                    to restrict.
+                  </p>
+                )}
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
         </div>
 
         <DialogFooter>

@@ -61,6 +61,8 @@ export async function GET(req: Request) {
       scopes: auth.apiKey.scopes,
       prefix: auth.apiKey.prefix,
       lastUsedAt: auth.apiKey.lastUsedAt,
+      allowedIps: auth.apiKey.allowedIps,
+      rateLimitPerMinute: auth.apiKey.rateLimitPerMinute,
     },
     account: {
       activeKeys,

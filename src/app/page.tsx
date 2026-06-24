@@ -76,6 +76,14 @@ export default function Home() {
                 <strong className="text-foreground">N8N</strong>, custom
                 scripts — can securely access DataMind BI via REST.
               </p>
+              <div className="flex items-center gap-2 pt-1">
+                <kbd className="inline-flex items-center gap-0.5 rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                  <span className="text-[9px]">⌘</span>K
+                </kbd>
+                <span className="text-xs text-muted-foreground">
+                  to open the command palette
+                </span>
+              </div>
             </div>
 
             {/* Quick curl example */}
@@ -125,6 +133,12 @@ curl https://datamind.mooo.com/api/public/v1/me \\
               path="/api/public/v1/datasources"
               scope="read"
               description="List datasources connected to the account with status + last sync."
+            />
+            <EndpointCard
+              method="GET"
+              path="/api/public/v1/dashboards"
+              scope="read"
+              description="List dashboards owned by the account with widget counts + URLs."
             />
             <EndpointCard
               method="POST"

@@ -173,3 +173,226 @@ feature aligned with the conversation context (DataMind BI API Keys).
    - Add the IP allowlist feature
    - Add a `/api/public/v1/dashboards` endpoint (scope `read`)
    - Add per-key usage sparkline inline in the keys table
+
+---
+Task ID: 2-UI
+Agent: general-purpose (subagent)
+Task: Rewrite api-keys-manager.tsx to integrate EditApiKeyDialog, TestKeyPopover, InlineSparkline, RevokedKeysAudit, and CommandPalette.
+
+Work Log:
+- Read /home/z/my-project/worklog.md to understand the DataMind BI API Keys Manager project context (built on Next.js 16 + Prisma SQLite + shadcn/ui, with emerald/sky/rose/amber palette; no indigo/blue).
+- Read the current api-keys-manager.tsx (~650 lines) to map existing structure: ApiKeysManager orchestrator + StatsRow + StatCard + EmptyState + KeyRow + RecentRequests + MethodBadge + StatusBadge + SecurityNote + ScopeInlineBadge.
+- Read all six new dependency component files to learn their APIs:
+  - types.ts — ApiKeyListItem now has allowedIps: string[] and rateLimitPerMinute: number | null; UsageData.perKey[i] now has histogram24h: number[]; RevokedApiKey type added.
+  - edit-api-key-dialog.tsx — accepts { apiKey, trigger?: ReactNode }; renders Dialog with label/rate-limit/IP-allowlist editor; PATCHes /api/settings/api-keys/[id]; invalidates ['api-keys'] on success.
+  - test-key-popover.tsx — accepts { expectedPrefix?, children? }; popover with password input that POSTs to /api/public/v1/me and shows valid/invalid result; warns if plaintext prefix doesn't match expectedPrefix.
+  - revoked-keys-audit.tsx — Collapsible Card; useQuery with enabled: open; fetches /api/settings/api-keys/revoked on expand.
+  - command-palette.tsx — exports useCommandPalette(onCreateKey, onOpenRevoked) hook that returns { palette }; wires Cmd/Ctrl+K to open the CommandDialog.
+  - inline-sparkline.tsx — accepts { data: number[], width?, height? }; renders an SVG area sparkline, gracefully handles empty/zero data.
+- Read tooltip.tsx and badge.tsx to understand styling primitives; confirmed Button uses ...props spread (so ref forwards through to the underlying <button> in React 19).
+- Rewrote api-keys-manager.tsx:
+  1. Added imports for EditApiKeyDialog, InlineSparkline, RevokedKeysAudit, TestKeyPopover, useCommandPalette, plus new lucide icons (FlaskConical, Gauge, Pencil, Shield).
+  2. In ApiKeysManager: added createKeyRef (HTMLButtonElement) + revokedRef (HTMLDivElement); called useCommandPalette(() => createKeyRef.current?.click(), () => revokedRef.current?.scrollIntoView({ behavior: 'smooth' })); destructured { palette }; rendered {palette} at the end.
+  3. Keys Card: added id="keys-section" and scroll-mt-24; passed a Button with ref={createKeyRef} as the CreateApiKeyDialog trigger so the command palette can programmatically click it.
+  4. Wrapped the table in overflow-x-auto for horizontal scroll on narrow viewports (new columns added).
+  5. KeyRow: added histogram24h prop; new "24h" column with InlineSparkline + total request count tooltip; IP-allowlist + rate-limit chips under the label (emerald Shield chip for N IPs with tooltip listing them, or muted "any IP" hint when empty; amber Gauge chip for set rate limit, muted "60/min (default)" when null); actions column now contains Edit (Pencil, ghost, title="Edit label, rate limit, IPs") + Test (FlaskConical, ghost with emerald hover, expectedPrefix={apiKey.keyMasked}) + Revoke (Trash2, existing Tooltip + AlertDialog pattern). AlertDialog now also summarizes IP allowlist + rate limit alongside masked key and scopes.
+  6. Added a div with ref={revokedRef} and scroll-mt-24 wrapping <RevokedKeysAudit />, placed between RecentRequests and SecurityNote.
+  7. Swapped the StatCard "Avg latency" tone from violet to amber to strictly conform to the emerald/sky/rose/amber palette (the PATCH badge violet for PATCH method badge kept — it's a status colour for a rare method, not a primary brand tone).
+  8. SecurityNote: added a new bullet about IP allowlist + rate limit, with inline Shield + Gauge icons.
+- Append this entry to worklog.md.
+- Ran `bun run lint` — see Stage Summary.
+
+Stage Summary:
+- File: /home/z/my-project/src/components/api-keys/api-keys-manager.tsx (rewritten, ~720 lines).
+- All six new features integrated end-to-end: IP-allowlist + rate-limit chips per row, EditApiKeyDialog, TestKeyPopover (with expectedPrefix wiring), InlineSparkline (24h column), RevokedKeysAudit (collapsible, lazy-fetched), CommandPalette (Cmd/Ctrl+K, drives create button + scroll-to-revoked).
+- Existing functionality preserved: create flow + one-time reveal modal, revoke with AlertDialog confirmation, copy-masked-key, stats row + 24h histogram, recent requests table with method/status badges, security best-practices note.
+- Lint: `bun run lint` ran clean (0 errors). See verification below.
+- Next-phase suggestions for the cron-triggered reviewer:
+  - Add integration tests (curl) that PATCH /api/settings/api-keys/[id] to set allowedIps/rateLimitPerMinute and verify they persist + are enforced by /api/public/v1/* (the rate-limit middleware and IP check need to actually run server-side; the dialogs assume the PATCH route exists).
+  - Add a per-row "last 7d" total next to the 24h sparkline (or a tiny popover with the full per-key histogram).
+  - Consider adding keyboard navigation (↑/↓) through the keys table rows.
+
+---
+Task ID: 2 (cron-triggered review #2 — orchestrator)
+Agent: main (Z.ai Code)
+Task: Continue Round 2 development — implement IP allowlist + rate limiting +
+new endpoints + new UI components, QA, and update worklog.
+
+Work Log:
+- Reviewed worklog.md from Round 1. Identified 7 next-phase recommendations;
+  selected the top 4 for this round: IP allowlist, rate limiting, /dashboards
+  endpoint, per-key sparkline. Added 3 more UI features independently:
+  EditApiKeyDialog, TestKeyPopover, RevokedKeysAudit, CommandPalette.
+- Found a critical bug at start: the previous cron tick (which I also ran) had
+  extended the Prisma schema with `allowedIps` + `rateLimitPerMinute` fields
+  and regenerated the Prisma Client, but the Next.js Turbopack dev server had
+  the OLD @prisma/client cached in its module graph. Every API call to
+  db.apiKey.findMany() / .create() was throwing 500 "Unknown field
+  allowedIps". Root cause: Turbopack doesn't invalidate node_modules on touch
+  of user files.
+- Fix: deleted .next/ cache, killed the stuck dev server process (PIDs
+  1134/1129/1133), restarted with `setsid bun run dev` in background. This
+  forced Turbopack to reload @prisma/client with the new fields. All API
+  routes returned to 200.
+- Backend work completed:
+  1. Extended `prisma/schema.prisma` ApiKey model with `allowedIps String
+     @default("[]")` (JSON array) and `rateLimitPerMinute Int?`. Ran
+     `bun run db:push` to apply + regenerate Prisma Client.
+  2. Extended `src/lib/api-auth.ts` with:
+     - `parseAllowedIps` / `serializeAllowedIps` — JSON <-> string[]
+     - `isIpAllowed(clientIp, allowlist)` — exact match + CIDR support
+       (IPv4 only, with ::ffff: prefix stripping)
+     - `ipInCidr(ip, cidr)` — 32-bit bitmask check
+     - `checkRateLimit(apiKeyId, rateLimitPerMinute)` — token-bucket limiter,
+       in-memory Map persisted across hot reloads via globalThis, default
+       60/min, returns { ok, remaining } or { ok: false, retryAfter }
+     - `pruneRateBuckets(maxSize)` — memory-bounds cleanup
+     - `DEFAULT_RATE_LIMIT_PER_MINUTE = 60` constant
+     - Updated `AuthenticatedApiKey` interface to include allowedIps +
+       rateLimitPerMinute
+     - Updated `authenticateApiKey()` to run IP allowlist check (403 if
+       denied) + rate limit check (429 if exceeded) after scope/expiry checks
+  3. Updated `src/app/api/settings/api-keys/route.ts`:
+     - GET now returns `allowedIps` + `rateLimitPerMinute` per key
+     - POST now accepts `allowedIps` (max 20) + `rateLimitPerMinute`
+       (1–10,000) via Zod schema, serializes to JSON for storage
+  4. Created `PATCH /api/settings/api-keys/[id]` route — edits label,
+     allowedIps, rateLimitPerMinute on existing keys (NOT scopes — requires
+     revoke + recreate). Verifies ownership, rejects edits to revoked keys.
+  5. Kept `DELETE /api/settings/api-keys/[id]` (soft-revoke) working
+     alongside the new PATCH in the same route file.
+  6. Created `GET /api/settings/api-keys/revoked` — returns revoked keys
+     (newest-revoked first, max 100) for the audit view.
+  7. Created `GET /api/public/v1/dashboards` — demo endpoint, `read` scope,
+     returns 4 sample dashboards (Revenue Overview, Product Engagement,
+     Support Operations, Infrastructure Health) with widget counts + URLs.
+  8. Updated `GET /api/settings/api-keys/usage` to also return per-key
+     24h histograms (`perKey[i].histogram24h: number[]`) — added a 4th
+     parallel Prisma query for all 24h logs (uncapped) and bucketed them
+     per apiKeyId.
+  9. Updated `GET /api/public/v1/me` response to include `allowedIps` +
+     `rateLimitPerMinute` in the apiKey object.
+- Backend QA (all passing via curl):
+  - POST with allowedIps=["127.0.0.1","10.0.0.0/8"] + rateLimitPerMinute=5 → 201
+  - Rate limit: key with limit=3/min, 5 sequential requests → 200,200,200,429,429
+  - IP allowlist: key locked to 192.168.1.1, connect from 127.0.0.1 → 403
+    "IP ::ffff:127.0.0.1 is not in this key's IP allowlist."
+  - /dashboards with valid read key → 200 with 4 dashboards
+  - PATCH label + rateLimitPerMinute → 200 with updated fields
+  - GET /revoked → 200 with 1 revoked key (from earlier Round 1 test)
+- UI work completed (delegated Task 2-UI to a subagent for the manager
+  rewrite; built the other 5 components myself):
+  1. Updated `types.ts` — added `allowedIps`, `rateLimitPerMinute` to
+     ApiKeyListItem + CreatedApiKey; added `RevokedApiKey` interface; added
+     `histogram24h: number[]` to perKey usage entry.
+  2. Rewrote `create-api-key-dialog.tsx` — added Collapsible "Advanced"
+     section with rate-limit Select (Default/10/60/300/1000 per min) and
+     IP-allowlist chip input (add via Enter or button, remove via X chip).
+     Shows count badge on the collapsible trigger when IPs are added.
+  3. Built `edit-api-key-dialog.tsx` — Dialog with label Input, rate-limit
+     Select (more options: 10/30/60/120/300/1000), IP-allowlist chip editor.
+     PATCHes only changed fields. Diff-compares arrays to avoid no-op writes.
+  4. Built `test-key-popover.tsx` — Popover with password Input, runs
+     /api/public/v1/me with the pasted key, shows green "Valid key" with
+     user email + label + scopes, or red error with HTTP status + hint.
+     Warns if pasted key prefix doesn't match the row's expectedPrefix.
+  5. Built `revoked-keys-audit.tsx` — Collapsible Card, lazy-fetches
+     /api/settings/api-keys/revoked on expand, shows table with
+     line-through labels, masked keys, scope badges, revoked time, last
+     used. Empty state with RotateCcw icon.
+  6. Built `command-palette.tsx` — CommandDialog wired to Cmd/Ctrl+K via
+     `useCommandPalette(onCreateKey, onOpenRevoked)` hook. Actions group
+     (Generate key, Test key, View revoked), Theme group (Light/Dark/System),
+     Links group (OpenFN, Docs, GitHub).
+  7. Built `inline-sparkline.tsx` — tiny SVG area sparkline (80×24px) with
+     gradient fill, end dot, handles empty data with dashed baseline.
+  8. (Subagent Task 2-UI) Rewrote `api-keys-manager.tsx` (~720 lines) to
+     integrate all 6 new components: new "24h" table column with sparkline,
+     IP-allowlist + rate-limit chips per row, Edit/Test/Revoke action
+     buttons, RevokedKeysAudit section, CommandPalette rendering, Cmd+K
+     shortcut.
+  9. Updated `page.tsx` — added /dashboards EndpointCard to the reference
+     grid, added ⌘K hint in the hero section.
+- Lint: `bun run lint` → clean, 0 errors.
+- Frontend QA via agent-browser (all passing):
+  - Page loads with 7 active keys, 8 requests/7d, 6ms avg latency, 24h
+    histogram showing activity
+  - Keys table shows new columns: 24h (sparkline + count), Actions (Edit +
+    Test + Revoke)
+  - IP-allowlist chips: "any IP" (empty), "1 IP", "2 IPs" (non-empty, emerald)
+  - Rate-limit badges: "60/min (default)" (null), "3/min", "5/min", "100/min"
+    (set values, amber)
+  - Command palette (Cmd+K) opens with Actions/Theme/Links groups
+  - TestKeyPopover: typed a fresh key, clicked "Run test" → "Valid key" with
+    24ms latency, user email, label
+  - RevokedKeysAudit: expandable, shows 1 revoked key ("Curl test key") with
+    scopes, revoked time, last used
+  - Dark mode toggle works (screenshot captured)
+
+Stage Summary:
+- **Status**: ✅ Round 2 complete and verified end-to-end.
+- **New features shipped**:
+  1. IP allowlisting per key (exact IP + CIDR, IPv4, strict when set)
+  2. Per-key rate limiting (token bucket, in-memory, configurable 1–10k rpm)
+  3. PATCH endpoint for editing keys (label, IPs, rate limit)
+  4. Revoked keys audit view (collapsible, lazy-fetched)
+  5. /api/public/v1/dashboards endpoint
+  6. Per-key inline 24h sparkline in keys table
+  7. EditApiKeyDialog (full key editor)
+  8. TestKeyPopover (inline key validation against /me)
+  9. CommandPalette (Cmd+K with actions, theme, links)
+  10. CreateApiKeyDialog advanced section (IP + rate limit at creation time)
+- **Artifacts produced**:
+  - `prisma/schema.prisma` (added allowedIps + rateLimitPerMinute)
+  - `src/lib/api-auth.ts` (IP + rate-limit helpers, updated authenticateApiKey)
+  - 3 new API routes (PATCH, /revoked, /dashboards)
+  - 1 updated API route (usage now returns perKey.histogram24h)
+  - 6 new UI components (edit-dialog, test-popover, revoked-audit,
+    command-palette, inline-sparkline) + 1 updated (create-dialog)
+  - 1 rewritten UI component (api-keys-manager.tsx, ~720 lines)
+  - Updated page.tsx with /dashboards card + ⌘K hint
+  - QA screenshots: round2-baseline.png, round2-final.png,
+    round2-test-popover.png, round2-revoked-audit.png, round2-dark-mode.png
+- **Verification**: lint clean, dev server 200 on all routes, full curl test
+  matrix passing (POST with new fields, rate limit 429, IP 403, PATCH,
+  /dashboards, /revoked), UI validated via agent-browser (command palette,
+  test popover, revoked audit, sparklines, chips, dark mode).
+
+Unresolved issues / risks / next-phase recommendations:
+1. **Dev server restart required after Prisma schema changes** — Turbopack
+   caches @prisma/client and doesn't invalidate on `db:push`. Workaround:
+   delete `.next/` and restart `bun run dev`. Next phase: add a
+   `postinstall` or `predev` script that touches @prisma/client, or switch
+   to `prisma migrate dev` which is slower but more predictable. Document
+   this in a CONTRIBUTING.md.
+2. **Rate limiter is in-memory only** — won't survive serverless cold
+   starts or multi-instance deployments. For production DataMind BI on
+   Coolify (single container), this is fine. For multi-replica, switch to
+   Redis-based token bucket (e.g. `@upstash/ratelimit`).
+3. **IP allowlist CIDR is IPv4-only** — IPv6 exact-match works but CIDR
+   notation for IPv6 (e.g. `2001:db8::/32`) is not supported. Add IPv6
+   CIDR parsing if needed (BigInt-based 128-bit mask).
+4. **No rate-limit Retry-After header** — the 429 response includes the
+   retry time in the error message body but doesn't set the standard
+   `Retry-After` HTTP header. Add `headers: { 'Retry-After': String(retryAfter) }`
+   to the 429 NextResponse for better client compliance.
+5. **No rate-limit remaining header** — could add `X-RateLimit-Remaining`
+   and `X-RateLimit-Limit` headers to all public API responses for
+   discoverability.
+6. **TestKeyPopover sends plaintext to the browser** — by design (it's the
+   user's own key), but worth noting in the security note that the popover
+   doesn't persist the key.
+7. **Command palette doesn't have a "Copy curl example" action** — would be
+   a nice quick-action for users who want to test a key from terminal.
+8. **No keyboard navigation in the keys table** — ↑/↓ through rows would
+   be a nice accessibility improvement.
+9. **Cron review cadence** — the recurring webDevReview cron (job 228854)
+   fires every 15 min. Future runs should:
+   - Add Retry-After + X-RateLimit-* headers to public API responses
+   - Add IPv6 CIDR support to isIpAllowed
+   - Add a "Copy curl" action to the command palette
+   - Add keyboard navigation (↑/↓) through the keys table
+   - Consider Redis-backed rate limiting for multi-replica production
+   - Add a per-key "last 7d" total next to the 24h sparkline
+   - Add integration tests (curl) that verify PATCH persists + /public
+     enforces the new fields
