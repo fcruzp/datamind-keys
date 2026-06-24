@@ -11,6 +11,10 @@ import type { AuthMeResponse } from '@/components/portal/types'
 // to the client-side <PortalShell/> which owns view switching + mutations.
 // ---------------------------------------------------------------------------
 
+// Force dynamic rendering — this page depends on the request session cookie
+// and the database, so it must NOT be prerendered at build time.
+export const dynamic = 'force-dynamic'
+
 export default async function Home() {
   const user = await getCurrentUser()
   const switchable = await listSwitchableUsers()
