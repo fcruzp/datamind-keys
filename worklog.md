@@ -1597,3 +1597,34 @@ Stage Summary:
   * Env vars: solo 3 secretas (SUPABASE_SERVICE_ROLE_KEY, DATABASE_URL, DIRECT_URL)
 - Requisito: el repo fcruzp/datamind-keys debe mantenerse público para que
   el git clone funcione sin credenciales
+
+---
+Task ID: fix-build-prerender
+Agent: main (Z.ai Code)
+Task: Diagnosticar y corregir el fallo de build en Coolify. El build falló con
+"Error occurred prerendering page /" y "Export encountered an error on /page: /".
+
+Work Log:
+- Analicé el log de Coolify:
+  * git clone OK
+  * npm install OK (841 packages, 2m)
+  * npx prisma generate OK
+  * next build: compiló en 10.4s pero falló al prerenderizar /
+  * Error: "Export encountered an error on /page: /, exiting the build."
+- Revisé src/app/page.tsx: es un async server component que llama a
+  getCurrentUser() (lee cookies de sesión) y db.apiKey.count() (query DB).
+  En build time no hay request context ni sesión → falla el prerender.
+- Fix: añadí `export const dynamic = 'force-dynamic'` al principio del archivo.
+  Esto le dice a Next.js que NUNCA intente prerenderizar esta página y siempre
+  la renderice en request time.
+- Verifiqué que no hay otras páginas / que necesiten el mismo fix (las rutas
+  /api/* son dinámicas por definición).
+- bun run lint → limpio (0 errores).
+- Commit: "Fix build: mark / as force-dynamic to prevent SSG prerender"
+- Push exitoso: 7544562..e1c786e main -> main
+
+Stage Summary:
+- Fix aplicado: / ahora es force-dynamic (no SSG)
+- Commit: e1c786e en main
+- Usuario debe reintentar el deploy en Coolify (mismo Dockerfile, solo cambió
+  el código del repo que el git clone trae automáticamente)
