@@ -760,3 +760,155 @@ Unresolved issues / next-phase recommendations:
    - Sync expiring-soon filter to URL
    - Add request/response examples to OpenAPI explorer
    - Add a "Copy as JavaScript fetch" button next to "Copy curl"
+
+---
+
+## Task ID: 2-prod-port (integration into the real BIweb repo)
+Agent: main (Z.ai Code)
+Task: The user pointed out that the Round 2 enhancements had only been built
+in the sandbox demo, not ported into the actual production DataMind BI repo
+(github.com/fcruzp/BIweb). Port all Round 2 functionality into the real
+production codebase, adapting it to Supabase Auth + Postgres + the existing
+i18n/UI patterns.
+
+### Work Log
+
+- Cloned the production repo `https://github.com/fcruzp/BIweb` (public) into
+  `/home/z/BIweb-prod` (moved from /tmp because the sandbox restricts writes
+  to /home/z).
+- Audited the production repo's existing API Keys system (already present):
+  - `prisma/schema.prisma`: `ApiKey` + `ApiRequestLog` models (Postgres,
+    `@map` snake_case naming), `User.apiKeys` relation
+  - `src/lib/api-auth.ts`: generation/hashing/scopes/`authenticateApiKey`
+    (NO IP/rate/audit), uses `User` from `@prisma/client` (not a demo user)
+  - `src/lib/auth-utils.ts`: `getCurrentUser()` resolves Supabase session →
+    `User` row (this is what settings routes use, NOT `getDemoUser`)
+  - Routes: `GET/POST /api/settings/api-keys`, `DELETE [id]`, `GET /api/public/v1/me`
+  - UI: `src/components/app/settings/api-keys/` — manager (Dialog-based),
+    create-dialog, reveal-dialog, `dict.ts` (en/es i18n + scope metadata)
+  - Palette already matches: emerald/sky/rose/amber (no indigo/blue)
+- Identified the gap: production had Round 1 only. Round 2 (IP whitelist,
+  rate limiting, audit log, PATCH edit, /revoked audit, /usage, /dashboards,
+  /datasources, /queries, sparkline UI) was missing.
+- Ported Round 2 into the production repo (commit 7b26bc9):
+
+  **Schema** (`prisma/schema.prisma`):
+  - Added `allowedIps String @default("[]") @map("allowed_ips")` and
+    `rateLimitPerMinute Int? @map("rate_limit_per_minute")` to `ApiKey`
+  - Added new `SettingsAuditLog` model (Postgres-style with `@map`):
+    id, userId, action, apiKeyId, apiKeyLabel, diff (JSON), ip, userAgent,
+    createdAt; relations to User (Cascade) + ApiKey (SetNull); indexes on
+    [userId,createdAt], [apiKeyId], [action]
+  - Added `auditLogs SettingsAuditLog[]` relation to `User`
+  - Added `auditLogs SettingsAuditLog[]` relation to `ApiKey`
+  - `bun run db:generate` → schema valid, client generated
+
+  **Library** (`src/lib/api-auth.ts` — full rewrite preserving existing API):
+  - Kept: `AuthenticatedApiKey`, `ApiAuthResult`, `generateApiKey`,
+    `hashApiKey`, `maskApiKey`, `parseScopes`, `serializeScopes`, `hasScope`,
+    `requireScope` (asserts pattern), `extractBearerToken`, `getClientIp`,
+    `logApiRequest`, `unauthorizedResponse`
+  - Added `allowedIps: string[]` + `rateLimitPerMinute: number | null` to
+    `AuthenticatedApiKey`
+  - Added `rateLimit: RateLimitInfo` to `ApiAuthSuccess` and optional to
+    `ApiAuthFailure`
+  - Added `parseAllowedIps` / `serializeAllowedIps`
+  - Added `isIpAllowed` with IPv4 + IPv6 CIDR matching (BigInt-based,
+    converted to `BigInt()` calls for ES2017 target compatibility)
+  - Added `checkRateLimit` (token bucket, globalThis-persisted across hot
+    reloads), `pruneRateBuckets`, `DEFAULT_RATE_LIMIT_PER_MINUTE = 60`
+  - Added `rateLimitHeaders` (X-RateLimit-Limit/-Remaining/Retry-After)
+  - Added `writeAuditLog` + `auditContext` + `AuditAction` + `AuditEntry`
+  - `authenticateApiKey` now enforces IP allowlist (403) + rate limit (429),
+    returns rateLimit info, calls `pruneRateBuckets` opportunistically
+  - `unauthorizedResponse` attaches rate-limit headers automatically
+
+  **Routes**:
+  - `POST /api/settings/api-keys` — accepts allowedIps + rateLimitPerMinute
+    (Zod-validated), writes `api_key.create` audit log
+  - `PATCH /api/settings/api-keys/[id]` — NEW: edits label/scopes/IPs/rate/
+    expiry with before/after diff audit, 409 if revoked, no-op if unchanged
+  - `DELETE /api/settings/api-keys/[id]` — now writes `api_key.revoke` audit
+  - `GET /api/settings/api-keys/revoked` — NEW: revoked keys + last-50 audit
+    entries
+  - `GET /api/settings/api-keys/usage` — NEW: 7-day per-key + aggregate
+    breakdown (count/avgMs/errors by day, top endpoints)
+  - `GET /api/public/v1/me` — now exposes allowedIps + rateLimitPerMinute,
+    attaches rate-limit headers to every response
+  - `GET /api/public/v1/datasources` — NEW (read scope): lists user's
+    datasources + schemas
+  - `GET /api/public/v1/dashboards` — NEW (read scope): lists dashboards +
+    widgets
+  - `POST /api/public/v1/queries` — NEW (execute scope): runs validated
+    SELECT against a datasource with auto-LIMIT (default 1000, max 10000)
+
+  **UI** (`src/components/app/settings/api-keys/`):
+  - `dict.ts` — added `allowedIps`/`rateLimitPerMinute` to `ApiKeyView` +
+    `CreatedApiKey`; new `KeyUsage`, `UsageResponse`, `RevokedKeyView`,
+    `AuditLogEntry`, `RevokedResponse` types; 40+ new i18n keys (en+es)
+    covering IP, rate, edit, test, usage, audit; `isValidIpOrCidr` client
+    validator (IPv4/IPv6/CIDR)
+  - `usage-chart.tsx` — NEW: dependency-free SVG sparkline (7-day volume,
+    emerald bars, amber on error-heavy days, baseline tick for empty days)
+  - `create-api-key-dialog.tsx` — added IP allowlist tag input (Enter-to-add,
+    X-to-remove, live validation) + rate-limit mode selector (default/custom)
+    with number input
+  - `api-keys-manager.tsx` — full rewrite: IP/rate-limit badges on each key
+    card, per-key 7-day sparkline, Edit dialog (PATCH), collapsible
+    "Audit & revoked keys" panel with color-coded action entries, lazy-loads
+    usage + audit data, active/revoked count in toolbar
+
+- Validation:
+  - `bun install` → 899 packages, 5.5s
+  - `bun run db:generate` → schema valid
+  - `bun run lint` → **0 errors, 1 pre-existing warning** (TanStack Table
+    React Compiler memoization in `data-table.tsx` — not touched)
+  - `bun x tsc --noEmit` → **0 errors in any file I touched**. 21 remaining
+    errors are all pre-existing in unrelated files (`examples/`, `skills/`,
+    `onboarding/demo`, `stripe/webhook`, `WelcomeScreen`, `FeaturesBento`,
+    `i18n.ts`)
+  - Fixed 2 issues during port: BigInt literals (tsconfig target is ES2017,
+    not ES2020) → converted to `BigInt()` calls; `NextResponse.json` 3-arg
+    call → merged status + headers into one init object
+
+- Generated a git patch at `/home/z/my-project/download/api-keys-round2.patch`
+  (110 KB, 3196 lines) that can be applied to the real production repo with:
+  `git am api-keys-round2.patch` (preserves author + commit message) OR
+  `git apply api-keys-round2.patch` (just the diff).
+- Committed locally to the clone at `/home/z/BIweb-prod` (commit 7b26bc9)
+  on top of origin/master (5af2367).
+
+### Stage Summary
+
+- The production DataMind BI repo now has full Round 2 API Keys
+  functionality: IP/CIDR allowlist, per-key token-bucket rate limiting,
+  management audit trail, PATCH edit, revoked/audit + usage endpoints,
+  3 new public API endpoints (datasources/dashboards/queries), and a
+  significantly enhanced UI (sparklines, IP/rate badges, edit dialog,
+  collapsible audit panel) — all adapted to the real Supabase + Postgres +
+  i18n stack.
+- All code type-checks and lints clean (0 new errors/warnings).
+- The patch is ready to apply to the real GitHub repo. The only manual step
+  after applying: run `bun run db:push` (or `prisma migrate dev`) against
+  the production Postgres to create the `allowed_ips` / `rate_limit_per_minute`
+  columns on `api_keys` and the new `settings_audit_logs` table.
+- The sandbox demo at `/home/z/my-project` is unchanged this round — it
+  remains a fully-working standalone preview of the same feature set.
+
+### Unresolved / Next-phase recommendations
+
+1. **Push to GitHub** — I cannot push from the sandbox (no credentials).
+   The user should either apply the patch locally and push, or grant push
+   access. Patch: `/home/z/my-project/download/api-keys-round2.patch`.
+2. **DB migration** — after applying, run `prisma migrate dev --name
+   api_keys_round2` against production Postgres to create the new columns
+   + `settings_audit_logs` table.
+3. **Redis-backed rate limiting** — the in-memory token bucket is
+   per-process. Coolify single-container is fine, but if BIweb ever scales
+   to multiple replicas, move `checkRateLimit` to Redis (INCR + EXPIRE).
+4. **Webhook on revoke** — integration tools (OpenFN/N8N) would benefit
+   from a webhook fired when a key is revoked, so they can fail-fast
+   instead of discovering the 401 on the next call.
+5. **Audit log retention** — add a `pruneOldAuditEntries(days=365)` cron.
+6. **CSV audit export** — compliance teams may want `?format=csv` on the
+   `/revoked` endpoint.

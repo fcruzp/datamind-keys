@@ -1,0 +1,3196 @@
+From 7b26bc97430561423b9daa733bf526af5aa87aff Mon Sep 17 00:00:00 2001
+From: "Z.ai Code" <z@container>
+Date: Wed, 24 Jun 2026 15:15:10 +0000
+Subject: [PATCH] feat(api-keys): IP allowlist, rate limiting, audit log, edit
+ & usage endpoints
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Round 2 security + management enhancements for the per-user API Keys system.
+Ported from the sandbox demo and adapted to Supabase Auth + Postgres + the
+existing i18n/UI patterns.
+
+Schema (prisma/schema.prisma):
+- ApiKey: add allowedIps (JSON array, default []), rateLimitPerMinute (Int?)
+- New SettingsAuditLog model (create/update/revoke trail, with user+apiKey
+  relations, indexed on [userId,createdAt] / [apiKeyId] / [action])
+
+Library (src/lib/api-auth.ts):
+- parseAllowedIps / serializeAllowedIps — JSON <-> string[] for the allowlist
+- isIpAllowed — exact + CIDR match, IPv4 and IPv6 (BigInt-based, ES2017-safe)
+- checkRateLimit — in-memory token bucket, persisted across hot reloads
+- pruneRateBuckets — bounded memory cleanup
+- rateLimitHeaders — X-RateLimit-Limit / -Remaining / Retry-After
+- writeAuditLog + auditContext — best-effort audit persistence
+- authenticateApiKey now enforces IP allowlist (403) + rate limit (429) and
+  returns rateLimit info on both success and failure
+- unauthorizedResponse attaches rate-limit headers automatically
+
+Routes:
+- POST /api/settings/api-keys — accepts allowedIps + rateLimitPerMinute, writes
+  audit log
+- PATCH /api/settings/api-keys/[id] — NEW: edit label/scopes/IPs/rate/expiry
+  with before/after diff audit
+- DELETE /api/settings/api-keys/[id] — now writes audit log
+- GET /api/settings/api-keys/revoked — NEW: revoked keys + last-50 audit entries
+- GET /api/settings/api-keys/usage — NEW: 7-day per-key + aggregate breakdown
+- GET /api/public/v1/me — exposes allowedIps/rateLimitPerMinute + rate headers
+- GET /api/public/v1/datasources — NEW (read scope)
+- GET /api/public/v1/dashboards — NEW (read scope)
+- POST /api/public/v1/queries — NEW (execute scope, SQL SELECT with auto-LIMIT)
+
+UI (src/components/app/settings/api-keys/):
+- dict.ts — add allowedIps/rateLimitPerMinute to ApiKeyView + CreatedApiKey,
+  new UsageResponse/RevokedResponse/AuditLogEntry types, 40+ new i18n keys
+  (en+es), isValidIpOrCidr client validator
+- usage-chart.tsx — NEW: dependency-free SVG sparkline (7-day volume)
+- create-api-key-dialog.tsx — IP allowlist tag input + rate-limit mode/value
+- api-keys-manager.tsx — IP/rate badges, per-key sparkline, Edit dialog,
+  collapsible Audit & revoked-keys panel
+---
+ prisma/schema.prisma                          |  33 +
+ src/app/api/public/v1/dashboards/route.ts     | 126 ++++
+ src/app/api/public/v1/datasources/route.ts    | 132 ++++
+ src/app/api/public/v1/me/route.ts             |  68 +-
+ src/app/api/public/v1/queries/route.ts        | 188 ++++++
+ src/app/api/settings/api-keys/[id]/route.ts   | 220 ++++++-
+ .../api/settings/api-keys/revoked/route.ts    |  96 +++
+ src/app/api/settings/api-keys/route.ts        |  46 +-
+ src/app/api/settings/api-keys/usage/route.ts  | 119 ++++
+ .../settings/api-keys/api-keys-manager.tsx    | 619 +++++++++++++++++-
+ .../api-keys/create-api-key-dialog.tsx        | 176 ++++-
+ src/components/app/settings/api-keys/dict.ts  | 201 ++++++
+ .../app/settings/api-keys/usage-chart.tsx     |  93 +++
+ src/lib/api-auth.ts                           | 354 +++++++++-
+ 14 files changed, 2393 insertions(+), 78 deletions(-)
+ create mode 100644 src/app/api/public/v1/dashboards/route.ts
+ create mode 100644 src/app/api/public/v1/datasources/route.ts
+ create mode 100644 src/app/api/public/v1/queries/route.ts
+ create mode 100644 src/app/api/settings/api-keys/revoked/route.ts
+ create mode 100644 src/app/api/settings/api-keys/usage/route.ts
+ create mode 100644 src/components/app/settings/api-keys/usage-chart.tsx
+
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index c03285e..4c3f280 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -36,6 +36,7 @@ model User {
+   usageEvents    UsageEvent[]
+   mapLibrary     MapLibrary[]
+   apiKeys        ApiKey[]
++  auditLogs      SettingsAuditLog[]
+ 
+   createdAt      DateTime       @default(now()) @map("created_at")
+   updatedAt      DateTime       @updatedAt @map("updated_at")
+@@ -55,6 +56,10 @@ model ApiKey {
+   keyPrefix   String    @map("key_prefix") // "dm_live_a1B2" for display
+   label       String // "OpenFN - Sync nocturno"
+   scopes      String    @default("[]") @map("scopes") // JSON: ["read","execute","admin"]
++  /// JSON array of allowed IPs/CIDRs. Empty array = allow all IPs.
++  allowedIps  String    @default("[]") @map("allowed_ips")
++  /// Per-key rate limit (requests per minute). Null = use global default (60).
++  rateLimitPerMinute Int? @map("rate_limit_per_minute")
+   revokedAt   DateTime? @map("revoked_at") // soft delete
+   lastUsedAt  DateTime? @map("last_used_at")
+   lastUsedIp  String?   @map("last_used_ip")
+@@ -63,12 +68,40 @@ model ApiKey {
+ 
+   user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+   requestLogs ApiRequestLog[]
++  auditLogs   SettingsAuditLog[]
+ 
+   @@index([userId])
+   @@index([keyHash])
+   @@map("api_keys")
+ }
+ 
++/// Audit trail for management actions on API keys (create / edit / revoke).
++/// Used for compliance + debugging integration breakages ("who revoked the OpenFN key at 3am?").
++model SettingsAuditLog {
++  id          String   @id @default(cuid())
++  userId      String   @map("user_id")
++  /// "api_key.create" | "api_key.update" | "api_key.revoke"
++  action      String
++  /// Target API key id (null only if action target was unknown)
++  apiKeyId    String?  @map("api_key_id")
++  /// Target API key label (denormalized for human-readable audit even after key is deleted)
++  apiKeyLabel String?  @map("api_key_label")
++  /// JSON snapshot of the change. For create: full new record (minus hash).
++  /// For update: { before: {...}, after: {...} }. For revoke: { revokedAt }.
++  diff        String   @default("{}")
++  ip          String?
++  userAgent   String?  @map("user_agent")
++  createdAt   DateTime @default(now()) @map("created_at")
++
++  user        User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
++  apiKey      ApiKey?  @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
++
++  @@index([userId, createdAt])
++  @@index([apiKeyId])
++  @@index([action])
++  @@map("settings_audit_logs")
++}
++
+ model ApiRequestLog {
+   id          String   @id @default(cuid())
+   apiKeyId    String   @map("api_key_id")
+diff --git a/src/app/api/public/v1/dashboards/route.ts b/src/app/api/public/v1/dashboards/route.ts
+new file mode 100644
+index 0000000..5cb859d
+--- /dev/null
++++ b/src/app/api/public/v1/dashboards/route.ts
+@@ -0,0 +1,126 @@
++import { NextResponse } from 'next/server'
++import {
++  authenticateApiKey,
++  requireScope,
++  logApiRequest,
++  getClientIp,
++  rateLimitHeaders,
++} from '@/lib/api-auth'
++import { db } from '@/lib/db'
++
++/**
++ * GET /api/public/v1/dashboards
++ *
++ * Lists the API key owner's dashboards with their widget layout.
++ * Requires the `read` scope.
++ *
++ * Response:
++ *   {
++ *     dashboards: [{
++ *       id, name, description, createdAt,
++ *       widgets: [{ id, title, widgetType, sqlQuery, positionX, positionY, width, height }]
++ *     }]
++ *   }
++ */
++export async function GET(req: Request) {
++  const startedAt = Date.now()
++  const endpoint = '/api/public/v1/dashboards'
++  const method = 'GET'
++
++  const auth = await authenticateApiKey(req)
++  if (!auth.ok) {
++    return NextResponse.json(
++      { error: auth.error },
++      { status: auth.status, headers: rateLimitHeaders(auth) },
++    )
++  }
++
++  try {
++    requireScope(auth, 'read')
++  } catch (err) {
++    const status = (err as Error & { statusCode?: number }).statusCode ?? 403
++    logApiRequest({
++      apiKeyId: auth.apiKey.id,
++      endpoint,
++      method,
++      statusCode: status,
++      durationMs: Date.now() - startedAt,
++      ip: getClientIp(req),
++    })
++    return NextResponse.json(
++      { error: (err as Error).message },
++      { status, headers: rateLimitHeaders(auth) },
++    )
++  }
++
++  try {
++    const dashboards = await db.dashboard.findMany({
++      where: { userId: auth.user.id },
++      orderBy: { createdAt: 'desc' },
++      select: {
++        id: true,
++        name: true,
++        description: true,
++        createdAt: true,
++        widgets: {
++          select: {
++            id: true,
++            title: true,
++            widgetType: true,
++            dataSourceId: true,
++            sqlQuery: true,
++            positionX: true,
++            positionY: true,
++            width: true,
++            height: true,
++          },
++          orderBy: { positionY: 'asc' },
++        },
++      },
++    })
++
++    const durationMs = Date.now() - startedAt
++    logApiRequest({
++      apiKeyId: auth.apiKey.id,
++      endpoint,
++      method,
++      statusCode: 200,
++      durationMs,
++      ip: getClientIp(req),
++    })
++
++    return NextResponse.json(
++      {
++        dashboards: dashboards.map((d) => ({
++          id: d.id,
++          name: d.name,
++          description: d.description,
++          createdAt: d.createdAt,
++          widgets: d.widgets.map((w) => ({
++            id: w.id,
++            title: w.title,
++            widgetType: w.widgetType,
++            dataSourceId: w.dataSourceId,
++            sqlQuery: w.sqlQuery,
++            position: { x: w.positionX, y: w.positionY, w: w.width, h: w.height },
++          })),
++        })),
++      },
++      { headers: rateLimitHeaders(auth) },
++    )
++  } catch (err) {
++    console.error('[public/v1/dashboards] handler error:', err)
++    logApiRequest({
++      apiKeyId: auth.apiKey.id,
++      endpoint,
++      method,
++      statusCode: 500,
++      durationMs: Date.now() - startedAt,
++      ip: getClientIp(req),
++    })
++    return NextResponse.json(
++      { error: 'Internal server error' },
++      { status: 500, headers: rateLimitHeaders(auth) },
++    )
++  }
++}
+diff --git a/src/app/api/public/v1/datasources/route.ts b/src/app/api/public/v1/datasources/route.ts
+new file mode 100644
+index 0000000..0ef1213
+--- /dev/null
++++ b/src/app/api/public/v1/datasources/route.ts
+@@ -0,0 +1,132 @@
++import { NextResponse } from 'next/server'
++import {
++  authenticateApiKey,
++  requireScope,
++  logApiRequest,
++  getClientIp,
++  rateLimitHeaders,
++} from '@/lib/api-auth'
++import { db } from '@/lib/db'
++
++/**
++ * GET /api/public/v1/datasources
++ *
++ * Lists the API key owner's data sources with their schemas (tables + columns).
++ * Requires the `read` scope.
++ *
++ * Response:
++ *   {
++ *     datasources: [{
++ *       id, name, fileType, status, createdAt,
++ *       schemas: [{ id, tableName, rowCount, columns }]
++ *     }]
++ *   }
++ */
++export async function GET(req: Request) {
++  const startedAt = Date.now()
++  const endpoint = '/api/public/v1/datasources'
++  const method = 'GET'
++
++  const auth = await authenticateApiKey(req)
++  if (!auth.ok) {
++    return NextResponse.json(
++      { error: auth.error },
++      { status: auth.status, headers: rateLimitHeaders(auth) },
++    )
++  }
++
++  try {
++    requireScope(auth, 'read')
++  } catch (err) {
++    const status = (err as Error & { statusCode?: number }).statusCode ?? 403
++    logApiRequest({
++      apiKeyId: auth.apiKey.id,
++      endpoint,
++      method,
++      statusCode: status,
++      durationMs: Date.now() - startedAt,
++      ip: getClientIp(req),
++    })
++    return NextResponse.json(
++      { error: (err as Error).message },
++      { status, headers: rateLimitHeaders(auth) },
++    )
++  }
++
++  try {
++    const datasources = await db.dataSource.findMany({
++      where: { userId: auth.user.id },
++      orderBy: { createdAt: 'desc' },
++      select: {
++        id: true,
++        name: true,
++        fileName: true,
++        fileSize: true,
++        fileType: true,
++        status: true,
++        createdAt: true,
++        schemas: {
++          select: {
++            id: true,
++            tableName: true,
++            rowCount: true,
++            columns: true,
++          },
++        },
++      },
++    })
++
++    const durationMs = Date.now() - startedAt
++    logApiRequest({
++      apiKeyId: auth.apiKey.id,
++      endpoint,
++      method,
++      statusCode: 200,
++      durationMs,
++      ip: getClientIp(req),
++    })
++
++    return NextResponse.json(
++      {
++        datasources: datasources.map((d) => ({
++          id: d.id,
++          name: d.name,
++          fileName: d.fileName,
++          fileSize: d.fileSize,
++          fileType: d.fileType,
++          status: d.status,
++          createdAt: d.createdAt,
++          schemas: d.schemas.map((s) => ({
++            id: s.id,
++            tableName: s.tableName,
++            rowCount: s.rowCount,
++            columns: safeParseJson(s.columns),
++          })),
++        })),
++      },
++      { headers: rateLimitHeaders(auth) },
++    )
++  } catch (err) {
++    console.error('[public/v1/datasources] handler error:', err)
++    logApiRequest({
++      apiKeyId: auth.apiKey.id,
++      endpoint,
++      method,
++      statusCode: 500,
++      durationMs: Date.now() - startedAt,
++      ip: getClientIp(req),
++    })
++    return NextResponse.json(
++      { error: 'Internal server error' },
++      { status: 500, headers: rateLimitHeaders(auth) },
++    )
++  }
++}
++
++function safeParseJson(s: string): unknown {
++  try {
++    return JSON.parse(s)
++  } catch {
++    return []
++  }
++}
+diff --git a/src/app/api/public/v1/me/route.ts b/src/app/api/public/v1/me/route.ts
+index 9d476ef..e7982a7 100644
+--- a/src/app/api/public/v1/me/route.ts
++++ b/src/app/api/public/v1/me/route.ts
+@@ -5,6 +5,7 @@ import {
+   logApiRequest,
+   getClientIp,
+   hasScope,
++  rateLimitHeaders,
+   type ApiAuthResult,
+ } from '@/lib/api-auth'
+ import { db } from '@/lib/db'
+@@ -12,7 +13,7 @@ import { db } from '@/lib/db'
+ /**
+  * GET /api/public/v1/me
+  *
+- * Demo / introspection endpoint for API keys.
++ * Introspection endpoint for API keys.
+  * Authenticates via the `Authorization: Bearer dm_live_...` header (NOT the
+  * browser session). Requires the `read` scope.
+  *
+@@ -20,12 +21,11 @@ import { db } from '@/lib/db'
+  *  - Verifying a newly-created key works.
+  *  - OpenFN / N8N inspecting which user a key belongs to.
+  *
+- * Response:
+- *   {
+- *     "user": { "id", "email", "name" },
+- *     "apiKey": { "id", "label", "scopes" },
+- *     "subscription": { "plan" } | null
+- *   }
++ * Response includes the key's resolved IP allowlist + rate-limit config so
++ * integration tools can surface meaningful errors before hitting limits.
++ *
++ * Rate-limit headers (X-RateLimit-Limit, X-RateLimit-Remaining) are attached
++ * to every response so callers can throttle proactively.
+  */
+ export async function GET(req: Request) {
+   const startedAt = Date.now()
+@@ -44,8 +44,10 @@ export async function GET(req: Request) {
+   }
+ 
+   if (!auth.ok) {
+-    // No key to log against, so just return the error.
+-    return NextResponse.json({ error: auth.error }, { status: auth.status })
++    return NextResponse.json(
++      { error: auth.error },
++      { status: auth.status, headers: rateLimitHeaders(auth) },
++    )
+   }
+ 
+   try {
+@@ -62,12 +64,11 @@ export async function GET(req: Request) {
+     })
+     return NextResponse.json(
+       { error: (err as Error).message },
+-      { status },
++      { status, headers: rateLimitHeaders(auth) },
+     )
+   }
+ 
+   try {
+-    // Eagerly load the user's subscription for convenience.
+     const subscription = await db.subscription.findUnique({
+       where: { userId: auth.user.id },
+       select: { plan: true, status: true },
+@@ -83,26 +84,31 @@ export async function GET(req: Request) {
+       ip: getClientIp(req),
+     })
+ 
+-    return NextResponse.json({
+-      user: {
+-        id: auth.user.id,
+-        email: auth.user.email,
+-        name: auth.user.name,
+-      },
+-      apiKey: {
+-        id: auth.apiKey.id,
+-        label: auth.apiKey.label,
+-        scopes: auth.apiKey.scopes,
+-      },
+-      capabilities: {
+-        read: hasScope(auth.apiKey.scopes, 'read'),
+-        execute: hasScope(auth.apiKey.scopes, 'execute'),
+-        admin: auth.apiKey.scopes.includes('admin'),
++    return NextResponse.json(
++      {
++        user: {
++          id: auth.user.id,
++          email: auth.user.email,
++          name: auth.user.name,
++        },
++        apiKey: {
++          id: auth.apiKey.id,
++          label: auth.apiKey.label,
++          scopes: auth.apiKey.scopes,
++          allowedIps: auth.apiKey.allowedIps,
++          rateLimitPerMinute: auth.apiKey.rateLimitPerMinute,
++        },
++        capabilities: {
++          read: hasScope(auth.apiKey.scopes, 'read'),
++          execute: hasScope(auth.apiKey.scopes, 'execute'),
++          admin: auth.apiKey.scopes.includes('admin'),
++        },
++        subscription: subscription
++          ? { plan: subscription.plan, status: subscription.status }
++          : null,
+       },
+-      subscription: subscription
+-        ? { plan: subscription.plan, status: subscription.status }
+-        : null,
+-    })
++      { headers: rateLimitHeaders(auth) },
++    )
+   } catch (err) {
+     console.error('[public/v1/me] handler error:', err)
+     logApiRequest({
+@@ -115,7 +121,7 @@ export async function GET(req: Request) {
+     })
+     return NextResponse.json(
+       { error: 'Internal server error' },
+-      { status: 500 },
++      { status: 500, headers: rateLimitHeaders(auth) },
+     )
+   }
+ }
+diff --git a/src/app/api/public/v1/queries/route.ts b/src/app/api/public/v1/queries/route.ts
+new file mode 100644
+index 0000000..1b13102
+--- /dev/null
++++ b/src/app/api/public/v1/queries/route.ts
+@@ -0,0 +1,188 @@
++import { NextResponse } from 'next/server'
++import { z } from 'zod'
++import {
++  authenticateApiKey,
++  requireScope,
++  logApiRequest,
++  getClientIp,
++  rateLimitHeaders,
++} from '@/lib/api-auth'
++import { db } from '@/lib/db'
++import { executeSelectQuery } from '@/lib/sqlite'
++import { validateSQLQuery, sanitizeSQL } from '@/lib/sql-security'
++
++/**
++ * POST /api/public/v1/queries
++ *
++ * Executes a read-only SQL SELECT against one of the API key owner's data
++ * sources. Requires the `execute` scope.
++ *
++ * Body:
++ *   { dataSourceId: string, sql: string, limit?: number }
++ *
++ * The `limit` (default 1000, max 10000) is appended to the query if the SQL
++ * doesn't already contain LIMIT — protects against accidental huge result
++ * sets from integration tools.
++ *
++ * Response:
++ *   { data: Row[], columns: string[], rowCount: number, executionTime: number }
++ */
++const querySchema = z.object({
++  dataSourceId: z.string().min(1),
++  sql: z.string().trim().min(1, 'SQL is required').max(20_000),
++  limit: z.number().int().min(1).max(10_000).optional().default(1000),
++})
++
++export async function POST(req: Request) {
++  const startedAt = Date.now()
++  const endpoint = '/api/public/v1/queries'
++  const method = 'POST'
++
++  const auth = await authenticateApiKey(req)
++  if (!auth.ok) {
++    return NextResponse.json(
++      { error: auth.error },
++      { status: auth.status, headers: rateLimitHeaders(auth) },
++    )
++  }
++
++  try {
++    requireScope(auth, 'execute')
++  } catch (err) {
++    const status = (err as Error & { statusCode?: number }).statusCode ?? 403
++    logApiRequest({
++      apiKeyId: auth.apiKey.id,
++      endpoint,
++      method,
++      statusCode: status,
++      durationMs: Date.now() - startedAt,
++      ip: getClientIp(req),
++    })
++    return NextResponse.json(
++      { error: (err as Error).message },
++      { status, headers: rateLimitHeaders(auth) },
++    )
++  }
++
++  let rowCount = 0
++  try {
++    const body = await req.json().catch(() => null)
++    const parsed = querySchema.safeParse(body)
++    if (!parsed.success) {
++      logApiRequest({
++        apiKeyId: auth.apiKey.id,
++        endpoint,
++        method,
++        statusCode: 400,
++        durationMs: Date.now() - startedAt,
++        ip: getClientIp(req),
++      })
++      return NextResponse.json(
++        { error: 'Validation failed', issues: parsed.error.issues },
++        { status: 400, headers: rateLimitHeaders(auth) },
++      )
++    }
++
++    const { dataSourceId, sql, limit } = parsed.data
++
++    // Fetch the datasource and verify ownership
++    const datasource = await db.dataSource.findUnique({
++      where: { id: dataSourceId },
++      select: { id: true, userId: true, filePath: true, name: true, status: true },
++    })
++
++    if (!datasource || datasource.userId !== auth.user.id) {
++      logApiRequest({
++        apiKeyId: auth.apiKey.id,
++        endpoint,
++        method,
++        statusCode: 404,
++        durationMs: Date.now() - startedAt,
++        ip: getClientIp(req),
++      })
++      return NextResponse.json(
++        { error: 'Data source not found' },
++        { status: 404, headers: rateLimitHeaders(auth) },
++      )
++    }
++
++    if (datasource.status !== 'ready') {
++      logApiRequest({
++        apiKeyId: auth.apiKey.id,
++        endpoint,
++        method,
++        statusCode: 409,
++        durationMs: Date.now() - startedAt,
++        ip: getClientIp(req),
++      })
++      return NextResponse.json(
++        { error: `Data source is not ready (status: ${datasource.status})` },
++        { status: 409, headers: rateLimitHeaders(auth) },
++      )
++    }
++
++    // Validate the SQL — only safe SELECT statements are allowed
++    const validation = validateSQLQuery(sql)
++    if (!validation.isSafe) {
++      logApiRequest({
++        apiKeyId: auth.apiKey.id,
++        endpoint,
++        method,
++        statusCode: 400,
++        durationMs: Date.now() - startedAt,
++        ip: getClientIp(req),
++      })
++      return NextResponse.json(
++        { error: 'Query validation failed', details: validation.errors },
++        { status: 400, headers: rateLimitHeaders(auth) },
++      )
++    }
++
++    // Inject a LIMIT if none is present, to protect integration tools from
++    // accidentally pulling millions of rows.
++    const sanitized = sanitizeSQL(sql)
++    const finalSql = /\blimit\b/i.test(sanitized)
++      ? sanitized
++      : `${sanitized} LIMIT ${limit}`
++
++    const result = executeSelectQuery(datasource.filePath, finalSql)
++    rowCount = result.rowCount
++
++    const durationMs = Date.now() - startedAt
++    logApiRequest({
++      apiKeyId: auth.apiKey.id,
++      endpoint,
++      method,
++      statusCode: 200,
++      durationMs,
++      rowCount,
++      ip: getClientIp(req),
++    })
++
++    return NextResponse.json(
++      {
++        data: result.data,
++        columns: result.columns,
++        rowCount: result.rowCount,
++        executionTime: result.executionTime,
++      },
++      { headers: rateLimitHeaders(auth) },
++    )
++  } catch (err) {
++    console.error('[public/v1/queries] handler error:', err)
++    logApiRequest({
++      apiKeyId: auth.apiKey.id,
++      endpoint,
++      method,
++      statusCode: 500,
++      durationMs: Date.now() - startedAt,
++      rowCount,
++      ip: getClientIp(req),
++    })
++    const message = err instanceof Error ? err.message : 'Internal server error'
++    return NextResponse.json(
++      { error: 'Query execution failed', details: message },
++      { status: 500, headers: rateLimitHeaders(auth) },
++    )
++  }
++}
+diff --git a/src/app/api/settings/api-keys/[id]/route.ts b/src/app/api/settings/api-keys/[id]/route.ts
+index 1c4d508..9fe5746 100644
+--- a/src/app/api/settings/api-keys/[id]/route.ts
++++ b/src/app/api/settings/api-keys/[id]/route.ts
+@@ -1,6 +1,208 @@
+ import { NextResponse } from 'next/server'
++import { z } from 'zod'
+ import { getCurrentUser } from '@/lib/auth-utils'
+ import { db } from '@/lib/db'
++import {
++  serializeScopes,
++  parseScopes,
++  serializeAllowedIps,
++  parseAllowedIps,
++  ALL_SCOPES,
++  writeAuditLog,
++  auditContext,
++  type ApiScope,
++} from '@/lib/api-auth'
++
++const patchKeySchema = z.object({
++  label: z
++    .string()
++    .trim()
++    .min(1, 'Label is required')
++    .max(60, 'Label must be 60 characters or fewer')
++    .optional(),
++  scopes: z
++    .array(z.enum(ALL_SCOPES as [ApiScope, ...ApiScope[]]))
++    .min(1, 'Select at least one scope')
++    .max(3)
++    .optional(),
++  allowedIps: z
++    .array(z.string().trim().min(1).max(50))
++    .max(20, 'Maximum 20 IP/CIDR rules per key')
++    .optional(),
++  rateLimitPerMinute: z
++    .number()
++    .int()
++    .min(1, 'Rate limit must be at least 1')
++    .max(1000, 'Rate limit cannot exceed 1000/min')
++    .nullable()
++    .optional(),
++  expiresAt: z.string().datetime().nullable().optional(),
++})
++
++/**
++ * PATCH /api/settings/api-keys/[id]
++ *
++ * Edits a non-revoked API key's metadata: label, scopes, IP allowlist, rate
++ * limit, or expiry. The key hash is never touched (you cannot rotate a key
++ * without revoking + creating a new one).
++ *
++ * Ownership check: the key must belong to the authenticated user.
++ * Revoked keys cannot be edited (return 409).
++ */
++export async function PATCH(
++  req: Request,
++  { params }: { params: Promise<{ id: string }> },
++) {
++  try {
++    const user = await getCurrentUser()
++    if (!user) {
++      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
++    }
++
++    const { id } = await params
++
++    const existing = await db.apiKey.findUnique({
++      where: { id },
++      select: {
++        id: true,
++        userId: true,
++        label: true,
++        scopes: true,
++        allowedIps: true,
++        rateLimitPerMinute: true,
++        expiresAt: true,
++        revokedAt: true,
++      },
++    })
++
++    if (!existing || existing.userId !== user.id) {
++      return NextResponse.json({ error: 'API key not found' }, { status: 404 })
++    }
++
++    if (existing.revokedAt) {
++      return NextResponse.json(
++        { error: 'Cannot edit a revoked API key. Create a new one instead.' },
++        { status: 409 },
++      )
++    }
++
++    const body = await req.json().catch(() => null)
++    const parsed = patchKeySchema.safeParse(body)
++    if (!parsed.success) {
++      return NextResponse.json(
++        { error: 'Validation failed', issues: parsed.error.issues },
++        { status: 400 },
++      )
++    }
++
++    const patch = parsed.data
++    const data: Record<string, unknown> = {}
++
++    if (patch.label !== undefined && patch.label !== existing.label) {
++      data.label = patch.label
++    }
++    if (patch.scopes !== undefined) {
++      const newScopes = serializeScopes(patch.scopes)
++      if (newScopes !== existing.scopes) {
++        data.scopes = newScopes
++      }
++    }
++    if (patch.allowedIps !== undefined) {
++      const newIps = serializeAllowedIps(patch.allowedIps)
++      if (newIps !== existing.allowedIps) {
++        data.allowedIps = newIps
++      }
++    }
++    if (patch.rateLimitPerMinute !== undefined) {
++      if (patch.rateLimitPerMinute !== existing.rateLimitPerMinute) {
++        data.rateLimitPerMinute = patch.rateLimitPerMinute
++      }
++    }
++    if (patch.expiresAt !== undefined) {
++      const newExp = patch.expiresAt ? new Date(patch.expiresAt) : null
++      const oldExp = existing.expiresAt?.toISOString() ?? null
++      if ((newExp?.toISOString() ?? null) !== oldExp) {
++        data.expiresAt = newExp
++      }
++    }
++
++    if (Object.keys(data).length === 0) {
++      // Nothing to change — return current state without a DB write.
++      return NextResponse.json({
++        ok: true,
++        noChange: true,
++        meta: {
++          id: existing.id,
++          label: existing.label,
++          scopes: parseScopes(existing.scopes),
++          allowedIps: parseAllowedIps(existing.allowedIps),
++          rateLimitPerMinute: existing.rateLimitPerMinute,
++          expiresAt: existing.expiresAt,
++        },
++      })
++    }
++
++    const updated = await db.apiKey.update({
++      where: { id: existing.id },
++      data,
++      select: {
++        id: true,
++        label: true,
++        scopes: true,
++        allowedIps: true,
++        rateLimitPerMinute: true,
++        expiresAt: true,
++      },
++    })
++
++    // Audit log — capture the before/after diff for the changed fields only.
++    const ctx = auditContext(req)
++    const diff: Record<string, { before: unknown; after: unknown }> = {}
++    if ('label' in data) diff.label = { before: existing.label, after: updated.label }
++    if ('scopes' in data) {
++      diff.scopes = { before: parseScopes(existing.scopes), after: parseScopes(updated.scopes) }
++    }
++    if ('allowedIps' in data) {
++      diff.allowedIps = {
++        before: parseAllowedIps(existing.allowedIps),
++        after: parseAllowedIps(updated.allowedIps),
++      }
++    }
++    if ('rateLimitPerMinute' in data) {
++      diff.rateLimitPerMinute = {
++        before: existing.rateLimitPerMinute,
++        after: updated.rateLimitPerMinute,
++      }
++    }
++    if ('expiresAt' in data) {
++      diff.expiresAt = { before: existing.expiresAt, after: updated.expiresAt }
++    }
++
++    void writeAuditLog({
++      userId: user.id,
++      action: 'api_key.update',
++      apiKeyId: updated.id,
++      apiKeyLabel: updated.label,
++      diff,
++      ...ctx,
++    })
++
++    return NextResponse.json({
++      ok: true,
++      meta: {
++        id: updated.id,
++        label: updated.label,
++        scopes: parseScopes(updated.scopes),
++        allowedIps: parseAllowedIps(updated.allowedIps),
++        rateLimitPerMinute: updated.rateLimitPerMinute,
++        expiresAt: updated.expiresAt,
++      },
++    })
++  } catch (error) {
++    console.error('[api-keys] PATCH error:', error)
++    return NextResponse.json({ error: 'Failed to update API key' }, { status: 500 })
++  }
++}
+ 
+ /**
+  * DELETE /api/settings/api-keys/[id]
+@@ -12,7 +214,7 @@ import { db } from '@/lib/db'
+  * Already-revoked keys return 200 (idempotent) rather than 404.
+  */
+ export async function DELETE(
+-  _req: Request,
++  req: Request,
+   { params }: { params: Promise<{ id: string }> },
+ ) {
+   try {
+@@ -25,7 +227,7 @@ export async function DELETE(
+ 
+     const apiKey = await db.apiKey.findUnique({
+       where: { id },
+-      select: { id: true, userId: true, revokedAt: true },
++      select: { id: true, userId: true, label: true, revokedAt: true },
+     })
+ 
+     if (!apiKey || apiKey.userId !== user.id) {
+@@ -38,9 +240,21 @@ export async function DELETE(
+       return NextResponse.json({ ok: true, alreadyRevoked: true })
+     }
+ 
++    const now = new Date()
+     await db.apiKey.update({
+       where: { id: apiKey.id },
+-      data: { revokedAt: new Date() },
++      data: { revokedAt: now },
++    })
++
++    // Audit log
++    const ctx = auditContext(req)
++    void writeAuditLog({
++      userId: user.id,
++      action: 'api_key.revoke',
++      apiKeyId: apiKey.id,
++      apiKeyLabel: apiKey.label,
++      diff: { revokedAt: now.toISOString() },
++      ...ctx,
+     })
+ 
+     return NextResponse.json({ ok: true })
+diff --git a/src/app/api/settings/api-keys/revoked/route.ts b/src/app/api/settings/api-keys/revoked/route.ts
+new file mode 100644
+index 0000000..0c1b0f3
+--- /dev/null
++++ b/src/app/api/settings/api-keys/revoked/route.ts
+@@ -0,0 +1,96 @@
++import { NextResponse } from 'next/server'
++import { getCurrentUser } from '@/lib/auth-utils'
++import { db } from '@/lib/db'
++import { maskApiKey, parseScopes, parseAllowedIps } from '@/lib/api-auth'
++
++/**
++ * GET /api/settings/api-keys/revoked
++ *
++ * Returns revoked API keys + the full audit trail of management actions
++ * (create / update / revoke) for the current user. Used by the UI's
++ * "Audit & revoked keys" panel.
++ *
++ * Response:
++ *   {
++ *     revokedKeys: [{ id, label, maskedKey, scopes, revokedAt, createdAt, lastUsedAt }],
++ *     auditLog: [{ id, action, apiKeyLabel, diff, ip, createdAt }]
++ *   }
++ */
++export async function GET() {
++  try {
++    const user = await getCurrentUser()
++    if (!user) {
++      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
++    }
++
++    const [revokedKeys, auditLog] = await Promise.all([
++      db.apiKey.findMany({
++        where: { userId: user.id, revokedAt: { not: null } },
++        orderBy: { revokedAt: 'desc' },
++        select: {
++          id: true,
++          label: true,
++          keyPrefix: true,
++          scopes: true,
++          allowedIps: true,
++          revokedAt: true,
++          lastUsedAt: true,
++          lastUsedIp: true,
++          createdAt: true,
++          _count: { select: { requestLogs: true } },
++        },
++      }),
++      db.settingsAuditLog.findMany({
++        where: { userId: user.id },
++        orderBy: { createdAt: 'desc' },
++        take: 50, // cap to the most recent 50 entries
++        select: {
++          id: true,
++          action: true,
++          apiKeyId: true,
++          apiKeyLabel: true,
++          diff: true,
++          ip: true,
++          userAgent: true,
++          createdAt: true,
++        },
++      }),
++    ])
++
++    return NextResponse.json({
++      revokedKeys: revokedKeys.map((k) => ({
++        id: k.id,
++        label: k.label,
++        maskedKey: maskApiKey(k.keyPrefix),
++        scopes: parseScopes(k.scopes),
++        allowedIps: parseAllowedIps(k.allowedIps),
++        revokedAt: k.revokedAt,
++        lastUsedAt: k.lastUsedAt,
++        lastUsedIp: k.lastUsedIp,
++        createdAt: k.createdAt,
++        requestCount: k._count.requestLogs,
++      })),
++      auditLog: auditLog.map((e) => ({
++        id: e.id,
++        action: e.action,
++        apiKeyId: e.apiKeyId,
++        apiKeyLabel: e.apiKeyLabel,
++        diff: safeParseJson(e.diff),
++        ip: e.ip,
++        userAgent: e.userAgent,
++        createdAt: e.createdAt,
++      })),
++    })
++  } catch (error) {
++    console.error('[api-keys/revoked] GET error:', error)
++    return NextResponse.json({ error: 'Failed to fetch audit trail' }, { status: 500 })
++  }
++}
++
++function safeParseJson(s: string): unknown {
++  try {
++    return JSON.parse(s)
++  } catch {
++    return {}
++  }
++}
+diff --git a/src/app/api/settings/api-keys/route.ts b/src/app/api/settings/api-keys/route.ts
+index ec0c0dc..61084b8 100644
+--- a/src/app/api/settings/api-keys/route.ts
++++ b/src/app/api/settings/api-keys/route.ts
+@@ -7,7 +7,11 @@ import {
+   serializeScopes,
+   maskApiKey,
+   parseScopes,
++  parseAllowedIps,
++  serializeAllowedIps,
+   ALL_SCOPES,
++  writeAuditLog,
++  auditContext,
+   type ApiScope,
+ } from '@/lib/api-auth'
+ 
+@@ -32,6 +36,8 @@ export async function GET() {
+         label: true,
+         keyPrefix: true,
+         scopes: true,
++        allowedIps: true,
++        rateLimitPerMinute: true,
+         revokedAt: true,
+         lastUsedAt: true,
+         lastUsedIp: true,
+@@ -46,6 +52,8 @@ export async function GET() {
+       label: k.label,
+       maskedKey: maskApiKey(k.keyPrefix),
+       scopes: parseScopes(k.scopes),
++      allowedIps: parseAllowedIps(k.allowedIps),
++      rateLimitPerMinute: k.rateLimitPerMinute,
+       revokedAt: k.revokedAt,
+       lastUsedAt: k.lastUsedAt,
+       lastUsedIp: k.lastUsedIp,
+@@ -72,6 +80,19 @@ const createKeySchema = z.object({
+     .min(1, 'Select at least one scope')
+     .max(3),
+   expiresInDays: z.number().int().positive().optional(),
++  allowedIps: z
++    .array(z.string().trim().min(1).max(50))
++    .max(20, 'Maximum 20 IP/CIDR rules per key')
++    .optional()
++    .default([]),
++  rateLimitPerMinute: z
++    .number()
++    .int()
++    .min(1, 'Rate limit must be at least 1')
++    .max(1000, 'Rate limit cannot exceed 1000/min')
++    .optional()
++    .nullable()
++    .default(null),
+ })
+ 
+ /**
+@@ -97,7 +118,7 @@ export async function POST(req: Request) {
+       )
+     }
+ 
+-    const { label, scopes, expiresInDays } = parsed.data
++    const { label, scopes, expiresInDays, allowedIps, rateLimitPerMinute } = parsed.data
+ 
+     // Enforce a per-user key cap to avoid abuse.
+     const MAX_KEYS_PER_USER = 25
+@@ -124,17 +145,38 @@ export async function POST(req: Request) {
+         keyPrefix,
+         label,
+         scopes: serializeScopes(scopes),
++        allowedIps: serializeAllowedIps(allowedIps),
++        rateLimitPerMinute: rateLimitPerMinute ?? null,
+         expiresAt,
+       },
+       select: {
+         id: true,
+         label: true,
+         scopes: true,
++        allowedIps: true,
++        rateLimitPerMinute: true,
+         expiresAt: true,
+         createdAt: true,
+       },
+     })
+ 
++    // Audit log
++    const ctx = auditContext(req)
++    void writeAuditLog({
++      userId: user.id,
++      action: 'api_key.create',
++      apiKeyId: created.id,
++      apiKeyLabel: created.label,
++      diff: {
++        label: created.label,
++        scopes: parseScopes(created.scopes),
++        allowedIps: parseAllowedIps(created.allowedIps),
++        rateLimitPerMinute: created.rateLimitPerMinute,
++        expiresAt: created.expiresAt,
++      },
++      ...ctx,
++    })
++
+     // 201 Created — the plaintext is included here and ONLY here.
+     return NextResponse.json(
+       {
+@@ -143,6 +185,8 @@ export async function POST(req: Request) {
+           id: created.id,
+           label: created.label,
+           scopes: parseScopes(created.scopes),
++          allowedIps: parseAllowedIps(created.allowedIps),
++          rateLimitPerMinute: created.rateLimitPerMinute,
+           expiresAt: created.expiresAt,
+           createdAt: created.createdAt,
+           maskedKey: maskApiKey(keyPrefix),
+diff --git a/src/app/api/settings/api-keys/usage/route.ts b/src/app/api/settings/api-keys/usage/route.ts
+new file mode 100644
+index 0000000..f1887fb
+--- /dev/null
++++ b/src/app/api/settings/api-keys/usage/route.ts
+@@ -0,0 +1,119 @@
++import { NextResponse } from 'next/server'
++import { getCurrentUser } from '@/lib/auth-utils'
++import { db } from '@/lib/db'
++import { maskApiKey } from '@/lib/api-auth'
++
++/**
++ * GET /api/settings/api-keys/usage
++ *
++ * Returns 7-day usage breakdown per active API key for the current user.
++ * Used by the manager's per-key sparkline + the aggregate usage chart.
++ *
++ * Response:
++ *   {
++ *     range: { start, end, days: 7 },
++ *     keys: [{
++ *       id, label, maskedKey,
++ *       total: number,
++ *       byDay: [{ date: 'YYYY-MM-DD', count, avgMs, errors }],
++ *       topEndpoints: [{ endpoint, count }]
++ *     }],
++ *     aggregate: { total, byDay: [{ date, count }] }
++ *   }
++ */
++export async function GET() {
++  try {
++    const user = await getCurrentUser()
++    if (!user) {
++      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
++    }
++
++    const days = 7
++    const end = new Date()
++    const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000)
++
++    const keys = await db.apiKey.findMany({
++      where: { userId: user.id },
++      orderBy: { createdAt: 'desc' },
++      select: {
++        id: true,
++        label: true,
++        keyPrefix: true,
++        revokedAt: true,
++        requestLogs: {
++          where: { createdAt: { gte: start, lte: end } },
++          select: { endpoint: true, statusCode: true, durationMs: true, createdAt: true },
++        },
++      },
++    })
++
++    // Build per-day buckets
++    const dayBuckets: string[] = []
++    for (let i = 0; i < days; i++) {
++      const d = new Date(start.getTime() + i * 24 * 60 * 60 * 1000)
++      dayBuckets.push(d.toISOString().slice(0, 10))
++    }
++
++    const keysOut = keys.map((k) => {
++      const byDayMap = new Map<string, { count: number; totalMs: number; errors: number }>()
++      const endpointMap = new Map<string, number>()
++      for (const log of k.requestLogs) {
++        const day = log.createdAt.toISOString().slice(0, 10)
++        const entry = byDayMap.get(day) ?? { count: 0, totalMs: 0, errors: 0 }
++        entry.count += 1
++        entry.totalMs += log.durationMs
++        if (log.statusCode >= 400) entry.errors += 1
++        byDayMap.set(day, entry)
++
++        const ep = endpointMap.get(log.endpoint) ?? 0
++        endpointMap.set(log.endpoint, ep + 1)
++      }
++
++      const byDay = dayBuckets.map((date) => {
++        const e = byDayMap.get(date)
++        return {
++          date,
++          count: e?.count ?? 0,
++          avgMs: e && e.count > 0 ? Math.round(e.totalMs / e.count) : 0,
++          errors: e?.errors ?? 0,
++        }
++      })
++
++      const total = k.requestLogs.length
++      const topEndpoints = [...endpointMap.entries()]
++        .map(([endpoint, count]) => ({ endpoint, count }))
++        .sort((a, b) => b.count - a.count)
++        .slice(0, 5)
++
++      return {
++        id: k.id,
++        label: k.label,
++        maskedKey: maskApiKey(k.keyPrefix),
++        revoked: !!k.revokedAt,
++        total,
++        byDay,
++        topEndpoints,
++      }
++    })
++
++    // Aggregate across all keys
++    const aggregateByDay = dayBuckets.map((date) => {
++      let count = 0
++      for (const k of keysOut) {
++        const e = k.byDay.find((d) => d.date === date)
++        if (e) count += e.count
++      }
++      return { date, count }
++    })
++    const aggregateTotal = keysOut.reduce((s, k) => s + k.total, 0)
++
++    return NextResponse.json({
++      range: { start: start.toISOString(), end: end.toISOString(), days },
++      keys: keysOut,
++      aggregate: { total: aggregateTotal, byDay: aggregateByDay },
++    })
++  } catch (error) {
++    console.error('[api-keys/usage] GET error:', error)
++    return NextResponse.json({ error: 'Failed to fetch usage' }, { status: 500 })
++  }
++}
+diff --git a/src/components/app/settings/api-keys/api-keys-manager.tsx b/src/components/app/settings/api-keys/api-keys-manager.tsx
+index 1c2954a..c14dd2a 100644
+--- a/src/components/app/settings/api-keys/api-keys-manager.tsx
++++ b/src/components/app/settings/api-keys/api-keys-manager.tsx
+@@ -18,21 +18,42 @@ import {
+   AlertDialogHeader,
+   AlertDialogTitle,
+ } from '@/components/ui/alert-dialog';
++import {
++  Collapsible,
++  CollapsibleContent,
++  CollapsibleTrigger,
++} from '@/components/ui/collapsible';
+ import { Button } from '@/components/ui/button';
+ import { Badge } from '@/components/ui/badge';
++import { Input } from '@/components/ui/input';
++import { Label } from '@/components/ui/label';
++import { Checkbox } from '@/components/ui/checkbox';
+ import { ScrollArea } from '@/components/ui/scroll-area';
+ import { Separator } from '@/components/ui/separator';
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from '@/components/ui/select';
+ import {
+   KeyRound,
+   Plus,
+   Loader2,
+   Trash2,
++  Pencil,
+   ShieldCheck,
+   AlertCircle,
+   Clock,
+   Activity,
+   CalendarClock,
+   RefreshCw,
++  Shield,
++  Gauge,
++  History,
++  ChevronDown,
++  X,
+ } from 'lucide-react';
+ import { formatDistanceToNow, format, isValid } from 'date-fns';
+ import { toast } from 'sonner';
+@@ -41,12 +62,19 @@ import type { ApiScope } from '@/lib/api-auth';
+ import {
+   type ApiKeyView,
+   type CreatedApiKey,
++  type KeyUsage,
++  type UsageResponse,
++  type RevokedResponse,
++  type AuditLogEntry,
+   type Locale,
+   getDict,
++  scopeMeta,
+   scopeBadgeClass,
++  isValidIpOrCidr,
+ } from './dict';
+ import { CreateApiKeyDialog } from './create-api-key-dialog';
+ import { NewKeyRevealDialog } from './new-key-reveal-dialog';
++import { UsageChart } from './usage-chart';
+ 
+ interface ApiKeysManagerProps {
+   open: boolean;
+@@ -62,15 +90,26 @@ function safeDate(value: string | null): Date | null {
+ 
+ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerProps) {
+   const t = getDict(locale);
++  const metas = scopeMeta(locale, t);
+ 
+   const [keys, setKeys] = useState<ApiKeyView[]>([]);
+   const [loading, setLoading] = useState(false);
+   const [loadError, setLoadError] = useState<string | null>(null);
+ 
++  const [usage, setUsage] = useState<Record<string, KeyUsage>>({});
++  const [usageLoading, setUsageLoading] = useState(false);
++
++  const [revokedData, setRevokedData] = useState<RevokedResponse | null>(null);
++  const [auditOpen, setAuditOpen] = useState(false);
++  const [auditLoading, setAuditLoading] = useState(false);
++
+   const [createOpen, setCreateOpen] = useState(false);
+   const [revealCreated, setRevealCreated] = useState<CreatedApiKey | null>(null);
+   const [revealOpen, setRevealOpen] = useState(false);
+ 
++  const [editTarget, setEditTarget] = useState<ApiKeyView | null>(null);
++  const [editOpen, setEditOpen] = useState(false);
++
+   const [revokeTarget, setRevokeTarget] = useState<ApiKeyView | null>(null);
+   const [revoking, setRevoking] = useState(false);
+ 
+@@ -94,16 +133,63 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+     }
+   }, [t]);
+ 
+-  // Load keys whenever the manager is opened.
++  const loadUsage = useCallback(async () => {
++    setUsageLoading(true);
++    try {
++      const res = await authFetch('/api/settings/api-keys/usage');
++      const data = (await res.json().catch(() => ({}))) as UsageResponse;
++      if (res.ok && data?.keys) {
++        const map: Record<string, KeyUsage> = {};
++        for (const k of data.keys) map[k.id] = k;
++        setUsage(map);
++      }
++    } catch {
++      /* non-critical */
++    } finally {
++      setUsageLoading(false);
++    }
++  }, []);
++
++  const loadRevoked = useCallback(async () => {
++    setAuditLoading(true);
++    try {
++      const res = await authFetch('/api/settings/api-keys/revoked');
++      const data = (await res.json().catch(() => ({}))) as RevokedResponse;
++      if (res.ok) setRevokedData(data);
++    } catch {
++      /* non-critical */
++    } finally {
++      setAuditLoading(false);
++    }
++  }, []);
++
++  // Load keys + usage whenever the manager is opened.
+   useEffect(() => {
+-    if (open) loadKeys();
+-  }, [open, loadKeys]);
++    if (open) {
++      void loadKeys();
++      void loadUsage();
++    }
++  }, [open, loadKeys, loadUsage]);
++
++  // Load revoked/audit lazily when the panel is expanded.
++  useEffect(() => {
++    if (open && auditOpen && !revokedData) {
++      void loadRevoked();
++    }
++  }, [open, auditOpen, revokedData, loadRevoked]);
+ 
+   function handleCreated(created: CreatedApiKey) {
+     setRevealCreated(created);
+     setRevealOpen(true);
+-    // Optimistically refetch so the new key shows up behind the reveal modal.
+     void loadKeys();
++    void loadUsage();
++  }
++
++  function handleEdited() {
++    void loadKeys();
++    void loadUsage();
++    // Audit trail may have changed too.
++    if (auditOpen) void loadRevoked();
+   }
+ 
+   async function handleRevoke() {
+@@ -121,6 +207,8 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+       toast.success(t('keyRevoked'));
+       setRevokeTarget(null);
+       await loadKeys();
++      await loadUsage();
++      if (auditOpen) await loadRevoked();
+     } catch {
+       toast.error(t('revokeError'));
+     } finally {
+@@ -140,7 +228,7 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+   return (
+     <>
+       <Dialog open={open} onOpenChange={onOpenChange}>
+-        <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-hidden flex flex-col p-0 gap-0 bg-background/90 backdrop-blur-xl border-border/30 shadow-2xl">
++        <DialogContent className="sm:max-w-2xl max-h-[88vh] overflow-hidden flex flex-col p-0 gap-0 bg-background/90 backdrop-blur-xl border-border/30 shadow-2xl">
+           {/* Header */}
+           <div className="px-6 pt-6 pb-4 shrink-0">
+             <DialogHeader>
+@@ -161,8 +249,14 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+             <div className="flex items-center gap-2 text-xs text-muted-foreground">
+               <Activity className="h-3.5 w-3.5" />
+               <span>
+-                {keys.length}{' '}
+-                {locale === 'es' ? 'clave(s)' : 'key(s)'}
++                {keys.filter((k) => !k.revokedAt).length}{' '}
++                {locale === 'es' ? 'activa(s)' : 'active'}
++                {keys.some((k) => k.revokedAt) && (
++                  <span className="ml-2 opacity-70">
++                    · {keys.filter((k) => k.revokedAt).length}{' '}
++                    {locale === 'es' ? 'revocada(s)' : 'revoked'}
++                  </span>
++                )}
+               </span>
+             </div>
+             <div className="flex items-center gap-1.5">
+@@ -170,11 +264,14 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+                 variant="ghost"
+                 size="sm"
+                 className="h-8 w-8 p-0"
+-                onClick={loadKeys}
++                onClick={() => {
++                  void loadKeys();
++                  void loadUsage();
++                }}
+                 disabled={loading}
+                 title="Refresh"
+               >
+-                <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
++                <RefreshCw className={`h-3.5 w-3.5 ${loading || usageLoading ? 'animate-spin' : ''}`} />
+               </Button>
+               <Button
+                 size="sm"
+@@ -206,13 +303,14 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+             ) : keys.length === 0 ? (
+               <EmptyState locale={locale} onCreate={() => setCreateOpen(true)} />
+             ) : (
+-              <ScrollArea className="h-full max-h-[42vh] pr-2 -mr-2">
++              <ScrollArea className="h-full max-h-[44vh] pr-2 -mr-2">
+                 <div className="space-y-2">
+                   {keys.map((k) => {
+                     const status = keyStatus(k);
+                     const lastUsed = safeDate(k.lastUsedAt);
+                     const created = safeDate(k.createdAt);
+                     const expires = safeDate(k.expiresAt);
++                    const keyUsage = usage[k.id];
+                     return (
+                       <div
+                         key={k.id}
+@@ -232,10 +330,30 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+                               <StatusBadge status={status} locale={locale} />
+                             </div>
+                             {/* Masked key */}
+-                            <div className="mt-1 flex items-center gap-1.5">
++                            <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+                               <code className="font-mono text-xs text-muted-foreground bg-muted/40 px-1.5 py-0.5 rounded">
+                                 {k.maskedKey}
+                               </code>
++                              {k.rateLimitPerMinute !== null && (
++                                <Badge
++                                  variant="outline"
++                                  className="text-[9px] gap-0.5 px-1.5 h-4 bg-amber-500/10 text-amber-600 border-amber-500/20 dark:text-amber-400"
++                                  title={t('rateLimitDesc')}
++                                >
++                                  <Gauge className="h-2.5 w-2.5" />
++                                  {k.rateLimitPerMinute}/min
++                                </Badge>
++                              )}
++                              {k.allowedIps.length > 0 && (
++                                <Badge
++                                  variant="outline"
++                                  className="text-[9px] gap-0.5 px-1.5 h-4 bg-sky-500/10 text-sky-600 border-sky-500/20 dark:text-sky-400"
++                                  title={k.allowedIps.join(', ')}
++                                >
++                                  <Shield className="h-2.5 w-2.5" />
++                                  {t('ipCount', { count: String(k.allowedIps.length) })}
++                                </Badge>
++                              )}
+                             </div>
+                             {/* Scopes */}
+                             <div className="mt-2 flex flex-wrap items-center gap-1">
+@@ -249,6 +367,15 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+                                 </Badge>
+                               ))}
+                             </div>
++                            {/* Usage sparkline */}
++                            {keyUsage && status === 'active' && keyUsage.total > 0 && (
++                              <div className="mt-2 flex items-center gap-2">
++                                <UsageChart data={keyUsage.byDay} />
++                                <span className="text-[10px] text-muted-foreground">
++                                  {t('usageTotal', { count: String(keyUsage.total) })}
++                                </span>
++                              </div>
++                            )}
+                             {/* Meta row */}
+                             <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                               <span className="flex items-center gap-1">
+@@ -266,9 +393,7 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+                               {created && (
+                                 <span className="flex items-center gap-1">
+                                   <CalendarClock className="h-3 w-3" />
+-                                  {t('createdAt', {
+-                                    when: format(created, 'PP'),
+-                                  })}
++                                  {t('createdAt', { when: format(created, 'PP') })}
+                                 </span>
+                               )}
+                               {expires && (
+@@ -285,18 +410,32 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+                               )}
+                             </div>
+                           </div>
+-                          {/* Revoke */}
+-                          <div className="shrink-0">
++                          {/* Actions */}
++                          <div className="shrink-0 flex flex-col gap-1.5">
+                             {status === 'active' && (
+-                              <Button
+-                                variant="ghost"
+-                                size="sm"
+-                                className="h-8 gap-1.5 text-red-500 hover:text-red-600 hover:bg-red-500/10"
+-                                onClick={() => setRevokeTarget(k)}
+-                              >
+-                                <Trash2 className="h-3.5 w-3.5" />
+-                                {t('revoke')}
+-                              </Button>
++                              <>
++                                <Button
++                                  variant="ghost"
++                                  size="sm"
++                                  className="h-8 gap-1.5"
++                                  onClick={() => {
++                                    setEditTarget(k);
++                                    setEditOpen(true);
++                                  }}
++                                >
++                                  <Pencil className="h-3.5 w-3.5" />
++                                  {t('edit')}
++                                </Button>
++                                <Button
++                                  variant="ghost"
++                                  size="sm"
++                                  className="h-8 gap-1.5 text-red-500 hover:text-red-600 hover:bg-red-500/10"
++                                  onClick={() => setRevokeTarget(k)}
++                                >
++                                  <Trash2 className="h-3.5 w-3.5" />
++                                  {t('revoke')}
++                                </Button>
++                              </>
+                             )}
+                           </div>
+                         </div>
+@@ -304,6 +443,61 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+                     );
+                   })}
+                 </div>
++
++                {/* Audit & revoked keys panel */}
++                <Collapsible
++                  open={auditOpen}
++                  onOpenChange={setAuditOpen}
++                  className="mt-4 rounded-xl border border-border/40 bg-muted/10"
++                >
++                  <CollapsibleTrigger asChild>
++                    <button className="flex w-full items-center justify-between px-4 py-2.5 text-sm hover:bg-muted/20 transition-colors rounded-xl">
++                      <span className="flex items-center gap-2 font-medium">
++                        <History className="h-4 w-4 text-muted-foreground" />
++                        {t('auditPanel')}
++                        {revokedData && revokedData.auditLog.length > 0 && (
++                          <Badge variant="outline" className="text-[10px] h-4 px-1.5">
++                            {revokedData.auditLog.length}
++                          </Badge>
++                        )}
++                      </span>
++                      <ChevronDown
++                        className={`h-4 w-4 text-muted-foreground transition-transform ${
++                          auditOpen ? 'rotate-180' : ''
++                        }`}
++                      />
++                    </button>
++                  </CollapsibleTrigger>
++                  <CollapsibleContent>
++                    <div className="px-4 pb-3 pt-1 border-t border-border/30">
++                      <p className="text-[11px] text-muted-foreground mb-3 mt-2">
++                        {t('auditPanelDesc')}
++                      </p>
++                      {auditLoading ? (
++                        <div className="flex items-center justify-center py-6">
++                          <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
++                        </div>
++                      ) : !revokedData ||
++                        (revokedData.revokedKeys.length === 0 &&
++                          revokedData.auditLog.length === 0) ? (
++                        <p className="text-xs text-muted-foreground/70 italic py-4 text-center">
++                          {t('auditEmpty')}
++                        </p>
++                      ) : (
++                        <div className="space-y-3 max-h-64 overflow-y-auto pr-1">
++                          {/* Audit log entries */}
++                          {revokedData.auditLog.map((entry) => (
++                            <AuditEntryRow
++                              key={entry.id}
++                              entry={entry}
++                              locale={locale}
++                            />
++                          ))}
++                        </div>
++                      )}
++                    </div>
++                  </CollapsibleContent>
++                </Collapsible>
+               </ScrollArea>
+             )}
+           </div>
+@@ -337,6 +531,20 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+         locale={locale}
+       />
+ 
++      {/* Edit flow */}
++      {editTarget && (
++        <EditApiKeyDialog
++          open={editOpen}
++          onOpenChange={(o) => {
++            setEditOpen(o);
++            if (!o) setEditTarget(null);
++          }}
++          locale={locale}
++          keyView={editTarget}
++          onSaved={handleEdited}
++        />
++      )}
++
+       {/* Revoke confirmation */}
+       <AlertDialog
+         open={!!revokeTarget}
+@@ -391,6 +599,365 @@ export function ApiKeysManager({ open, onOpenChange, locale }: ApiKeysManagerPro
+   );
+ }
+ 
++// ─── Edit dialog ─────────────────────────────────────────────
++
++interface EditApiKeyDialogProps {
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++  locale: Locale;
++  keyView: ApiKeyView;
++  onSaved: () => void;
++}
++
++function EditApiKeyDialog({
++  open,
++  onOpenChange,
++  locale,
++  keyView,
++  onSaved,
++}: EditApiKeyDialogProps) {
++  const t = getDict(locale);
++  const metas = scopeMeta(locale, t);
++
++  const [label, setLabel] = useState(keyView.label);
++  const [scopes, setScopes] = useState<ApiScope[]>(keyView.scopes);
++  const [allowedIps, setAllowedIps] = useState<string[]>(keyView.allowedIps);
++  const [ipInput, setIpInput] = useState('');
++  const [ipError, setIpError] = useState<string | null>(null);
++  const [rateMode, setRateMode] = useState<'default' | 'custom'>(
++    keyView.rateLimitPerMinute === null ? 'default' : 'custom',
++  );
++  const [rateValue, setRateValue] = useState(
++    keyView.rateLimitPerMinute === null ? '' : String(keyView.rateLimitPerMinute),
++  );
++  const [saving, setSaving] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  function toggleScope(scope: ApiScope) {
++    setError(null);
++    setScopes((prev) => {
++      if (prev.includes(scope)) {
++        const next = prev.filter((s) => s !== scope);
++        return next.length === 0 ? prev : next;
++      }
++      return [...prev, scope];
++    });
++  }
++
++  function addIp() {
++    const v = ipInput.trim();
++    if (!v) return;
++    if (!isValidIpOrCidr(v)) {
++      setIpError(t('ipInvalid'));
++      return;
++    }
++    if (allowedIps.includes(v)) {
++      setIpInput('');
++      return;
++    }
++    setAllowedIps([...allowedIps, v]);
++    setIpInput('');
++    setIpError(null);
++  }
++
++  function removeIp(ip: string) {
++    setAllowedIps(allowedIps.filter((x) => x !== ip));
++  }
++
++  async function handleSubmit(e: React.FormEvent) {
++    e.preventDefault();
++    if (saving) return;
++    if (!label.trim()) {
++      setError(t('labelField') + ' is required.');
++      return;
++    }
++    if (scopes.length === 0) {
++      setError(t('selectScope'));
++      return;
++    }
++
++    const rateLimitPerMinute =
++      rateMode === 'custom' ? parseInt(rateValue, 10) || null : null;
++    if (rateMode === 'custom' && (isNaN(rateLimitPerMinute as number) || (rateLimitPerMinute as number) < 1 || (rateLimitPerMinute as number) > 1000)) {
++      setError(t('rateLimit') + ': 1–1000');
++      return;
++    }
++
++    setSaving(true);
++    setError(null);
++
++    try {
++      const res = await authFetch(`/api/settings/api-keys/${keyView.id}`, {
++        method: 'PATCH',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify({
++          label: label.trim(),
++          scopes,
++          allowedIps,
++          rateLimitPerMinute,
++        }),
++      });
++      const data = await res.json().catch(() => ({}));
++      if (!res.ok) {
++        setError(data?.error || t('editError'));
++        return;
++      }
++      toast.success(t('keyUpdated'));
++      onSaved();
++      onOpenChange(false);
++    } catch {
++      setError(t('editError'));
++    } finally {
++      setSaving(false);
++    }
++  }
++
++  return (
++    <Dialog open={open} onOpenChange={onOpenChange}>
++      <DialogContent className="sm:max-w-md p-0 gap-0 bg-background/95 backdrop-blur-xl border-border/30 shadow-2xl max-h-[90vh] overflow-y-auto">
++        <DialogHeader className="px-6 pt-6 pb-4 shrink-0">
++          <DialogTitle className="flex items-center gap-2">
++            <Pencil className="h-5 w-5 text-emerald-600" />
++            {t('editKey')}
++          </DialogTitle>
++          <DialogDescription className="text-xs leading-relaxed pt-1">
++            {t('editKeyDesc')}
++          </DialogDescription>
++        </DialogHeader>
++
++        <form onSubmit={handleSubmit} className="px-6 pb-6 space-y-5">
++          {/* Label */}
++          <div className="space-y-1.5">
++            <Label htmlFor="edit-api-key-label" className="text-sm">
++              {t('labelField')}
++            </Label>
++            <Input
++              id="edit-api-key-label"
++              value={label}
++              onChange={(e) => {
++                setLabel(e.target.value);
++                setError(null);
++              }}
++              maxLength={60}
++              className="bg-background"
++            />
++          </div>
++
++          {/* Scopes */}
++          <div className="space-y-2">
++            <Label className="text-sm">{t('scopes')}</Label>
++            <div className="space-y-2">
++              {metas.map((meta) => {
++                const checked = scopes.includes(meta.id);
++                return (
++                  <label
++                    key={meta.id}
++                    htmlFor={`edit-scope-${meta.id}`}
++                    className={`flex items-start gap-3 rounded-lg border px-3 py-2.5 cursor-pointer transition-colors ${
++                      checked
++                        ? 'border-emerald-500/40 bg-emerald-500/5'
++                        : 'border-border/50 bg-muted/20 hover:bg-muted/40'
++                    }`}
++                  >
++                    <Checkbox
++                      id={`edit-scope-${meta.id}`}
++                      checked={checked}
++                      onCheckedChange={() => toggleScope(meta.id)}
++                      className="mt-0.5"
++                    />
++                    <div className="space-y-0.5 min-w-0">
++                      <div className="text-sm font-medium">{meta.name}</div>
++                      <div className="text-xs text-muted-foreground leading-relaxed">
++                        {meta.description}
++                      </div>
++                    </div>
++                  </label>
++                );
++              })}
++            </div>
++          </div>
++
++          {/* IP allowlist */}
++          <div className="space-y-2">
++            <div className="flex items-center gap-1.5">
++              <Shield className="h-3.5 w-3.5 text-sky-600" />
++              <Label className="text-sm">{t('ipAllowlist')}</Label>
++            </div>
++            <div className="flex gap-2">
++              <Input
++                value={ipInput}
++                onChange={(e) => {
++                  setIpInput(e.target.value);
++                  setIpError(null);
++                }}
++                onKeyDown={(e) => {
++                  if (e.key === 'Enter') {
++                    e.preventDefault();
++                    addIp();
++                  }
++                }}
++                placeholder={t('ipPlaceholder')}
++                className="bg-background font-mono text-xs"
++              />
++              <Button
++                type="button"
++                variant="outline"
++                size="sm"
++                onClick={addIp}
++                disabled={!ipInput.trim()}
++                className="shrink-0"
++              >
++                {t('ipAdd')}
++              </Button>
++            </div>
++            {ipError && (
++              <p className="text-xs text-red-500 flex items-center gap-1">
++                <AlertCircle className="h-3 w-3" />
++                {ipError}
++              </p>
++            )}
++            {allowedIps.length > 0 ? (
++              <div className="flex flex-wrap gap-1.5">
++                {allowedIps.map((ip) => (
++                  <Badge
++                    key={ip}
++                    variant="outline"
++                    className="font-mono text-[11px] gap-1 bg-sky-500/5 border-sky-500/20 text-sky-700 dark:text-sky-300 pl-2 pr-1 py-0.5"
++                  >
++                    {ip}
++                    <button
++                      type="button"
++                      onClick={() => removeIp(ip)}
++                      className="ml-0.5 rounded-sm hover:bg-sky-500/20 p-0.5"
++                      aria-label={`Remove ${ip}`}
++                    >
++                      <X className="h-3 w-3" />
++                    </button>
++                  </Badge>
++                ))}
++              </div>
++            ) : (
++              <p className="text-[11px] text-muted-foreground/70 italic">
++                {t('ipEmpty')}
++              </p>
++            )}
++          </div>
++
++          {/* Rate limit */}
++          <div className="space-y-2">
++            <div className="flex items-center gap-1.5">
++              <Gauge className="h-3.5 w-3.5 text-amber-600" />
++              <Label className="text-sm">{t('rateLimit')}</Label>
++            </div>
++            <div className="flex gap-2">
++              <Select
++                value={rateMode}
++                onValueChange={(v) => setRateMode(v as 'default' | 'custom')}
++              >
++                <SelectTrigger className="bg-background w-[140px]">
++                  <SelectValue />
++                </SelectTrigger>
++                <SelectContent>
++                  <SelectItem value="default">{t('rateLimitDefault')}</SelectItem>
++                  <SelectItem value="custom">{t('rateLimitCustom')}</SelectItem>
++                </SelectContent>
++              </Select>
++              {rateMode === 'custom' && (
++                <Input
++                  type="number"
++                  min={1}
++                  max={1000}
++                  value={rateValue}
++                  onChange={(e) => setRateValue(e.target.value)}
++                  placeholder={t('rateLimitPlaceholder')}
++                  className="bg-background flex-1"
++                />
++              )}
++            </div>
++          </div>
++
++          {error && (
++            <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/5 px-3 py-2 text-sm text-red-600 dark:text-red-400">
++              <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
++              <span>{error}</span>
++            </div>
++          )}
++
++          <div className="flex justify-end gap-2 pt-1">
++            <Button
++              type="button"
++              variant="ghost"
++              onClick={() => onOpenChange(false)}
++              disabled={saving}
++            >
++              {t('cancel')}
++            </Button>
++            <Button
++              type="submit"
++              disabled={saving}
++              className="bg-emerald-600 hover:bg-emerald-700 text-white gap-1.5"
++            >
++              {saving ? (
++                <>
++                  <Loader2 className="h-4 w-4 animate-spin" />
++                  {t('saving')}
++                </>
++              ) : (
++                <>
++                  <Pencil className="h-4 w-4" />
++                  {t('save')}
++                </>
++              )}
++            </Button>
++          </div>
++        </form>
++      </DialogContent>
++    </Dialog>
++  );
++}
++
++// ─── Audit entry row ─────────────────────────────────────────
++
++function AuditEntryRow({
++  entry,
++  locale,
++}: {
++  entry: AuditLogEntry;
++  locale: Locale;
++}) {
++  const t = getDict(locale);
++  const created = safeDate(entry.createdAt);
++  const actionLabel =
++    entry.action === 'api_key.create'
++      ? t('auditActionCreate')
++      : entry.action === 'api_key.update'
++        ? t('auditActionUpdate')
++        : t('auditActionRevoke');
++  const actionColor =
++    entry.action === 'api_key.create'
++      ? 'text-emerald-600 dark:text-emerald-400'
++      : entry.action === 'api_key.update'
++        ? 'text-sky-600 dark:text-sky-400'
++        : 'text-rose-600 dark:text-rose-400';
++
++  return (
++    <div className="flex items-start gap-2 text-xs py-1.5 border-b border-border/20 last:border-0">
++      <div className={`mt-0.5 font-medium ${actionColor}`}>{actionLabel}</div>
++      <div className="min-w-0 flex-1">
++        <div className="truncate">
++          <span className="font-medium">{entry.apiKeyLabel ?? '—'}</span>
++        </div>
++        <div className="text-[10px] text-muted-foreground flex items-center gap-2 flex-wrap mt-0.5">
++          {created && <span>{formatDistanceToNow(created, { addSuffix: true })}</span>}
++          {entry.ip && <span className="font-mono">IP: {entry.ip}</span>}
++        </div>
++      </div>
++    </div>
++  );
++}
++
++// ─── Status badge ────────────────────────────────────────────
++
+ function StatusBadge({
+   status,
+   locale,
+@@ -429,6 +996,8 @@ function StatusBadge({
+   );
+ }
+ 
++// ─── Empty state ─────────────────────────────────────────────
++
+ function EmptyState({
+   locale,
+   onCreate,
+diff --git a/src/components/app/settings/api-keys/create-api-key-dialog.tsx b/src/components/app/settings/api-keys/create-api-key-dialog.tsx
+index 8401d73..9054de8 100644
+--- a/src/components/app/settings/api-keys/create-api-key-dialog.tsx
++++ b/src/components/app/settings/api-keys/create-api-key-dialog.tsx
+@@ -13,6 +13,7 @@ import { Button } from '@/components/ui/button';
+ import { Input } from '@/components/ui/input';
+ import { Label } from '@/components/ui/label';
+ import { Checkbox } from '@/components/ui/checkbox';
++import { Badge } from '@/components/ui/badge';
+ import {
+   Select,
+   SelectContent,
+@@ -20,7 +21,14 @@ import {
+   SelectTrigger,
+   SelectValue,
+ } from '@/components/ui/select';
+-import { Loader2, Plus, AlertCircle } from 'lucide-react';
++import {
++  Loader2,
++  Plus,
++  AlertCircle,
++  X,
++  Shield,
++  Gauge,
++} from 'lucide-react';
+ import { toast } from 'sonner';
+ import { authFetch } from '@/lib/fetch-utils';
+ import type { ApiScope } from '@/lib/api-auth';
+@@ -29,6 +37,7 @@ import {
+   type Locale,
+   getDict,
+   scopeMeta,
++  isValidIpOrCidr,
+ } from './dict';
+ 
+ interface CreateApiKeyDialogProps {
+@@ -55,12 +64,26 @@ export function CreateApiKeyDialog({
+   const [submitting, setSubmitting] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+ 
++  // IP allowlist
++  const [allowedIps, setAllowedIps] = useState<string[]>([]);
++  const [ipInput, setIpInput] = useState('');
++  const [ipError, setIpError] = useState<string | null>(null);
++
++  // Rate limit
++  const [rateMode, setRateMode] = useState<'default' | 'custom'>('default');
++  const [rateValue, setRateValue] = useState('');
++
+   function reset() {
+     setLabel('');
+     setScopes(['read']);
+     setExpiry('never');
+     setSubmitting(false);
+     setError(null);
++    setAllowedIps([]);
++    setIpInput('');
++    setIpError(null);
++    setRateMode('default');
++    setRateValue('');
+   }
+ 
+   function toggleScope(scope: ApiScope) {
+@@ -68,15 +91,33 @@ export function CreateApiKeyDialog({
+     setScopes((prev) => {
+       if (prev.includes(scope)) {
+         const next = prev.filter((s) => s !== scope);
+-        // Never allow an empty selection — keep at least one.
+         return next.length === 0 ? prev : next;
+       }
+-      // Selecting "admin" implies the others, but we keep the selection explicit
+-      // so the badge list is informative. We just add it.
+       return [...prev, scope];
+     });
+   }
+ 
++  function addIp() {
++    const v = ipInput.trim();
++    if (!v) return;
++    if (!isValidIpOrCidr(v)) {
++      setIpError(t('ipInvalid'));
++      return;
++    }
++    if (allowedIps.includes(v)) {
++      setIpInput('');
++      setIpError(null);
++      return;
++    }
++    setAllowedIps([...allowedIps, v]);
++    setIpInput('');
++    setIpError(null);
++  }
++
++  function removeIp(ip: string) {
++    setAllowedIps(allowedIps.filter((x) => x !== ip));
++  }
++
+   async function handleSubmit(e: React.FormEvent) {
+     e.preventDefault();
+     if (submitting) return;
+@@ -90,6 +131,16 @@ export function CreateApiKeyDialog({
+       return;
+     }
+ 
++    let rateLimitPerMinute: number | null = null;
++    if (rateMode === 'custom') {
++      const n = parseInt(rateValue, 10);
++      if (isNaN(n) || n < 1 || n > 1000) {
++        setError(t('rateLimit') + ': 1–1000');
++        return;
++      }
++      rateLimitPerMinute = n;
++    }
++
+     setSubmitting(true);
+     setError(null);
+ 
+@@ -100,7 +151,13 @@ export function CreateApiKeyDialog({
+       const res = await authFetch('/api/settings/api-keys', {
+         method: 'POST',
+         headers: { 'content-type': 'application/json' },
+-        body: JSON.stringify({ label: label.trim(), scopes, expiresInDays }),
++        body: JSON.stringify({
++          label: label.trim(),
++          scopes,
++          expiresInDays,
++          allowedIps,
++          rateLimitPerMinute,
++        }),
+       });
+ 
+       const data = await res.json().catch(() => ({}));
+@@ -129,8 +186,8 @@ export function CreateApiKeyDialog({
+         onOpenChange(o);
+       }}
+     >
+-      <DialogContent className="sm:max-w-md p-0 gap-0 bg-background/95 backdrop-blur-xl border-border/30 shadow-2xl">
+-        <DialogHeader className="px-6 pt-6 pb-4">
++      <DialogContent className="sm:max-w-md p-0 gap-0 bg-background/95 backdrop-blur-xl border-border/30 shadow-2xl max-h-[90vh] overflow-y-auto">
++        <DialogHeader className="px-6 pt-6 pb-4 shrink-0">
+           <DialogTitle className="flex items-center gap-2">
+             <Plus className="h-5 w-5 text-emerald-600" />
+             {t('createKey')}
+@@ -213,6 +270,111 @@ export function CreateApiKeyDialog({
+             </Select>
+           </div>
+ 
++          {/* IP allowlist */}
++          <div className="space-y-2">
++            <div className="flex items-center gap-1.5">
++              <Shield className="h-3.5 w-3.5 text-sky-600" />
++              <Label className="text-sm">{t('ipAllowlist')}</Label>
++            </div>
++            <p className="text-xs text-muted-foreground leading-relaxed">
++              {t('ipAllowlistDesc')}
++            </p>
++            <div className="flex gap-2">
++              <Input
++                value={ipInput}
++                onChange={(e) => {
++                  setIpInput(e.target.value);
++                  setIpError(null);
++                }}
++                onKeyDown={(e) => {
++                  if (e.key === 'Enter') {
++                    e.preventDefault();
++                    addIp();
++                  }
++                }}
++                placeholder={t('ipPlaceholder')}
++                className="bg-background font-mono text-xs"
++              />
++              <Button
++                type="button"
++                variant="outline"
++                size="sm"
++                onClick={addIp}
++                disabled={!ipInput.trim()}
++                className="shrink-0"
++              >
++                {t('ipAdd')}
++              </Button>
++            </div>
++            {ipError && (
++              <p className="text-xs text-red-500 flex items-center gap-1">
++                <AlertCircle className="h-3 w-3" />
++                {ipError}
++              </p>
++            )}
++            {allowedIps.length > 0 ? (
++              <div className="flex flex-wrap gap-1.5">
++                {allowedIps.map((ip) => (
++                  <Badge
++                    key={ip}
++                    variant="outline"
++                    className="font-mono text-[11px] gap-1 bg-sky-500/5 border-sky-500/20 text-sky-700 dark:text-sky-300 pl-2 pr-1 py-0.5"
++                  >
++                    {ip}
++                    <button
++                      type="button"
++                      onClick={() => removeIp(ip)}
++                      className="ml-0.5 rounded-sm hover:bg-sky-500/20 p-0.5"
++                      aria-label={`Remove ${ip}`}
++                    >
++                      <X className="h-3 w-3" />
++                    </button>
++                  </Badge>
++                ))}
++              </div>
++            ) : (
++              <p className="text-[11px] text-muted-foreground/70 italic">
++                {t('ipEmpty')}
++              </p>
++            )}
++          </div>
++
++          {/* Rate limit */}
++          <div className="space-y-2">
++            <div className="flex items-center gap-1.5">
++              <Gauge className="h-3.5 w-3.5 text-amber-600" />
++              <Label className="text-sm">{t('rateLimit')}</Label>
++            </div>
++            <p className="text-xs text-muted-foreground leading-relaxed">
++              {t('rateLimitDesc')}
++            </p>
++            <div className="flex gap-2">
++              <Select
++                value={rateMode}
++                onValueChange={(v) => setRateMode(v as 'default' | 'custom')}
++              >
++                <SelectTrigger className="bg-background w-[140px]">
++                  <SelectValue />
++                </SelectTrigger>
++                <SelectContent>
++                  <SelectItem value="default">{t('rateLimitDefault')}</SelectItem>
++                  <SelectItem value="custom">{t('rateLimitCustom')}</SelectItem>
++                </SelectContent>
++              </Select>
++              {rateMode === 'custom' && (
++                <Input
++                  type="number"
++                  min={1}
++                  max={1000}
++                  value={rateValue}
++                  onChange={(e) => setRateValue(e.target.value)}
++                  placeholder={t('rateLimitPlaceholder')}
++                  className="bg-background flex-1"
++                />
++              )}
++            </div>
++          </div>
++
+           {/* Error */}
+           {error && (
+             <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/5 px-3 py-2 text-sm text-red-600 dark:text-red-400">
+diff --git a/src/components/app/settings/api-keys/dict.ts b/src/components/app/settings/api-keys/dict.ts
+index ddac6aa..6f37b30 100644
+--- a/src/components/app/settings/api-keys/dict.ts
++++ b/src/components/app/settings/api-keys/dict.ts
+@@ -14,6 +14,10 @@ export interface ApiKeyView {
+   label: string
+   maskedKey: string
+   scopes: ApiScope[]
++  /** Resolved IP/CIDR allowlist (empty = allow all). */
++  allowedIps: string[]
++  /** Per-key rate limit (requests/min). Null = global default (60). */
++  rateLimitPerMinute: number | null
+   revokedAt: string | null
+   lastUsedAt: string | null
+   lastUsedIp: string | null
+@@ -28,6 +32,8 @@ export interface CreatedApiKey {
+     id: string
+     label: string
+     scopes: ApiScope[]
++    allowedIps: string[]
++    rateLimitPerMinute: number | null
+     expiresAt: string | null
+     createdAt: string
+     maskedKey: string
+@@ -44,6 +50,62 @@ export interface ScopeMeta {
+   badgeClass: string
+ }
+ 
++/** A single day's usage bucket returned by /api/settings/api-keys/usage. */
++export interface UsageDayBucket {
++  date: string
++  count: number
++  avgMs: number
++  errors: number
++}
++
++/** Per-key usage breakdown. */
++export interface KeyUsage {
++  id: string
++  label: string
++  maskedKey: string
++  revoked: boolean
++  total: number
++  byDay: UsageDayBucket[]
++  topEndpoints: { endpoint: string; count: number }[]
++}
++
++/** Full usage response from /api/settings/api-keys/usage. */
++export interface UsageResponse {
++  range: { start: string; end: string; days: number }
++  keys: KeyUsage[]
++  aggregate: { total: number; byDay: { date: string; count: number }[] }
++}
++
++/** Revoked-key + audit-log response from /api/settings/api-keys/revoked. */
++export interface RevokedKeyView {
++  id: string
++  label: string
++  maskedKey: string
++  scopes: ApiScope[]
++  allowedIps: string[]
++  revokedAt: string | null
++  lastUsedAt: string | null
++  lastUsedIp: string | null
++  createdAt: string
++  requestCount: number
++}
++
++export interface AuditLogEntry {
++  id: string
++  action: string
++  apiKeyId: string | null
++  apiKeyLabel: string | null
++  diff: unknown
++  ip: string | null
++  userAgent: string | null
++  createdAt: string
++}
++
++export interface RevokedResponse {
++  revokedKeys: RevokedKeyView[]
++  auditLog: AuditLogEntry[]
++}
++
+ const DICT = {
+   en: {
+     title: 'API Keys',
+@@ -51,9 +113,13 @@ const DICT = {
+     developer: 'Developer',
+     createKey: 'Create new key',
+     revoke: 'Revoke',
++    edit: 'Edit',
++    test: 'Test',
+     revokeConfirmTitle: 'Revoke this API key?',
+     revokeConfirmDesc: 'Any tool using this key will immediately stop working. This cannot be undone.',
+     cancel: 'Cancel',
++    save: 'Save',
++    saving: 'Saving…',
+     revokeAction: 'Revoke key',
+     noKeysTitle: 'No API keys yet',
+     noKeysDesc: 'Create your first API key to connect external tools to DataMind BI.',
+@@ -87,8 +153,10 @@ const DICT = {
+     loadError: 'Failed to load API keys.',
+     createError: 'Failed to create API key.',
+     revokeError: 'Failed to revoke API key.',
++    editError: 'Failed to update API key.',
+     keyCreated: 'API key created.',
+     keyRevoked: 'API key revoked.',
++    keyUpdated: 'API key updated.',
+     scopeReadName: 'Read',
+     scopeReadDesc: 'List datasources, dashboards, and schemas (GET endpoints).',
+     scopeExecuteName: 'Execute',
+@@ -101,6 +169,47 @@ const DICT = {
+     back: 'Back',
+     copyKey: 'Copy key',
+     keyId: 'ID',
++    // ── IP allowlist ──
++    ipAllowlist: 'IP allowlist',
++    ipAllowlistDesc: 'Restrict this key to specific IPs or CIDR ranges. Leave empty to allow all IPs.',
++    ipPlaceholder: 'e.g. 10.0.0.5 or 192.168.0.0/24',
++    ipAdd: 'Add',
++    ipEmpty: 'No IP restrictions — all IPs allowed',
++    ipCount: '{count} IP rule(s)',
++    ipInvalid: 'Invalid IP or CIDR format',
++    // ── Rate limit ──
++    rateLimit: 'Rate limit (req/min)',
++    rateLimitDesc: 'Maximum requests per minute. Leave empty for the global default (60/min).',
++    rateLimitPlaceholder: '60',
++    rateLimitDefault: 'Default (60/min)',
++    rateLimitCustom: 'Custom',
++    // ── Edit dialog ──
++    editKey: 'Edit API key',
++    editKeyDesc: 'Update the label, scopes, IP allowlist, rate limit, or expiry. The key itself cannot be changed.',
++    noChanges: 'No changes to save.',
++    // ── Test key ──
++    testKey: 'Test key',
++    testing: 'Testing…',
++    testSuccess: 'Key is valid — connected as {email}',
++    testFailed: 'Test failed: {error}',
++    // ── Usage ──
++    usage: 'Usage (7 days)',
++    usageTotal: '{count} total requests',
++    usageNoData: 'No requests in the last 7 days',
++    usageErrors: '{count} error(s)',
++    usageAvgMs: 'avg {ms}ms',
++    topEndpoints: 'Top endpoints',
++    // ── Audit & revoked ──
++    auditPanel: 'Audit & revoked keys',
++    auditPanelDesc: 'Revoked keys and the full history of management actions.',
++    auditEmpty: 'No revoked keys or audit entries yet.',
++    auditActionCreate: 'Created',
++    auditActionUpdate: 'Updated',
++    auditActionRevoke: 'Revoked',
++    auditBy: 'by',
++    auditDiff: 'Changes',
++    showAudit: 'Show audit ({count})',
++    hideAudit: 'Hide audit',
+   },
+   es: {
+     title: 'Claves de API',
+@@ -108,9 +217,13 @@ const DICT = {
+     developer: 'Desarrollador',
+     createKey: 'Crear nueva clave',
+     revoke: 'Revocar',
++    edit: 'Editar',
++    test: 'Probar',
+     revokeConfirmTitle: '¿Revocar esta clave de API?',
+     revokeConfirmDesc: 'Cualquier herramienta que use esta clave dejará de funcionar inmediatamente. Esta acción no se puede deshacer.',
+     cancel: 'Cancelar',
++    save: 'Guardar',
++    saving: 'Guardando…',
+     revokeAction: 'Revocar clave',
+     noKeysTitle: 'Aún no hay claves de API',
+     noKeysDesc: 'Crea tu primera clave de API para conectar herramientas externas a DataMind BI.',
+@@ -144,8 +257,10 @@ const DICT = {
+     loadError: 'Error al cargar las claves de API.',
+     createError: 'Error al crear la clave de API.',
+     revokeError: 'Error al revocar la clave de API.',
++    editError: 'Error al actualizar la clave de API.',
+     keyCreated: 'Clave de API creada.',
+     keyRevoked: 'Clave de API revocada.',
++    keyUpdated: 'Clave de API actualizada.',
+     scopeReadName: 'Lectura',
+     scopeReadDesc: 'Listar datasources, dashboards y esquemas (endpoints GET).',
+     scopeExecuteName: 'Ejecución',
+@@ -158,6 +273,47 @@ const DICT = {
+     back: 'Atrás',
+     copyKey: 'Copiar clave',
+     keyId: 'ID',
++    // ── IP allowlist ──
++    ipAllowlist: 'Lista de IPs permitidas',
++    ipAllowlistDesc: 'Restringe esta clave a IPs o rangos CIDR específicos. Vacío = permitir todas.',
++    ipPlaceholder: 'p.ej. 10.0.0.5 o 192.168.0.0/24',
++    ipAdd: 'Añadir',
++    ipEmpty: 'Sin restricciones de IP — todas permitidas',
++    ipCount: '{count} regla(s) de IP',
++    ipInvalid: 'Formato de IP o CIDR inválido',
++    // ── Rate limit ──
++    rateLimit: 'Límite (req/min)',
++    rateLimitDesc: 'Máximo de solicitudes por minuto. Vacío = default global (60/min).',
++    rateLimitPlaceholder: '60',
++    rateLimitDefault: 'Default (60/min)',
++    rateLimitCustom: 'Personalizado',
++    // ── Edit dialog ──
++    editKey: 'Editar clave de API',
++    editKeyDesc: 'Actualiza etiqueta, permisos, IPs, límite o expiración. La clave en sí no se puede cambiar.',
++    noChanges: 'Sin cambios que guardar.',
++    // ── Test key ──
++    testKey: 'Probar clave',
++    testing: 'Probando…',
++    testSuccess: 'Clave válida — conectado como {email}',
++    testFailed: 'Prueba fallida: {error}',
++    // ── Usage ──
++    usage: 'Uso (7 días)',
++    usageTotal: '{count} solicitudes totales',
++    usageNoData: 'Sin solicitudes en los últimos 7 días',
++    usageErrors: '{count} error(es)',
++    usageAvgMs: 'prom {ms}ms',
++    topEndpoints: 'Endpoints principales',
++    // ── Audit & revoked ──
++    auditPanel: 'Auditoría y claves revocadas',
++    auditPanelDesc: 'Claves revocadas e historial completo de acciones de gestión.',
++    auditEmpty: 'Sin claves revocadas ni entradas de auditoría aún.',
++    auditActionCreate: 'Creada',
++    auditActionUpdate: 'Actualizada',
++    auditActionRevoke: 'Revocada',
++    auditBy: 'por',
++    auditDiff: 'Cambios',
++    showAudit: 'Mostrar auditoría ({count})',
++    hideAudit: 'Ocultar auditoría',
+   },
+ } as const
+ 
+@@ -209,3 +365,48 @@ export function scopeBadgeClass(scope: ApiScope): string {
+       return 'bg-rose-500/10 text-rose-600 border-rose-500/20 dark:text-rose-400'
+   }
+ }
++
++/**
++ * Basic client-side validation for an IP address or CIDR range.
++ * Accepts:
++ *   - IPv4: 1.2.3.4
++ *   - IPv4 CIDR: 1.2.3.0/24
++ *   - IPv6: 2001:db8::1
++ *   - IPv6 CIDR: 2001:db8::/32
++ */
++export function isValidIpOrCidr(input: string): boolean {
++  const s = input.trim()
++  if (!s) return false
++  // CIDR?
++  if (s.includes('/')) {
++    const [base, bits] = s.split('/')
++    const bitsNum = parseInt(bits ?? '', 10)
++    if (isNaN(bitsNum)) return false
++    if (base?.includes(':')) {
++      // IPv6 CIDR
++      return bitsNum >= 0 && bitsNum <= 128 && isValidIpv6(base)
++    }
++    // IPv4 CIDR
++    return bitsNum >= 0 && bitsNum <= 32 && isValidIpv4(base ?? '')
++  }
++  if (s.includes(':')) return isValidIpv6(s)
++  return isValidIpv4(s)
++}
++
++function isValidIpv4(s: string): boolean {
++  const parts = s.split('.')
++  if (parts.length !== 4) return false
++  return parts.every((p) => {
++    const n = parseInt(p, 10)
++    return /^\d+$/.test(p) && n >= 0 && n <= 255
++  })
++}
++
++function isValidIpv6(s: string): boolean {
++  // Very permissive — just check it has colons and valid hex groups
++  if (!s.includes(':')) return false
++  const parts = s.split('::')
++  if (parts.length > 2) return false
++  const groups = s.replace('::', ':').split(':').filter(Boolean)
++  return groups.every((g) => /^[0-9a-fA-F]{1,4}$/.test(g))
++}
+diff --git a/src/components/app/settings/api-keys/usage-chart.tsx b/src/components/app/settings/api-keys/usage-chart.tsx
+new file mode 100644
+index 0000000..19882d4
+--- /dev/null
++++ b/src/components/app/settings/api-keys/usage-chart.tsx
+@@ -0,0 +1,93 @@
++'use client';
++
++import { useMemo } from 'react';
++import type { UsageDayBucket } from './dict';
++
++interface UsageChartProps {
++  /** Per-day buckets (7 entries for the last week). */
++  data: UsageDayBucket[];
++  /** Width of the chart area in px. */
++  width?: number;
++  /** Height of the chart area in px. */
++  height?: number;
++}
++
++/**
++ * A tiny, dependency-free SVG sparkline showing the last-7-days request
++ * volume for a single API key. Renders inline inside the key card.
++ *
++ * - Bars are emerald by default, amber on error-heavy days, empty days render
++ *   as a faint baseline tick so the chart never looks broken.
++ * - Tooltip-on-hover is intentionally omitted to keep the component cheap;
++ *   the per-day counts are already shown in the usage panel.
++ */
++export function UsageChart({ data, width = 140, height = 32 }: UsageChartProps) {
++  const { bars, maxValue } = useMemo(() => {
++    const max = Math.max(1, ...data.map((d) => d.count));
++    const barWidth = width / data.length;
++    const bars = data.map((d, i) => {
++      const ratio = d.count / max;
++      const barHeight = Math.max(2, ratio * (height - 4));
++      const x = i * barWidth + barWidth * 0.15;
++      const y = height - barHeight - 1;
++      const w = barWidth * 0.7;
++      const errorHeavy = d.errors > 0 && d.errors >= d.count * 0.5;
++      return { x, y, w, h: barHeight, count: d.count, errorHeavy };
++    });
++    return { bars, maxValue: max };
++  }, [data, width, height]);
++
++  if (maxValue === 0) {
++    return (
++      <div
++        className="flex items-center justify-center text-[10px] text-muted-foreground/60 italic"
++        style={{ width, height }}
++      >
++        no requests
++      </div>
++    );
++  }
++
++  return (
++    <svg
++      width={width}
++      height={height}
++      viewBox={`0 0 ${width} ${height}`}
++      className="overflow-visible"
++      role="img"
++      aria-label="7-day request volume sparkline"
++    >
++      {/* baseline */}
++      <line
++        x1={0}
++        x2={width}
++        y1={height - 0.5}
++        y2={height - 0.5}
++        stroke="currentColor"
++        className="text-border/40"
++        strokeWidth={0.5}
++      />
++      {bars.map((b, i) => (
++        <rect
++          key={i}
++          x={b.x}
++          y={b.y}
++          width={b.w}
++          height={b.h}
++          rx={1.5}
++          className={
++            b.errorHeavy
++              ? 'fill-amber-500/70 dark:fill-amber-400/70'
++              : b.count === 0
++                ? 'fill-muted-foreground/20'
++                : 'fill-emerald-500/70 dark:fill-emerald-400/70'
++          }
++        >
++          <title>
++            {data[i]?.date}: {b.count} requests
++          </title>
++        </rect>
++      ))}
++    </svg>
++  );
++}
+diff --git a/src/lib/api-auth.ts b/src/lib/api-auth.ts
+index 886ecbb..8afdf65 100644
+--- a/src/lib/api-auth.ts
++++ b/src/lib/api-auth.ts
+@@ -10,6 +10,9 @@
+  * - A short, non-reversible prefix ("dm_live_a1B2") is stored for display.
+  * - Keys are soft-deleted via `revokedAt` (never hard-deleted, for audit).
+  * - Every public API request is logged to `ApiRequestLog` (endpoint, status, duration, IP).
++ * - Optional per-key IP/CIDR allowlist (empty = allow all).
++ * - Optional per-key token-bucket rate limit (null = global default 60/min).
++ * - Management actions (create / edit / revoke) are recorded in `SettingsAuditLog`.
+  *
+  * Auth patterns:
+  * - /api/settings/*  → Supabase session auth (browser user)
+@@ -36,6 +39,9 @@ const KEY_ALPHABET = 'abcdefghijkmnpqrstuvwxyz23456789' // no 0/O/1/l/I
+ export type ApiScope = 'read' | 'execute' | 'admin'
+ export const ALL_SCOPES: ApiScope[] = ['read', 'execute', 'admin']
+ 
++/** Global default rate limit (requests per minute) when a key has no per-key override. */
++export const DEFAULT_RATE_LIMIT_PER_MINUTE = 60
++
+ // ─── Types ───────────────────────────────────────────────────
+ 
+ export interface AuthenticatedApiKey {
+@@ -43,18 +49,33 @@ export interface AuthenticatedApiKey {
+   label: string
+   scopes: ApiScope[]
+   userId: string
++  /** Resolved IP allowlist (empty = allow all). */
++  allowedIps: string[]
++  /** Per-key rate limit (null = global default). */
++  rateLimitPerMinute: number | null
++}
++
++export interface RateLimitInfo {
++  limit: number
++  remaining: number
++  /** Seconds to wait before retrying. Null unless rate-limited. */
++  retryAfter: number | null
+ }
+ 
+ export interface ApiAuthSuccess {
+   ok: true
+   user: User
+   apiKey: AuthenticatedApiKey
++  /** Rate-limit info to be exposed as X-RateLimit-* headers by the route. */
++  rateLimit: RateLimitInfo
+ }
+ 
+ export interface ApiAuthFailure {
+   ok: false
+   error: string
+   status: number
++  /** Present only when status === 429. */
++  rateLimit?: RateLimitInfo
+ }
+ 
+ export type ApiAuthResult = ApiAuthSuccess | ApiAuthFailure
+@@ -163,6 +184,237 @@ function generateRandomString(length: number): string {
+   return out
+ }
+ 
++// ─── IP allowlist ────────────────────────────────────────────
++
++/**
++ * Parses a JSON string of allowed IPs/CIDRs into a clean string array.
++ * Returns [] for empty/malformed input (which means "allow all IPs").
++ */
++export function parseAllowedIps(json: string | null | undefined): string[] {
++  if (!json) return []
++  try {
++    const parsed = JSON.parse(json) as unknown
++    if (!Array.isArray(parsed)) return []
++    return parsed
++      .filter((x): x is string => typeof x === 'string')
++      .map((s) => s.trim())
++      .filter(Boolean)
++  } catch {
++    return []
++  }
++}
++
++/** Serializes a list of IPs/CIDRs into the JSON string format stored in the DB. */
++export function serializeAllowedIps(ips: string[]): string {
++  return JSON.stringify([...new Set(ips.map((s) => s.trim()).filter(Boolean))])
++}
++
++/**
++ * Validates a client IP against the key's allowlist.
++ * - Empty allowlist → allow all
++ * - Otherwise the IP must match exactly OR fall within a CIDR range
++ *   Supports both IPv4 (e.g. "10.0.0.0/8") and IPv6 (e.g. "2001:db8::/32").
++ *
++ * Returns true if allowed (or if allowlist is empty / client IP unknown).
++ */
++export function isIpAllowed(clientIp: string | null, allowlist: string[]): boolean {
++  if (!allowlist.length) return true
++  if (!clientIp) return false // strict: if allowlist set but no IP detected, deny
++
++  // Strip IPv6-mapped IPv4 prefix "::ffff:"
++  const ip = clientIp.startsWith('::ffff:') ? clientIp.slice(7) : clientIp
++
++  for (const rule of allowlist) {
++    if (rule === ip || rule === clientIp) return true
++    if (rule.includes('/')) {
++      const isV4 = ip.includes('.') && !ip.includes(':')
++      const ruleIsV4 = rule.includes('.') && !rule.includes(':')
++      if (isV4 && ruleIsV4) {
++        if (ipInV4Cidr(ip, rule)) return true
++      } else if (!isV4 && !ruleIsV4) {
++        if (ipInV6Cidr(ip, rule)) return true
++      }
++    }
++  }
++  return false
++}
++
++function ipInV4Cidr(ip: string, cidr: string): boolean {
++  const [base, bitsStr] = cidr.split('/')
++  if (!base || !bitsStr) return false
++  const bits = parseInt(bitsStr, 10)
++  if (isNaN(bits) || bits < 0 || bits > 32) return false
++
++  const ipParts = ip.split('.').map((p) => parseInt(p, 10))
++  const baseParts = base.split('.').map((p) => parseInt(p, 10))
++  if (ipParts.length !== 4 || baseParts.length !== 4) return false
++  if (ipParts.some((p) => isNaN(p) || p < 0 || p > 255)) return false
++  if (baseParts.some((p) => isNaN(p) || p < 0 || p > 255)) return false
++
++  const ipNum =
++    ((ipParts[0]! << 24) | (ipParts[1]! << 16) | (ipParts[2]! << 8) | ipParts[3]!) >>> 0
++  const baseNum =
++    ((baseParts[0]! << 24) | (baseParts[1]! << 16) | (baseParts[2]! << 8) | baseParts[3]!) >>> 0
++  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
++  return (ipNum & mask) === (baseNum & mask)
++}
++
++/**
++ * IPv6 CIDR check using BigInt (128-bit). Normalizes both IPs to full
++ * 8-group hex form before comparing.
++ */
++function ipInV6Cidr(ip: string, cidr: string): boolean {
++  const [base, bitsStr] = cidr.split('/')
++  if (!base || !bitsStr) return false
++  const bits = parseInt(bitsStr, 10)
++  if (isNaN(bits) || bits < 0 || bits > 128) return false
++
++  const ipBig = ipv6ToBigInt(ip)
++  const baseBig = ipv6ToBigInt(base)
++  if (ipBig === null || baseBig === null) return false
++
++  if (bits === 0) return true
++  if (bits === 128) return ipBig === baseBig
++
++  // 128-bit all-ones mask, built via BigInt() to stay ES2017-compatible.
++  const FFFF64 = BigInt('0xffffffffffffffff')
++  const fullMask = (FFFF64 << BigInt(64)) | FFFF64
++  const shift = BigInt(128 - bits)
++  const maskShifted = (fullMask >> shift) << shift
++  return (ipBig & maskShifted) === (baseBig & maskShifted)
++}
++
++function ipv6ToBigInt(ip: string): bigint | null {
++  const v4MappedMatch = ip.match(/^(.*):(\d+)\.(\d+)\.(\d+)\.(\d+)$/)
++  if (v4MappedMatch) {
++    const [, prefix, a, b, c, d] = v4MappedMatch
++    const v4Part =
++      (BigInt(a!) << BigInt(24)) | (BigInt(b!) << BigInt(16)) | (BigInt(c!) << BigInt(8)) | BigInt(d!)
++    const v6Part = ipv6GroupsToBigInt(expandV6Groups(prefix || ''))
++    if (v6Part === null) return null
++    const FFFF64 = BigInt('0xffffffffffffffff')
++    const maskHigh96 = (FFFF64 << BigInt(64)) | BigInt('0xffffffff00000000')
++    return (v6Part & maskHigh96) | v4Part
++  }
++
++  const groups = expandV6Groups(ip)
++  if (!groups) return null
++  return ipv6GroupsToBigInt(groups)
++}
++
++function expandV6Groups(ip: string): string[] | null {
++  if (!ip.includes(':')) return null
++  const parts = ip.split('::')
++  if (parts.length > 2) return null
++  let left: string[]
++  let right: string[]
++  if (parts.length === 2) {
++    left = parts[0] ? parts[0]!.split(':') : []
++    right = parts[1] ? parts[1]!.split(':') : []
++    const missing = 8 - left.length - right.length
++    if (missing < 0) return null
++    left = [...left, ...new Array(missing).fill('0')]
++  } else {
++    left = ip.split(':')
++    right = []
++  }
++  const groups = [...left, ...right]
++  if (groups.length !== 8) return null
++  for (const g of groups) {
++    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null
++  }
++  return groups.map((g) => g.toLowerCase().padStart(4, '0'))
++}
++
++function ipv6GroupsToBigInt(groups: string[] | null): bigint | null {
++  if (!groups) return null
++  let result = BigInt(0)
++  for (const g of groups) {
++    result = (result << BigInt(16)) | BigInt(parseInt(g, 16))
++  }
++  return result
++}
++
++// ─── In-memory rate limiting (token bucket per API key) ──────
++
++interface RateBucket {
++  tokens: number
++  lastRefill: number
++}
++
++const REFILL_INTERVAL_MS = 60_000 // 1 minute
++
++// Persisted across hot reloads in dev
++const globalForRate = globalThis as unknown as {
++  __rateBuckets?: Map<string, RateBucket>
++}
++const buckets: Map<string, RateBucket> =
++  globalForRate.__rateBuckets ?? new Map<string, RateBucket>()
++globalForRate.__rateBuckets = buckets
++
++/**
++ * Token-bucket rate limiter.
++ * Returns { ok: true } if the request is allowed, or { ok: false, retryAfter }
++ * with seconds-to-wait if the bucket is empty.
++ *
++ * Bucket capacity = rateLimitPerMinute tokens, refilled continuously at
++ * rateLimitPerMinute/60 tokens per ms.
++ */
++export function checkRateLimit(
++  apiKeyId: string,
++  rateLimitPerMinute: number | null,
++): { ok: true; remaining: number } | { ok: false; retryAfter: number; remaining: 0 } {
++  const capacity = rateLimitPerMinute ?? DEFAULT_RATE_LIMIT_PER_MINUTE
++  const now = Date.now()
++
++  let bucket = buckets.get(apiKeyId)
++  if (!bucket) {
++    bucket = { tokens: capacity, lastRefill: now }
++    buckets.set(apiKeyId, bucket)
++  }
++
++  const elapsed = now - bucket.lastRefill
++  const refill = (elapsed / REFILL_INTERVAL_MS) * capacity
++  bucket.tokens = Math.min(capacity, bucket.tokens + refill)
++  bucket.lastRefill = now
++
++  if (bucket.tokens >= 1) {
++    bucket.tokens -= 1
++    return { ok: true, remaining: Math.floor(bucket.tokens) }
++  }
++
++  const msUntilNext = Math.ceil((1 - bucket.tokens) * (REFILL_INTERVAL_MS / capacity))
++  const retryAfter = Math.max(1, Math.ceil(msUntilNext / 1000))
++  return { ok: false, retryAfter, remaining: 0 }
++}
++
++/** Lightweight cleanup: drop stale buckets occasionally to bound memory. */
++export function pruneRateBuckets(maxSize = 10_000): void {
++  if (buckets.size < maxSize) return
++  const entries = [...buckets.entries()].sort((a, b) => a[1].lastRefill - b[1].lastRefill)
++  const dropCount = Math.floor(entries.length * 0.25)
++  for (let i = 0; i < dropCount; i++) {
++    buckets.delete(entries[i]![0])
++  }
++}
++
++/**
++ * Builds the standard rate-limit headers to attach to public API responses.
++ * Works for both success (200) and rate-limited (429) responses.
++ */
++export function rateLimitHeaders(auth: ApiAuthResult): Record<string, string> {
++  const rl = auth.ok ? auth.rateLimit : auth.rateLimit
++  if (!rl) return {}
++  const headers: Record<string, string> = {
++    'X-RateLimit-Limit': String(rl.limit),
++    'X-RateLimit-Remaining': String(rl.remaining),
++  }
++  if (rl.retryAfter !== null) {
++    headers['Retry-After'] = String(rl.retryAfter)
++  }
++  return headers
++}
++
+ // ─── Request authentication ──────────────────────────────────
+ 
+ /**
+@@ -183,8 +435,10 @@ export function extractBearerToken(req: Request | NextRequest): string | null {
+  *  1. Extract Bearer token from the Authorization header.
+  *  2. Hash it and look up the matching ApiKey row by keyHash.
+  *  3. Reject if not found, revoked, or expired.
+- *  4. Eagerly load the owning User.
+- *  5. (Non-blocking) update lastUsedAt / lastUsedIp.
++ *  4. Check IP allowlist (403 if client IP not allowed).
++ *  5. Check rate limit (429 if bucket empty).
++ *  6. Eagerly load the owning User.
++ *  7. (Non-blocking) update lastUsedAt / lastUsedIp.
+  *
+  * Returns a discriminated union — callers should check `ok` first.
+  */
+@@ -196,7 +450,6 @@ export async function authenticateApiKey(
+     return { ok: false, error: 'Missing or malformed Authorization header. Expected: Bearer <api_key>', status: 401 }
+   }
+ 
+-  // Quick format check — saves a DB round trip for obviously-bogus tokens.
+   if (!token.startsWith(API_KEY_PREFIX)) {
+     return { ok: false, error: 'Invalid API key format.', status: 401 }
+   }
+@@ -222,9 +475,31 @@ export async function authenticateApiKey(
+     return { ok: false, error: 'API key has expired.', status: 401 }
+   }
+ 
++  // IP allowlist check (strict if allowlist non-empty)
++  const clientIp = getClientIp(req)
++  const allowlist = parseAllowedIps(apiKey.allowedIps)
++  if (!isIpAllowed(clientIp, allowlist)) {
++    return {
++      ok: false,
++      error: `IP ${clientIp ?? '(unknown)'} is not allowed for this API key.`,
++      status: 403,
++    }
++  }
++
++  // Rate limit (token bucket per key)
++  const limit = apiKey.rateLimitPerMinute ?? DEFAULT_RATE_LIMIT_PER_MINUTE
++  const rate = checkRateLimit(apiKey.id, apiKey.rateLimitPerMinute)
++  if (!rate.ok) {
++    return {
++      ok: false,
++      error: `Rate limit exceeded. Try again in ${rate.retryAfter}s.`,
++      status: 429,
++      rateLimit: { limit, remaining: 0, retryAfter: rate.retryAfter },
++    }
++  }
++
+   // Fire-and-forget: update last-used metadata. We deliberately don't await
+   // this so it never slows down the response. Errors are swallowed.
+-  const clientIp = getClientIp(req)
+   db.apiKey
+     .update({
+       where: { id: apiKey.id },
+@@ -234,6 +509,9 @@ export async function authenticateApiKey(
+       /* non-critical */
+     })
+ 
++  // Opportunistic cleanup — runs ~never (only when map gets large).
++  pruneRateBuckets()
++
+   return {
+     ok: true,
+     user: apiKey.user,
+@@ -242,7 +520,10 @@ export async function authenticateApiKey(
+       label: apiKey.label,
+       scopes: parseScopes(apiKey.scopes),
+       userId: apiKey.userId,
++      allowedIps: allowlist,
++      rateLimitPerMinute: apiKey.rateLimitPerMinute,
+     },
++    rateLimit: { limit, remaining: rate.remaining, retryAfter: null },
+   }
+ }
+ 
+@@ -295,17 +576,68 @@ export function getClientIp(req: Request | NextRequest): string | null {
+   return null
+ }
+ 
++// ─── Settings audit log ──────────────────────────────────────
++
++export type AuditAction = 'api_key.create' | 'api_key.update' | 'api_key.revoke'
++
++export interface AuditEntry {
++  userId: string
++  action: AuditAction
++  apiKeyId?: string | null
++  apiKeyLabel?: string | null
++  /** Will be JSON.stringified before storage. */
++  diff?: Record<string, unknown>
++  ip?: string | null
++  userAgent?: string | null
++}
++
++/**
++ * Persists a settings-audit entry. Best-effort: never throws.
++ * Caller should not await unless it explicitly needs to.
++ */
++export async function writeAuditLog(entry: AuditEntry): Promise<void> {
++  try {
++    await db.settingsAuditLog.create({
++      data: {
++        userId: entry.userId,
++        action: entry.action,
++        apiKeyId: entry.apiKeyId ?? null,
++        apiKeyLabel: entry.apiKeyLabel ?? null,
++        diff: JSON.stringify(entry.diff ?? {}),
++        ip: entry.ip ?? null,
++        userAgent: entry.userAgent ?? null,
++      },
++    })
++  } catch {
++    /* best-effort — audit log must never break the user flow */
++  }
++}
++
++/** Helper: pulls IP + UA off a Request, ready to drop into writeAuditLog. */
++export function auditContext(req: Request): { ip: string | null; userAgent: string | null } {
++  return {
++    ip: getClientIp(req),
++    userAgent: req.headers.get('user-agent'),
++  }
++}
++
+ // ─── Error helper for route handlers ─────────────────────────
+ 
+ /**
+  * Convenience: converts an ApiAuthFailure into a Next.js Response.
++ * Automatically attaches rate-limit headers when relevant.
+  */
+ export function unauthorizedResponse(result: ApiAuthFailure): Response {
+-  return new Response(
+-    JSON.stringify({ error: result.error }),
+-    {
+-      status: result.status,
+-      headers: { 'content-type': 'application/json' },
+-    },
+-  )
++  const headers: Record<string, string> = { 'content-type': 'application/json' }
++  if (result.rateLimit) {
++    headers['X-RateLimit-Limit'] = String(result.rateLimit.limit)
++    headers['X-RateLimit-Remaining'] = String(result.rateLimit.remaining)
++    if (result.rateLimit.retryAfter !== null) {
++      headers['Retry-After'] = String(result.rateLimit.retryAfter)
++    }
++  }
++  return new Response(JSON.stringify({ error: result.error }), {
++    status: result.status,
++    headers,
++  })
+ }
+-- 
+2.47.3
+
