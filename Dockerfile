@@ -31,6 +31,12 @@ RUN npm install
 # Generate Prisma client (needed at build time for type checking + bundling)
 RUN npx prisma generate
 
+# Push schema to Postgres (creates tables if they don't exist).
+# Uses DIRECT_URL (direct connection, not pgbouncer) for DDL operations.
+# DATABASE_URL and DIRECT_URL must be available at build time (Coolify passes
+# env vars to the build by default).
+RUN npx prisma db push --accept-data-loss
+
 # ---------------------------------------------------------------------------
 # Stage 2 — builder: compile Next.js standalone
 # ---------------------------------------------------------------------------

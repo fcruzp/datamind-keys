@@ -186,7 +186,13 @@ async function fetchUserFields(id: string, email: string, name: string | null) {
 export async function getCurrentUser(
   req?: NextRequest,
 ): Promise<SessionUser> {
-  await seedDemoTenants()
+  // Seed demo tenants — wrapped in try/catch so a transient DB issue
+  // (e.g. pgbouncer connection reset) doesn't crash the entire page.
+  try {
+    await seedDemoTenants()
+  } catch (e) {
+    console.error('[session] seedDemoTenants failed:', e)
+  }
 
   // --- 1. Try Supabase Auth -------------------------------------------------
   try {
