@@ -17,6 +17,11 @@ RUN apk add --no-cache git libc6-compat python3 make g++ openssl
 FROM base AS deps
 WORKDIR /app
 
+# Cache-bust: change this value in Coolify (1 → 2 → 3...) each time you push
+# new code to the repo, to force Docker to re-run git clone and pull the
+# latest commit instead of using a cached layer.
+ARG CACHEBUST=1
+
 # Clone the public repo (no credentials needed — repo is public)
 RUN git clone --depth 1 https://github.com/fcruzp/datamind-keys.git .
 
