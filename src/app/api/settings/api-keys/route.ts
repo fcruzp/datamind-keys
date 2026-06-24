@@ -14,13 +14,14 @@ import {
   writeAuditLog,
   type ApiScope,
 } from '@/lib/api-auth'
+import { withDbSafe } from '@/lib/api-wrapper'
 
 // ---------------------------------------------------------------------------
 // GET /api/settings/api-keys
 // Lists active (non-revoked) keys for the current user. Never returns plaintext.
 // ---------------------------------------------------------------------------
 
-export async function GET(req: NextRequest) {
+export const GET = withDbSafe<NextRequest>(async (req) => {
   const user = await getDemoUser(req)
 
   const keys = await db.apiKey.findMany({
@@ -58,7 +59,7 @@ export async function GET(req: NextRequest) {
       createdAt: k.createdAt,
     })),
   })
-}
+})
 
 // ---------------------------------------------------------------------------
 // POST /api/settings/api-keys
@@ -96,7 +97,7 @@ const createSchema = z.object({
     .or(z.literal(null)),
 })
 
-export async function POST(req: NextRequest) {
+export const POST = withDbSafe<NextRequest>(async (req) => {
   let body: unknown
   try {
     body = await req.json()
@@ -187,4 +188,4 @@ export async function POST(req: NextRequest) {
     },
     { status: 201 },
   )
-}
+})

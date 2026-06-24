@@ -6,37 +6,54 @@ import {
   SESSION_COOKIE,
 } from '@/lib/session'
 import { db } from '@/lib/db'
+import { withDbSafe } from '@/lib/api-wrapper'
 
 // GET /api/auth/me
 // Returns the currently-logged-in user (resolved from the session cookie),
 // the list of switchable demo tenants, and quick stats so the portal shell
 // can render the sidebar / dashboard without N round-trips.
 
-export async function GET(req: NextRequest) {
+export const GET = withDbSafe<NextRequest>(async (req) => {
   const user = await getCurrentUser(req)
-  const switchable = await listSwitchableUsers()
 
-  // Quick stats for the dashboard — active keys + 7d request count for THIS tenant only.
+  // Defensive: listSwitchableUsers may fail if DB is unreachable.
+  let switchable: Awaited<ReturnType<typeof listSwitchableUsers>> = []
+  try {
+    switchable = await listSwitchableUsers()
+  } catch (e) {
+    console.error('[/api/auth/me] listSwitchableUsers failed:', e)
+  }
+
+  // Quick stats — defensive: tables may not exist yet.
   const since7d = new Date(Date.now() - 1000 * 60 * 60 * 24 * 7)
-  const [activeKeys, revokedKeys, requests7d, lastLogAt] = await Promise.all([
-    db.apiKey.count({
-      where: { userId: user.id, revokedAt: null },
-    }),
-    db.apiKey.count({
-      where: { userId: user.id, revokedAt: { not: null } },
-    }),
-    db.apiRequestLog.count({
-      where: {
-        apiKey: { userId: user.id },
-        createdAt: { gte: since7d },
-      },
-    }),
-    db.apiRequestLog.findFirst({
-      where: { apiKey: { userId: user.id } },
-      orderBy: { createdAt: 'desc' },
-      select: { createdAt: true },
-    }),
-  ])
+  let activeKeys = 0
+  let revokedKeys = 0
+  let requests7d = 0
+  let lastLogAt: { createdAt: Date } | null = null
+
+  try {
+    ;[activeKeys, revokedKeys, requests7d, lastLogAt] = await Promise.all([
+      db.apiKey.count({
+        where: { userId: user.id, revokedAt: null },
+      }),
+      db.apiKey.count({
+        where: { userId: user.id, revokedAt: { not: null } },
+      }),
+      db.apiRequestLog.count({
+        where: {
+          apiKey: { userId: user.id },
+          createdAt: { gte: since7d },
+        },
+      }),
+      db.apiRequestLog.findFirst({
+        where: { apiKey: { userId: user.id } },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true },
+      }),
+    ])
+  } catch (e) {
+    console.error('[/api/auth/me] stats query failed:', e)
+  }
 
   // The cookie that's actually set (may be undefined → defaults to demo@datamind.bi)
   const cookieEmail = req.cookies.get(SESSION_COOKIE)?.value
@@ -71,4 +88,4 @@ export async function GET(req: NextRequest) {
       lastRequestAt: lastLogAt?.createdAt?.toISOString() ?? null,
     },
   })
-}
+})

@@ -2,10 +2,11 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { getDemoUser } from '@/lib/api-auth'
+import { withDbSafe } from '@/lib/api-wrapper'
 
 // GET /api/settings/api-keys/usage
 // Returns recent request logs aggregated by API key, for the dashboard widget.
-export async function GET(req: NextRequest) {
+export const GET = withDbSafe<NextRequest>(async (req) => {
   const user = await getDemoUser(req)
 
   const since7d = new Date(Date.now() - 1000 * 60 * 60 * 24 * 7) // 7 days
@@ -107,4 +108,4 @@ export async function GET(req: NextRequest) {
     })),
     hourlyHistogram: globalHistogram,
   })
-}
+})

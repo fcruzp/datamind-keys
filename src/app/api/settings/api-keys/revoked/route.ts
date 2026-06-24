@@ -7,10 +7,11 @@ import {
   parseAllowedIps,
   parseScopes,
 } from '@/lib/api-auth'
+import { withDbSafe } from '@/lib/api-wrapper'
 
 // GET /api/settings/api-keys/revoked
 // Lists revoked keys for audit (no plaintext). Newest-revoked first.
-export async function GET(req: NextRequest) {
+export const GET = withDbSafe<NextRequest>(async (req) => {
   const user = await getDemoUser(req)
 
   const keys = await db.apiKey.findMany({
@@ -50,4 +51,4 @@ export async function GET(req: NextRequest) {
       revokedAt: k.revokedAt,
     })),
   })
-}
+})

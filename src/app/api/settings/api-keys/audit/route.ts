@@ -2,12 +2,13 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { getDemoUser } from '@/lib/api-auth'
 import { db } from '@/lib/db'
+import { withDbSafe } from '@/lib/api-wrapper'
 
 // GET /api/settings/api-keys/audit
 // Returns the most recent settings-audit entries for the current user.
 // Used by the AuditLogPanel UI to show "who did what, when" for compliance.
 
-export async function GET(req: NextRequest) {
+export const GET = withDbSafe<NextRequest>(async (req) => {
   const user = await getDemoUser(req)
 
   const entries = await db.settingsAuditLog.findMany({
@@ -46,4 +47,4 @@ export async function GET(req: NextRequest) {
       }
     }),
   })
-}
+})
