@@ -54,6 +54,13 @@ COPY . .
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
+# NEXT_PUBLIC_* vars are inlined by Next.js at BUILD time, so they MUST be
+# present in this builder stage (not just in the runner). The anon key is
+# public by design and the URL is a public endpoint.
+ENV NEXT_PUBLIC_SUPABASE_URL=https://rsrcdaepiwjqfynwwzcn.supabase.co
+ENV NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJzcmNkYWVwaXdqcWZ5bnd3emNuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgyOTk2ODYsImV4cCI6MjA5Mzg3NTY4Nn0.SYC-TqLgL01BY59GtPQ7xnzKvjIJFWl9-HYr84K-eZM
+ENV NEXT_PUBLIC_SITE_URL=https://datamind-api.mooo.com
+
 # Build the standalone bundle. next.config.ts already has output: "standalone"
 # which produces .next/standalone (server.js + minimal node_modules).
 RUN bun run build
@@ -87,12 +94,20 @@ COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@prisma ./node_modul
 # ---------------------------------------------------------------------------
 # Runtime environment
 # ---------------------------------------------------------------------------
+# Core runtime (fixed)
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
-# Supabase pooler is PgBouncer in transaction mode — Prisma needs this
-ENV DIRECT_URL="${DIRECT_URL}"
+
+# Public/non-secret Supabase + app vars — baked into the image so Coolify
+# only needs 3 secret env vars at runtime (SERVICE_ROLE_KEY, DATABASE_URL,
+# DIRECT_URL). These are safe to commit: anon key is public by design,
+# publishable key is public, and the URL/SITE_URL are public endpoints.
+ENV NEXT_PUBLIC_SUPABASE_URL=https://rsrcdaepiwjqfynwwzcn.supabase.co
+ENV NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJzcmNkYWVwaXdqcWZ5bnd3emNuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgyOTk2ODYsImV4cCI6MjA5Mzg3NTY4Nn0.SYC-TqLgL01BY59GtPQ7xnzKvjIJFWl9-HYr84K-eZM
+ENV SUPABASE_PUBLISHABLE_KEY=sb_publishable_gB8AGof8Nd4UkmblvOjr7g_2aG4KrCy
+ENV NEXT_PUBLIC_SITE_URL=https://datamind-api.mooo.com
 
 # Next.js standalone server.js listens on $PORT
 EXPOSE 3000

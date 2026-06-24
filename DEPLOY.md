@@ -1,8 +1,9 @@
 # Despliegue en Coolify — DataMind BI · API Keys Manager
 
 Dominio: **`datamind-api.mooo.com`**
-Repo: `fcruzp/datamind-keys` (pendiente de crear)
+Repo: `fcruzp/datamind-keys` (privado)
 Backend: Supabase `rsrcdaepiwjqfynwwzcn` (compartido con BIweb)
+Build Pack: **Dockerfile** (igual que `datamind.mooo.com`)
 
 ---
 
@@ -10,12 +11,12 @@ Backend: Supabase `rsrcdaepiwjqfynwwzcn` (compartido con BIweb)
 
 | Archivo | Para qué sirve |
 |---|---|
-| `Dockerfile` | Imagen multi-stage Bun → Next.js standalone. No requiere build local. |
+| `Dockerfile` | Imagen multi-stage Bun → Next.js standalone. Incluye baked-in las variables públicas (anon key, URL de Supabase, SITE_URL). No requiere build local. |
 | `.dockerignore` | Recorta el contexto de build (excluye `node_modules`, `.next`, `db/`, etc.) |
-| `docker-compose.yml` | Definición del servicio con labels Traefik + Caddy para Coolify. |
-| `coolify.yaml` | Referencia YAML de los labels y env vars (para pegar en el dashboard). |
-| `.env.production.example` | Plantilla de variables de entorno. |
+| `.env.production.example` | Plantilla — solo las 3 variables SECRETAS que debes configurar en Coolify. |
 | `supabase/migrations/*.sql` | Esquema + RLS que debes aplicar en Supabase Studio. |
+
+> **No hay `docker-compose.yml` ni `coolify.yaml`** — el despliegue es Dockerfile puro, igual que tu `datamind.mooo.com`.
 
 ---
 
@@ -29,9 +30,6 @@ Antes de desplegar, el backend necesita las tablas nuevas (`user_profiles`,
 3. Pega el contenido de `supabase/migrations/0001_schema_additions.sql` → **Run**
 4. Nuevo query → pega `supabase/migrations/0002_rls_policies.sql` → **Run**
 5. Verifica en **Table Editor** que ves las 4 tablas nuevas con candado RLS.
-
-> Alternativa: `supabase db push` con la CLI, pero SQL Editor es más rápido
-> para una única aplicación.
 
 ---
 
@@ -47,7 +45,7 @@ Prisma necesita `DATABASE_URL` y `DIRECT_URL` (no las claves de API).
 4. Sustituye `[YOUR-PASSWORD]` por la contraseña del rol `postgres`.
    Si no la recuerdas: botón **Reset database password** en la misma página.
 
-Formato esperado:
+Formato esperado (región us-east-1):
 ```
 DATABASE_URL=postgresql://postgres.rsrcdaepiwjqfynwwzcn:PASS@aws-0-us-east-1.pooler.supabase.com:6543/postgres?pgbouncer=true
 DIRECT_URL=postgresql://postgres.rsrcdaepiwjqfynwwzcn:PASS@aws-0-us-east-1.pooler.supabase.com:5432/postgres
@@ -67,35 +65,36 @@ Para que el login redirija al dominio correcto:
 
 ---
 
-## Paso 4 — Crear el recurso en Coolify
+## Paso 4 — Crear el recurso en Coolify (Build Pack = Dockerfile)
 
-### Opción A — Desde repo Git (recomendado)
+1. Coolify → **+ New Resource** → **Public repository** (o private con deploy key)
+2. Selecciona `fcruzp/datamind-keys` → rama `main`
+3. En **Configuration**:
+   - **Build Pack**: `Dockerfile` ← importante, NO Docker Compose
+   - **Dockerfile Location**: `/Dockerfile` (default)
+   - **Domains**: `datamind-api.mooo.com`
+   - **Ports Exposes**: `3000`
+   - **Custom Docker Options**: (vacío)
+   - **Install/Build/Start Command**: (vacíos — los maneja el Dockerfile)
+4. **Environment Variables** — solo 3 (las secretas):
+   - `SUPABASE_SERVICE_ROLE_KEY` = `eyJhbGc...` (service_role secret)
+   - `DATABASE_URL` = `postgresql://...6543/postgres?pgbouncer=true`
+   - `DIRECT_URL` = `postgresql://...5432/postgres`
+   
+   ⚠️ **NO añadir** `NODE_ENV`, `NEXT_PUBLIC_*`, etc. — ya están baked-in
+   en el Dockerfile. Si las añades, pueden sobreescribir el valor correcto.
+5. **Deploy** → espera 2-3 min
 
-1. Sube el código a `fcruzp/datamind-keys` en GitHub.
-2. Coolify → **+ New Resource** → **Public repository** (o private con deploy key)
-3. Selecciona `fcruzp/datamind-keys` → rama `main`
-4. Coolify detecta `docker-compose.yml` automáticamente → **Continue**
-5. En **Configuration**:
-   - **Domains**: `datamind-api.mooo.com` (Coolify genera los labels automáticamente)
-   - **Build Pack**: Docker Compose
-   - **Environment Variables**: pega el contenido de `.env.production.example`
-     con los valores reales (`DATABASE_URL`, `DIRECT_URL`, etc.)
-6. **Deploy** → espera 2-3 min (build + healthcheck)
-
-### Opción B — Docker Compose vacío
-
-1. Coolify → **+ New Resource** → **Docker Compose Empty**
-2. Pega el contenido de `docker-compose.yml`
-3. En **Custom Labels** puedes pegar el bloque `labels` de `coolify.yaml`
-   (aunque Coolify ya los genera con solo poner el dominio en el campo **Domains**)
-4. Configura **Environment Variables** igual que en la Opción A
-5. **Deploy**
+> Las 8 variables públicas (NODE_ENV, NEXT_PUBLIC_SUPABASE_URL, anon key,
+> publishable key, SITE_URL, PORT, HOSTNAME, NEXT_TELEMETRY_DISABLED)
+> ya están hardcodeadas como `ENV` en el Dockerfile — no necesitas
+> configurarlas en Coolify.
 
 ---
 
 ## Paso 5 — DNS (si no está hecho)
 
-En el panel donde gestionas `mooo.com` (probablemente el proveedor de DNS):
+En el panel donde gestionas `mooo.com`:
 
 ```
 A     datamind-api     <IP-DEL-SERVIDOR-COOLIFY>     TTL 300
@@ -107,7 +106,7 @@ CNAME datamind-api     coolify.tuservidor.com.       TTL 300
 ```
 
 Coolify solicitará el certificado Let's Encrypt automáticamente al primer
-deploy gracias a `tls.certresolver=letsencrypt`.
+deploy.
 
 ---
 
@@ -116,9 +115,8 @@ deploy gracias a `tls.certresolver=letsencrypt`.
 Una vez verde el deploy:
 
 ```bash
-# Health check
-curl https://datamind-api.mooo.com/api/health
-# → {"ok":true,"service":"datamind-keys","ts":"..."}
+# Página principal (debe responder 200)
+curl -I https://datamind-api.mooo.com/
 
 # OpenAPI spec (no requiere auth)
 curl https://datamind-api.mooo.com/api/openapi.json | jq '.info'
@@ -137,34 +135,14 @@ portal (login con Supabase Auth).
 
 ---
 
-## Estructura de labels (referencia)
-
-Los labels de Traefik + Caddy siguen exactamente el mismo patrón que
-`datamind.mooo.com` (BIweb), solo cambia el dominio y el ID del router:
-
-| Campo | datamind.mooo.com (BIweb) | datamind-api.mooo.com (Keys) |
-|---|---|---|
-| `Host(...)` | `datamind.mooo.com` | `datamind-api.mooo.com` |
-| `caddy_0=` | `https://datamind.mooo.com` | `https://datamind-api.mooo.com` |
-| Router ID | `hyvtdbc00txfcds8pr6oj8ji` | `datamindapi` (estable, legible) |
-| Puerto LB | 3000 | 3000 |
-| certresolver | letsencrypt | letsencrypt |
-| Middleware | gzip + redirect-to-https | gzip + redirect-to-https |
-
-El ID del router (`hyvtdbc...` en BIweb) es el UUID del recurso en Coolify.
-Para `datamind-keys` uso `datamindapi` porque es grep-able y estable entre
-rebuilds. Traefik solo requiere que el ID sea consistente dentro del servicio.
-
----
-
 ## Troubleshooting
 
 ### El contenedor arranca pero 502/503 en el navegador
 
-- Revisa `docker logs datamind-keys` — lo más probable es que falte una env var.
-- Comprueba que `DATABASE_URL` y `DIRECT_URL` están seteadas (no las de API).
-- Verifica que el healthcheck pasa: `curl http://localhost:3000/api/health`
-  desde dentro del contenedor.
+- Revisa los logs del contenedor en Coolify — lo más probable es que falte
+  una de las 3 env vars secretas (`SUPABASE_SERVICE_ROLE_KEY`,
+  `DATABASE_URL`, `DIRECT_URL`).
+- Verifica que las 3 están configuradas en Coolify → Environment Variables.
 
 ### `PrismaClientInitializationError: Can't reach database server`
 
@@ -175,13 +153,14 @@ rebuilds. Traefik solo requiere que el ID sea consistente dentro del servicio.
 
 ### El login redirige a `localhost:3000`
 
-- `NEXT_PUBLIC_SITE_URL` no está seteada en Coolify → debe ser
-  `https://datamind-api.mooo.com`.
-- Supabase → Authentication → URL Configuration → Site URL mal puesto.
+- Esto ya no debería pasar: `NEXT_PUBLIC_SITE_URL` está baked-in en el
+  Dockerfile con valor `https://datamind-api.mooo.com`.
+- Si persiste, revisa Supabase → Authentication → URL Configuration →
+  Site URL (debe ser `https://datamind-api.mooo.com`).
 
 ### `tls.certresolver=letsencrypt` no emite certificado
 
-- El DNS `A datamind-api` aún no propagó → espera 5 min y forza redeploy.
+- El DNS `A datamind-api` aún no propagó → espera 5 min y fuerza redeploy.
 - El dominio ya tiene un CAA record que bloquea Let's Encrypt → revisa DNS.
 
 ### Prisma dice `relation "api_keys" does not exist`
@@ -193,9 +172,6 @@ rebuilds. Traefik solo requiere que el ID sea consistente dentro del servicio.
 ## Rollback
 
 ```bash
-# En el servidor Coolify
-docker stop datamind-keys
-docker rm datamind-keys
 # Coolify mantiene imágenes anteriores → redespliega la penúltima
 # desde el dashboard: Deploy → selecciona commit anterior → Redeploy
 ```
