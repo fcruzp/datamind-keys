@@ -13,6 +13,10 @@ import type { NextRequest } from 'next/server'
  * DB-related, we return:
  *   - For GET: 200 with empty payload ({ keys: [], logs: [], ... })
  *   - For POST/PATCH/DELETE: 503 with { error: 'Database unavailable' }
+ *
+ * In all error cases, the Prisma error code + message are included in the
+ * response body so the frontend (and the user via DevTools Network tab) can
+ * see exactly what went wrong.
  */
 export function withDbSafe<T extends NextRequest>(
   handler: (req: T) => Promise<NextResponse>,
@@ -21,9 +25,10 @@ export function withDbSafe<T extends NextRequest>(
     try {
       return await handler(req)
     } catch (e: unknown) {
-      const err = e as { code?: string; message?: string }
+      const err = e as { code?: string; message?: string; meta?: unknown }
       const code = err?.code ?? ''
       const msg = err?.message ?? ''
+      const meta = err?.meta
 
       // Prisma error codes:
       // P1xxx = connection errors
@@ -45,7 +50,21 @@ export function withDbSafe<T extends NextRequest>(
         )
       }
 
-      console.error('[api] DB error:', code, msg)
+      console.error('[api] DB error:', {
+        code,
+        message: msg,
+        meta,
+        url: req.url,
+        method: req.method,
+      })
+
+      // Detailed error info — included in ALL responses so the user can
+      // diagnose via DevTools → Network → Response tab.
+      const errorDetail = {
+        prismaCode: code || undefined,
+        message: msg.slice(0, 500),
+        meta: meta ? JSON.stringify(meta).slice(0, 500) : undefined,
+      }
 
       if (req.method === 'GET') {
         // Return empty payload for GETs so the UI can render.
@@ -72,13 +91,17 @@ export function withDbSafe<T extends NextRequest>(
             auditLogs: [],
             revokedKeys: [],
             error: isDbError ? 'Database unavailable' : 'Internal error',
+            errorDetail,
           },
           { status: 200 },
         )
       }
 
       return NextResponse.json(
-        { error: 'Database temporarily unavailable' },
+        {
+          error: 'Database temporarily unavailable',
+          errorDetail,
+        },
         { status: 503 },
       )
     }

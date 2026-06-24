@@ -103,6 +103,34 @@ export const POST = withDbSafe<NextRequest>(async (req) => {
   const { label, scopes, expiresInDays } = parsed.data
   const user = await getDemoUser(req)
 
+  // Diagnostic: log the user state so we can see if user.id is valid
+  console.log('[POST /api/settings/api-keys] user:', {
+    id: user.id,
+    supabaseId: user.supabaseId,
+    email: user.email,
+    idLength: user.id.length,
+  })
+
+  // If user.id is empty, the user row wasn't created in the DB — all
+  // writes will fail with FK constraint. Return a clear error.
+  if (!user.id) {
+    return NextResponse.json(
+      {
+        error:
+          'Your account exists in Supabase Auth but not in the users table. ' +
+          'This usually means the users table is missing or the DB connection ' +
+          'uses a role without insert permissions. ' +
+          'Visit /api/debug/db-health for diagnostics.',
+        errorDetail: {
+          userId: '(empty)',
+          supabaseId: user.supabaseId,
+          email: user.email,
+        },
+      },
+      { status: 503 },
+    )
+  }
+
   // Cap active keys per user to prevent runaway growth
   const activeCount = await db.apiKey.count({
     where: { userId: user.id, revokedAt: null },
@@ -122,6 +150,12 @@ export const POST = withDbSafe<NextRequest>(async (req) => {
     ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000)
     : null
 
+  console.log('[POST /api/settings/api-keys] creating key:', {
+    userId: user.id,
+    keyPrefix: prefix,
+    label,
+  })
+
   const created = await db.apiKey.create({
     data: {
       userId: user.id,
@@ -132,6 +166,8 @@ export const POST = withDbSafe<NextRequest>(async (req) => {
       expiresAt,
     },
   })
+
+  console.log('[POST /api/settings/api-keys] key created:', created.id)
 
   // Audit: record creation (no plaintext, no hash — just metadata)
   // NOTE: userId must be the Supabase Auth UUID (user.supabaseId), NOT
