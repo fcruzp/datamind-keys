@@ -1,0 +1,104 @@
+# =============================================================================
+# DataMind BI — API Keys Manager
+# docker-compose.yml — listo para Coolify
+# =============================================================================
+#
+# Dominio:        datamind-api.mooo.com
+# Puerto interno: 3000 (Next.js standalone)
+# Proxy:          Traefik (primary) + Caddy (fallback)
+#
+# Cómo usar en Coolify:
+#   1. New Resource → Docker Compose Empty → pega este archivo
+#      (o conecta el repo fcruzp/datamind-keys y Coolify lo detecta solo)
+#   2. En "Environment variables" pega el contenido de .env.production.example
+#   3. En "Domains" confirma: datamind-api.mooo.com
+#   4. Deploy
+#
+# Los labels de Traefik + Caddy ya están incluidos abajo, pero Coolify los
+# regenera automáticamente a partir del campo "Domains" del dashboard.
+# Si prefieres pegarlos manualmente en "Custom Labels", usa coolify.yaml.
+# =============================================================================
+
+services:
+  datamind-keys:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: datamind-keys
+    restart: unless-stopped
+    # El contenedor escucha en 3000; Coolify publica vía Traefik en 443/80
+    expose:
+      - "3000"
+    # Sin `ports:` — el tráfico entra por el proxy de Coolify, no directo
+    environment:
+      - NODE_ENV=production
+      - NEXT_TELEMETRY_DISABLED=1
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
+      # ── Supabase (se inyectan vía Coolify env vars) ──
+      - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
+      - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - SUPABASE_PUBLISHABLE_KEY=${SUPABASE_PUBLISHABLE_KEY}
+      # ── Postgres (Prisma) ──
+      - DATABASE_URL=${DATABASE_URL}
+      - DIRECT_URL=${DIRECT_URL}
+      # ── App ──
+      - NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL:-https://datamind-api.mooo.com}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - coolify
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Labels de proxy — equivalentes a los de datamind.mooo.com pero
+    # apuntando a datamind-api.mooo.com.
+    # El ID `datamindapi` reemplaza al UUID que Coolify genera; es estable
+    # y grep-able. Traefik solo requiere consistencia interna del servicio.
+    # ─────────────────────────────────────────────────────────────────────
+    labels:
+      # === Traefik: habilitar + middlewares globales ===
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.gzip.compress=true"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+
+      # === Traefik: router HTTP (80) → redirect a HTTPS ===
+      - "traefik.http.routers.http-0-datamindapi.entryPoints=http"
+      - "traefik.http.routers.http-0-datamindapi.middlewares=redirect-to-https"
+      - "traefik.http.routers.http-0-datamindapi.rule=Host(`datamind-api.mooo.com`) && PathPrefix(`/`)"
+      - "traefik.http.routers.http-0-datamindapi.service=http-0-datamindapi"
+
+      # === Traefik: router HTTPS (443) con gzip + Let's Encrypt ===
+      - "traefik.http.routers.https-0-datamindapi.entryPoints=https"
+      - "traefik.http.routers.https-0-datamindapi.middlewares=gzip"
+      - "traefik.http.routers.https-0-datamindapi.rule=Host(`datamind-api.mooo.com`) && PathPrefix(`/`)"
+      - "traefik.http.routers.https-0-datamindapi.service=https-0-datamindapi"
+      - "traefik.http.routers.https-0-datamindapi.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.https-0-datamindapi.tls=true"
+
+      # === Traefik: backend apunta al puerto 3000 del contenedor ===
+      - "traefik.http.services.http-0-datamindapi.loadbalancer.server.port=3000"
+      - "traefik.http.services.https-0-datamindapi.loadbalancer.server.port=3000"
+
+      # === Caddy (fallback proxy) ===
+      - "caddy_0.encode=zstd gzip"
+      - "caddy_0.handle_path.0_reverse_proxy={{upstreams 3000}}"
+      - "caddy_0.handle_path=/*"
+      - "caddy_0.header=-Server"
+      - "caddy_0.try_files={path} /index.html /index.php"
+      - "caddy_0=https://datamind-api.mooo.com"
+      - "caddy_ingress_network=coolify"
+
+      # === Metadatos Coolify ===
+      - "coolify.managed=true"
+      - "coolify.service.name=datamind-keys"
+      - "coolify.service.domain=datamind-api.mooo.com"
+
+networks:
+  coolify:
+    external: true
+    name: coolify

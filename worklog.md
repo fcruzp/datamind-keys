@@ -1376,3 +1376,68 @@ fallback working.
    Prisma is on Postgres, we can simplify this to call
    `getSupabaseServer().auth.getUser()` directly and drop the demo
    cookie fallback entirely.
+
+---
+Task ID: coolify-deploy
+Agent: main (Z.ai Code)
+Task: Crear el YAML de Coolify para desplegar la app en datamind-api.mooo.com,
+tomando como ejemplo el YAML de datamind.mooo.com (BIweb) que proporcionó el
+usuario.
+
+Work Log:
+- Revisé el estado del proyecto: Next.js 16 con `output: "standalone"`,
+  Prisma (SQLite en sandbox), Supabase SSR auth, paleta emerald/sky/rose/amber.
+- Confirmé que no existían Dockerfile, docker-compose.yml, .dockerignore ni
+  archivos de despliegue Coolify.
+- Creé `Dockerfile` multi-stage (3 etapas):
+  - `deps`: oven/bun:1.1, instala deps + genera Prisma client
+  - `builder`: compila Next.js standalone
+  - `runner`: oven/bun:1.1-slim, usuario nextjs non-root, tini para signals,
+    copia standalone + static + prisma client, CMD `bun server.js`
+- Creé `.dockerignore` que excluye node_modules, .next, db/, *.db, dev.log,
+  download/, tool-results/, examples/, .env.*, Dockerfile, etc.
+- Creé `docker-compose.yml` con:
+  - Servicio `datamind-keys` build from Dockerfile
+  - `expose: 3000` (sin `ports:` — el tráfico entra por el proxy Coolify)
+  - Environment vars: NODE_ENV, Supabase (URL/anon/service/publishable),
+    Postgres (DATABASE_URL/DIRECT_URL), NEXT_PUBLIC_SITE_URL
+  - Healthcheck contra `/api/health`
+  - Network `coolify` (external)
+  - Labels Traefik + Caddy adaptados de datamind.mooo.com → datamind-api.mooo.com
+    - Router ID estable: `datamindapi` (en vez del UUID Coolify)
+    - Puerto LB: 3000
+    - certresolver: letsencrypt
+    - middlewares: gzip + redirect-to-https
+- Creé `coolify.yaml` — YAML estructurado con labels + environment + service
+  config, listo para pegar en el dashboard de Coolify o usar como referencia.
+- Creé `.env.production.example` con todas las variables:
+  - Supabase (URL, anon, service role, publishable — ya conocidas)
+  - Postgres (DATABASE_URL transaction pooler 6543, DIRECT_URL direct 5432)
+  - NEXT_PUBLIC_SITE_URL = https://datamind-api.mooo.com
+- Creé `DEPLOY.md` con 6 pasos:
+  1. Aplicar migraciones SQL en Supabase Studio
+  2. Obtener connection strings Postgres (transaction + direct pooler)
+  3. Configurar Auth redirect URLs en Supabase
+  4. Crear recurso en Coolify (opción A: repo Git, opción B: compose vacío)
+  5. DNS A/CNAME record para datamind-api
+  6. Verificación con curl (health, openapi, /api/public/v1/me)
+  + Tabla comparativa de labels datamind vs datamind-api
+  + Sección de troubleshooting (502, Prisma init, redirect localhost, TLS,
+    relation does not exist)
+  + Sección de rollback
+- Creé `src/app/api/health/route.ts` — endpoint GET trivial que devuelve
+  `{ ok: true, service: 'datamind-keys', ts }` para el healthcheck de Docker.
+  No toca DB ni Supabase (intencional, para evitar cascadas de restart).
+- Verifiqué `bun run lint` → pasa limpio (0 errores).
+- Arranqué el dev server con `setsid` para que persista entre sesiones bash.
+
+Stage Summary:
+- 6 archivos nuevos de despliegue: Dockerfile, .dockerignore, docker-compose.yml,
+  coolify.yaml, .env.production.example, DEPLOY.md
+- 1 endpoint nuevo: /api/health (para Docker healthcheck)
+- Labels Traefik + Caddy adaptados de datamind.mooo.com → datamind-api.mooo.com
+  con router ID estable `datamindapi` y puerto 3000
+- Pendiente del usuario: obtener DATABASE_URL + DIRECT_URL de Supabase Dashboard
+  (Settings → Database → Connection string) y aplicar las migraciones SQL
+- El sandbox sigue corriendo en SQLite; el YAML de Coolify está listo para
+  producción con Postgres una vez que el usuario aporte las connection strings
