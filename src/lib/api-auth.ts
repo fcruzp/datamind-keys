@@ -546,3 +546,53 @@ export function pruneRateBuckets(maxSize = 10_000): void {
     buckets.delete(entries[i]![0])
   }
 }
+
+// ---------------------------------------------------------------------------
+// Settings audit log
+// Records management actions on API keys (create / update / revoke) so the
+// owner can review "who did what, when" — useful for compliance + debugging
+// integration breakages ("who revoked the OpenFN key at 3am?").
+// ---------------------------------------------------------------------------
+
+export type AuditAction = 'api_key.create' | 'api_key.update' | 'api_key.revoke'
+
+export interface AuditEntry {
+  userId: string
+  action: AuditAction
+  apiKeyId?: string | null
+  apiKeyLabel?: string | null
+  /** Will be JSON.stringified before storage. */
+  diff?: Record<string, unknown>
+  ip?: string | null
+  userAgent?: string | null
+}
+
+/**
+ * Persists a settings-audit entry. Best-effort: never throws.
+ * Caller should not await unless it explicitly needs to.
+ */
+export async function writeAuditLog(entry: AuditEntry): Promise<void> {
+  try {
+    await db.settingsAuditLog.create({
+      data: {
+        userId: entry.userId,
+        action: entry.action,
+        apiKeyId: entry.apiKeyId ?? null,
+        apiKeyLabel: entry.apiKeyLabel ?? null,
+        diff: JSON.stringify(entry.diff ?? {}),
+        ip: entry.ip ?? null,
+        userAgent: entry.userAgent ?? null,
+      },
+    })
+  } catch {
+    /* best-effort — audit log must never break the user flow */
+  }
+}
+
+/** Helper: pulls IP + UA off a Request, ready to drop into writeAuditLog. */
+export function auditContext(req: Request): { ip: string | null; userAgent: string | null } {
+  return {
+    ip: getClientIp(req),
+    userAgent: req.headers.get('user-agent'),
+  }
+}

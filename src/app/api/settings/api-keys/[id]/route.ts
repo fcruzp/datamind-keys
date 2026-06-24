@@ -2,9 +2,12 @@ import { NextResponse } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import {
+  auditContext,
   getDemoUser,
   parseAllowedIps,
+  parseScopes,
   serializeAllowedIps,
+  writeAuditLog,
 } from '@/lib/api-auth'
 
 // PATCH /api/settings/api-keys/[id]
@@ -59,7 +62,13 @@ export async function PATCH(
 
   const existing = await db.apiKey.findFirst({
     where: { id, userId: user.id },
-    select: { id: true, revokedAt: true },
+    select: {
+      id: true,
+      revokedAt: true,
+      label: true,
+      allowedIps: true,
+      rateLimitPerMinute: true,
+    },
   })
   if (!existing) {
     return NextResponse.json({ error: 'API key not found.' }, { status: 404 })
@@ -87,6 +96,27 @@ export async function PATCH(
     )
   }
 
+  // Build a before/after diff for the audit log
+  const diff: Record<string, { before: unknown; after: unknown }> = {}
+  if (parsed.data.label !== undefined && parsed.data.label !== existing.label) {
+    diff.label = { before: existing.label, after: parsed.data.label }
+  }
+  if (parsed.data.allowedIps !== undefined) {
+    const beforeIps = parseAllowedIps(existing.allowedIps)
+    if (JSON.stringify(beforeIps) !== JSON.stringify(parsed.data.allowedIps)) {
+      diff.allowedIps = { before: beforeIps, after: parsed.data.allowedIps }
+    }
+  }
+  if (
+    parsed.data.rateLimitPerMinute !== undefined &&
+    parsed.data.rateLimitPerMinute !== existing.rateLimitPerMinute
+  ) {
+    diff.rateLimitPerMinute = {
+      before: existing.rateLimitPerMinute,
+      after: parsed.data.rateLimitPerMinute,
+    }
+  }
+
   const updated = await db.apiKey.update({
     where: { id },
     data,
@@ -96,6 +126,18 @@ export async function PATCH(
       allowedIps: true,
       rateLimitPerMinute: true,
     },
+  })
+
+  // Audit: record the change with before/after diff
+  const auditCtx = auditContext(req)
+  await writeAuditLog({
+    userId: user.id,
+    action: 'api_key.update',
+    apiKeyId: updated.id,
+    apiKeyLabel: updated.label,
+    diff,
+    ip: auditCtx.ip,
+    userAgent: auditCtx.userAgent,
   })
 
   return NextResponse.json({
@@ -113,7 +155,7 @@ export async function PATCH(
 // ---------------------------------------------------------------------------
 
 export async function DELETE(
-  _req: Request,
+  req: Request,
   ctx: { params: Promise<{ id: string }> },
 ) {
   const { id } = await ctx.params
@@ -121,7 +163,7 @@ export async function DELETE(
 
   const apiKey = await db.apiKey.findFirst({
     where: { id, userId: user.id },
-    select: { id: true, revokedAt: true },
+    select: { id: true, revokedAt: true, label: true, keyPrefix: true },
   })
 
   if (!apiKey) {
@@ -137,10 +179,26 @@ export async function DELETE(
     )
   }
 
+  const revokedAt = new Date()
   await db.apiKey.update({
     where: { id: apiKey.id },
-    data: { revokedAt: new Date() },
+    data: { revokedAt },
   })
 
-  return NextResponse.json({ ok: true, revokedAt: new Date() })
+  // Audit: record revocation
+  const auditCtx = auditContext(req)
+  await writeAuditLog({
+    userId: user.id,
+    action: 'api_key.revoke',
+    apiKeyId: apiKey.id,
+    apiKeyLabel: apiKey.label,
+    diff: {
+      revokedAt: revokedAt.toISOString(),
+      keyPrefix: apiKey.keyPrefix,
+    },
+    ip: auditCtx.ip,
+    userAgent: auditCtx.userAgent,
+  })
+
+  return NextResponse.json({ ok: true, revokedAt })
 }

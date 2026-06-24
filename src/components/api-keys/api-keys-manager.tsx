@@ -20,6 +20,8 @@ import {
   Trash2,
   Activity,
   CheckCircle2,
+  CalendarClock,
+  Filter,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -56,6 +58,8 @@ import { EditApiKeyDialog } from './edit-api-key-dialog'
 import { InlineSparkline } from './inline-sparkline'
 import { NewKeyRevealDialog } from './new-key-reveal-dialog'
 import { RevokedKeysAudit } from './revoked-keys-audit'
+import { AuditLogPanel } from './audit-log-panel'
+import { OpenApiExplorer } from './openapi-explorer'
 import { ScopeBadgeList } from './scope-badge'
 import { TestKeyPopover } from './test-key-popover'
 import { UsageHistogram } from './usage-chart'
@@ -67,8 +71,18 @@ import { cn } from '@/lib/utils'
 export function ApiKeysManager() {
   const qc = useQueryClient()
   const [revealKey, setRevealKey] = React.useState<CreatedApiKey | null>(null)
+  const [expiringOnly, setExpiringOnly] = React.useState(false)
   const createKeyRef = React.useRef<HTMLButtonElement>(null)
   const revokedRef = React.useRef<HTMLDivElement>(null)
+
+  // Open the Edit dialog for a key by programmatically clicking its row's Edit button.
+  // Used by the keyboard-nav Enter handler.
+  const handleActivateRow = React.useCallback((rowId: string) => {
+    const btn = document.querySelector(
+      `[data-row-id="${rowId}"] [aria-label^="Edit "]`,
+    ) as HTMLButtonElement | null
+    btn?.click()
+  }, [])
 
   const handleCopyCurl = React.useCallback(async () => {
     const host =
@@ -136,10 +150,23 @@ export function ApiKeysManager() {
   }
 
   const isLoading = keysQuery.isLoading
-  const keys = keysQuery.data ?? []
+  const allKeys = keysQuery.data ?? []
   const usage = usageQuery.data
 
-  const keyboardNav = useRowKeyboardNav(keys.map((k) => k.id))
+  // Filter to "expiring soon" (within 7 days or already expired) when the
+  // filter toggle is on. Helps users find keys that need rotation.
+  const EXPIRING_SOON_DAYS = 7
+  const isExpiringSoon = (k: ApiKeyListItem): boolean => {
+    if (!k.expiresAt) return false
+    const ms = new Date(k.expiresAt).getTime() - Date.now()
+    return ms < EXPIRING_SOON_DAYS * 24 * 60 * 60 * 1000
+  }
+  const expiringCount = allKeys.filter(isExpiringSoon).length
+  const keys = expiringOnly ? allKeys.filter(isExpiringSoon) : allKeys
+
+  const keyboardNav = useRowKeyboardNav(keys.map((k) => k.id), {
+    onActivate: handleActivateRow,
+  })
 
   return (
     <div className="space-y-6">
@@ -157,12 +184,28 @@ export function ApiKeysManager() {
       >
         <CardHeader className="flex flex-row items-center justify-between gap-4 border-b bg-muted/30 py-4">
           <div className="space-y-0.5">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <KeyRound className="size-4 text-muted-foreground" />
               <h2 className="text-sm font-semibold">Active API keys</h2>
               <Badge variant="secondary" className="font-mono text-[11px]">
                 {keys.length}/25
               </Badge>
+              {expiringCount > 0 && (
+                <button
+                  onClick={() => setExpiringOnly((v) => !v)}
+                  className={cn(
+                    'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium transition-colors',
+                    expiringOnly
+                      ? 'border-amber-500/40 bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                      : 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20',
+                  )}
+                  title="Toggle filter: only show keys expiring within 7 days"
+                >
+                  <CalendarClock className="size-3" />
+                  {expiringCount} expiring
+                  {expiringOnly && <span className="ml-1">· filtered</span>}
+                </button>
+              )}
             </div>
             <p className="text-xs text-muted-foreground">
               Keys are SHA-256 hashed at rest. Plaintext is shown only at creation.
@@ -171,19 +214,37 @@ export function ApiKeysManager() {
                   <kbd className="rounded border border-border bg-background px-1 py-0.5 font-mono">↑</kbd>
                   <kbd className="rounded border border-border bg-background px-1 py-0.5 font-mono">↓</kbd>
                   to navigate
+                  <kbd className="ml-1 rounded border border-border bg-background px-1 py-0.5 font-mono">Enter</kbd>
+                  to edit
                 </span>
               )}
             </p>
           </div>
-          <CreateApiKeyDialog
-            onCreated={setRevealKey}
-            trigger={
-              <Button ref={createKeyRef} className="gap-2 shadow-sm">
-                <Plus className="size-4" />
-                Generate new key
+          <div className="flex items-center gap-2">
+            {expiringCount > 0 && (
+              <Button
+                size="sm"
+                variant={expiringOnly ? 'secondary' : 'ghost'}
+                className="gap-1.5"
+                onClick={() => setExpiringOnly((v) => !v)}
+                title="Toggle 'expiring soon' filter"
+              >
+                <Filter className="size-3.5" />
+                <span className="hidden sm:inline">
+                  {expiringOnly ? 'Show all' : 'Expiring soon'}
+                </span>
               </Button>
-            }
-          />
+            )}
+            <CreateApiKeyDialog
+              onCreated={setRevealKey}
+              trigger={
+                <Button ref={createKeyRef} className="gap-2 shadow-sm">
+                  <Plus className="size-4" />
+                  Generate new key
+                </Button>
+              }
+            />
+          </div>
         </CardHeader>
 
         <CardContent className="p-0">
@@ -191,8 +252,27 @@ export function ApiKeysManager() {
             <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
               <Loader2 className="size-4 animate-spin" /> Loading keys…
             </div>
-          ) : keys.length === 0 ? (
+          ) : allKeys.length === 0 ? (
             <EmptyState onCreate={(k) => setRevealKey(k)} />
+          ) : expiringOnly && keys.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12 px-6 text-center">
+              <div className="grid size-10 place-items-center rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 mb-3">
+                <CheckCircle2 className="size-5" />
+              </div>
+              <p className="text-sm font-medium">No keys expiring soon</p>
+              <p className="mt-1 text-xs text-muted-foreground max-w-sm">
+                All your active keys have more than 7 days of life remaining,
+                or never expire.
+              </p>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="mt-3"
+                onClick={() => setExpiringOnly(false)}
+              >
+                Clear filter
+              </Button>
+            </div>
           ) : (
             <div className="overflow-x-auto" {...keyboardNav.containerProps}>
               <Table>
@@ -234,10 +314,16 @@ export function ApiKeysManager() {
       {/* Recent requests table */}
       <RecentRequests usage={usage} loading={usageQuery.isLoading} />
 
+      {/* OpenAPI spec explorer */}
+      <OpenApiExplorer />
+
       {/* Revoked keys audit */}
       <div ref={revokedRef} className="scroll-mt-24">
         <RevokedKeysAudit />
       </div>
+
+      {/* Settings audit log (create / edit / revoke history) */}
+      <AuditLogPanel />
 
       {/* Security note */}
       <SecurityNote />
@@ -538,16 +624,7 @@ function KeyRow({
       </TableCell>
       <TableCell className="py-3 align-top">
         {apiKey.expiresAt ? (
-          <span
-            className={cn(
-              'text-xs',
-              isExpired
-                ? 'text-rose-500 font-medium'
-                : 'text-muted-foreground',
-            )}
-          >
-            {format(new Date(apiKey.expiresAt), 'PP')}
-          </span>
+          <ExpiryCell expiresAt={apiKey.expiresAt} isExpired={!!isExpired} />
         ) : (
           <span className="text-xs text-muted-foreground">Never</span>
         )}
@@ -790,6 +867,77 @@ function StatusBadge({ status }: { status: number }) {
     <span className={cn('font-mono text-xs px-1.5 py-0.5 rounded', tone)}>
       {status}
     </span>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Expiry cell — shows date + warning chip if expiring soon
+// ---------------------------------------------------------------------------
+
+function ExpiryCell({
+  expiresAt,
+  isExpired,
+}: {
+  expiresAt: string
+  isExpired: boolean
+}) {
+  const date = new Date(expiresAt)
+  const msRemaining = date.getTime() - Date.now()
+  const daysRemaining = Math.ceil(msRemaining / (24 * 60 * 60 * 1000))
+
+  // Expired
+  if (isExpired) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex items-center gap-1 text-xs text-rose-500 font-medium cursor-default">
+            <CalendarClock className="size-3" />
+            Expired
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="top" className="text-xs">
+          Expired {format(date, 'PPpp')}
+        </TooltipContent>
+      </Tooltip>
+    )
+  }
+
+  // Expiring soon (within 7 days)
+  if (daysRemaining <= 7) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300 cursor-default">
+            <CalendarClock className="size-3" />
+            {daysRemaining <= 0
+              ? 'today'
+              : daysRemaining === 1
+                ? '1 day'
+                : `${daysRemaining}d`}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="top" className="text-xs">
+          <div>Expires {format(date, 'PPpp')}</div>
+          <div className="text-muted-foreground">
+            Consider rotating this key soon.
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    )
+  }
+
+  // Normal expiry
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="text-xs text-muted-foreground cursor-default">
+          {format(date, 'PP')}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="text-xs">
+        {format(date, 'PPpp')}
+      </TooltipContent>
+    </Tooltip>
   )
 }
 

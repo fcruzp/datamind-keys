@@ -242,6 +242,55 @@ STATUS=$(curl -s -o /dev/null --max-time 10 -w "%{http_code}" "$BASE/api/public/
 assert_eq "status (should be 403, IPv4 not in IPv6 CIDR)" "403" "$STATUS"
 echo
 
+# ─── 17. OpenAPI spec ──────────────────────────────────────────────────────
+echo "▶ Test 17: OpenAPI 3.1 spec endpoint"
+OAS_STATUS=$(curl -s -o /tmp/oas.json --max-time 10 -w "%{http_code}" "$BASE/api/openapi.json")
+assert_eq "status" "200" "$OAS_STATUS"
+OAS_VERSION=$(python3 -c "import json; d=json.load(open('/tmp/oas.json')); print(d.get('openapi',''))")
+assert_eq "openapi version" "3.1.0" "$OAS_VERSION"
+OAS_PATHS=$(python3 -c "import json; d=json.load(open('/tmp/oas.json')); print(len(d.get('paths',{})))")
+assert_eq "paths count (4 endpoints)" "4" "$OAS_PATHS"
+OAS_HAS_ME=$(python3 -c "import json; d=json.load(open('/tmp/oas.json')); print('yes' if '/api/public/v1/me' in d.get('paths',{}) else 'no')")
+assert_eq "spec includes /me endpoint" "yes" "$OAS_HAS_ME"
+OAS_SECURITY=$(python3 -c "import json; d=json.load(open('/tmp/oas.json')); print('yes' if 'bearerAuth' in d.get('components',{}).get('securitySchemes',{}) else 'no')")
+assert_eq "spec defines bearerAuth security scheme" "yes" "$OAS_SECURITY"
+echo
+
+# ─── 18. Audit log ─────────────────────────────────────────────────────────
+echo "▶ Test 18: Settings audit log endpoint"
+AUDIT_STATUS=$(curl -s -o /tmp/audit.json --max-time 10 -w "%{http_code}" "$BASE/api/settings/api-keys/audit")
+assert_eq "status" "200" "$AUDIT_STATUS"
+# The audit log should contain at least 1 create entry (from earlier test keys)
+AUDIT_CREATE_COUNT=$(python3 -c "import json; d=json.load(open('/tmp/audit.json')); print(sum(1 for e in d['entries'] if e['action']=='api_key.create'))")
+[ "$AUDIT_CREATE_COUNT" -ge 1 ] && assert_eq "has create entries" "yes" "yes" || assert_eq "has create entries" "yes" "no"
+# Verify each entry has required fields
+AUDIT_FIELDS=$(python3 -c "
+import json
+d=json.load(open('/tmp/audit.json'))
+required = ['id','action','apiKeyId','apiKeyLabel','diff','ip','createdAt']
+ok = all(all(k in e for k in required) for e in d['entries'][:5])
+print('yes' if ok else 'no')
+")
+assert_eq "entries have required fields" "yes" "$AUDIT_FIELDS"
+# Test 18b: verify an UPDATE entry has before/after diff
+AUDIT_DIFF=$(python3 -c "
+import json
+d=json.load(open('/tmp/audit.json'))
+update_entries = [e for e in d['entries'] if e['action']=='api_key.update']
+if not update_entries:
+    print('skip')
+else:
+    e = update_entries[0]
+    diff = e['diff']
+    # diff should be a dict with at least one changed field having before/after
+    ok = any(isinstance(v, dict) and 'before' in v and 'after' in v for v in diff.values())
+    print('yes' if ok else 'no')
+")
+if [ "$AUDIT_DIFF" != "skip" ]; then
+  assert_eq "update entry has before/after diff" "yes" "$AUDIT_DIFF"
+fi
+echo
+
 # ─── Cleanup ────────────────────────────────────────────────────────────────
 echo "▶ Cleanup: revoking test keys"
 curl -s --max-time 10 "$BASE/api/settings/api-keys" | python3 -c "

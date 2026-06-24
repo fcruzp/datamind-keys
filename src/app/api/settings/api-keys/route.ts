@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import {
+  auditContext,
   generateApiKey,
   getDemoUser,
   maskApiKey,
@@ -9,6 +10,7 @@ import {
   parseScopes,
   serializeAllowedIps,
   serializeScopes,
+  writeAuditLog,
   type ApiScope,
 } from '@/lib/api-auth'
 
@@ -149,6 +151,25 @@ export async function POST(req: Request) {
       rateLimitPerMinute: rateLimitPerMinute ?? null,
       expiresAt,
     },
+  })
+
+  // Audit: record creation (no plaintext, no hash — just metadata)
+  const ctx = auditContext(req)
+  await writeAuditLog({
+    userId: user.id,
+    action: 'api_key.create',
+    apiKeyId: created.id,
+    apiKeyLabel: created.label,
+    diff: {
+      label: created.label,
+      scopes: parseScopes(created.scopes),
+      allowedIps: parseAllowedIps(created.allowedIps),
+      rateLimitPerMinute: created.rateLimitPerMinute,
+      expiresAt: created.expiresAt?.toISOString() ?? null,
+      keyPrefix: created.keyPrefix,
+    },
+    ip: ctx.ip,
+    userAgent: ctx.userAgent,
   })
 
   return NextResponse.json(

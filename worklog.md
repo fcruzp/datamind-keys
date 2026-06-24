@@ -537,3 +537,226 @@ Unresolved issues / next-phase recommendations:
    - Add Enter-key handling on active keyboard-nav row
    - Add SettingsAuditLog model + UI
    - Consider Redis-backed rate limiting
+
+---
+Task ID: 4 (cron-triggered review #4 — orchestrator)
+Agent: main (Z.ai Code)
+Task: Continue Round 4 — tackle next-phase recommendations from Round 3:
+OpenAPI spec, SettingsAuditLog, key expiration warnings, Enter-key handler,
+styling polish.
+
+Work Log:
+- Reviewed worklog.md Round 3 recommendations. App was healthy (200s on all
+  routes, 37/37 integration tests passing, lint clean). Selected 4 priority
+  features for this round from the 7 recommendations.
+- **OpenAPI 3.1 spec endpoint** (rec #2):
+  - Created `/api/openapi.json` route returning a full OpenAPI 3.1 spec
+    covering all 4 public API endpoints (/me, /datasources, /dashboards,
+    /queries).
+  - Spec includes: bearerAuth security scheme, component schemas (User,
+    ApiKey, Error, Datasource, Dashboard, QueryRequest, QueryResponse), all
+    response codes (200/401/403/429/400/422), rate-limit headers in
+    response schemas, tags (account/datasources/dashboards/queries), and
+    production + sandbox server URLs.
+  - Importable by OpenFN, N8N, Postman, Swagger UI directly via URL.
+- **Interactive OpenAPI explorer component** (`openapi-explorer.tsx`):
+  - Collapsible panel with sidebar listing all endpoints (method + path).
+  - Color-coded HTTP method badges (GET=emerald, POST=sky, etc.).
+  - Operation detail view with summary, description, full URL.
+  - **"Try it live" form**: bearer token input (password-masked), JSON
+    request body editor (for POST), send button.
+  - Live response panel: status code badge, latency, response headers
+    (filtered to rate-limit + content-type), pretty-printed JSON body.
+  - "Possible responses" reference showing all documented status codes.
+  - Copy spec to clipboard + download as `datamind-bi-openapi.json`.
+  - Direct link to docs.
+- **SettingsAuditLog Prisma model** (rec #6):
+  - Added `SettingsAuditLog` model: id, userId, action, apiKeyId,
+    apiKeyLabel (denormalized for post-deletion audit), diff (JSON string),
+    ip, userAgent, createdAt. Indexed on [userId, createdAt], [apiKeyId],
+    [action].
+  - Ran `bun run db:push` — schema applied cleanly.
+- **Audit log writer in api-auth.ts**:
+  - Added `writeAuditLog(entry)` helper — best-effort (never throws), JSON-
+    stringifies the diff before storage.
+  - Added `auditContext(req)` helper that extracts IP + user-agent from a
+    Request for the audit entry.
+  - Exported `AuditAction` type = `'api_key.create' | 'api_key.update' |
+    'api_key.revoke'`.
+- **Audit log writes wired into all 3 management handlers**:
+  - POST `/api/settings/api-keys`: writes `api_key.create` with diff
+    containing label/scopes/allowedIps/rateLimitPerMinute/expiresAt/
+    keyPrefix (no plaintext, no hash).
+  - PATCH `/api/settings/api-keys/[id]`: writes `api_key.update` with a
+    before/after diff per changed field (label, allowedIps,
+    rateLimitPerMinute). Skips unchanged fields.
+  - DELETE `/api/settings/api-keys/[id]`: writes `api_key.revoke` with
+    revokedAt timestamp + keyPrefix.
+  - Fixed a bug: in PATCH handler, `const ctx = auditContext(req)` clashed
+    with the Next.js route context param name `ctx` — renamed to
+    `auditCtx`. Caught by Turbopack at compile time.
+- **Audit log API endpoint** (`/api/settings/api-keys/audit`):
+  - GET returns the last 100 audit entries for the current user, newest
+    first. Parses the diff JSON string back to an object before returning.
+- **Audit log UI panel** (`audit-log-panel.tsx`):
+  - Collapsible panel with table: Action / Key / Change / IP / When.
+  - Action badges with icons + colored tones: Created (emerald + Plus),
+    Edited (sky + Pencil), Revoked (rose + Trash2).
+  - DiffSummary component renders action-specific summaries:
+    - create: DiffChips for scopes, IPs, rate, expires.
+    - update: DiffBeforeAfter chips with strikethrough old value + arrow →
+      + new value (truncated to 24 chars).
+    - revoke: timestamp of revocation.
+  - Sticky table header, max-h-96 with overflow-y-auto.
+  - Empty state with clipboard icon.
+  - Fetches only when expanded (enabled: open).
+- **Key expiration warnings** (rec #4):
+  - Added `ExpiryCell` component in KeyRow with 3 visual states:
+    - Expired: rose "Expired" label with calendar icon.
+    - Expiring soon (≤7 days): amber bordered chip showing "1 day" / "3d"
+      / "today", with tooltip "Expires {date} — Consider rotating this key
+      soon."
+    - Normal: muted date with tooltip.
+  - Added "expiring soon" filter: amber chip in keys card header shows
+    count, click to toggle filter. When active, table shows only keys
+    expiring within 7 days (or already expired).
+  - Added Filter button in card header actions (hidden on mobile, text
+    shows "Expiring soon" / "Show all").
+  - Empty filter state: green checkmark + "No keys expiring soon" message
+    + "Clear filter" button.
+  - Created demo keys exercising both states: "Cron webhook" (1 day),
+    "N8N sync (rotating)" (3 days).
+- **Enter-key handler on keyboard-nav rows** (rec #7 from Round 3):
+  - Updated `useRowKeyboardNav` hook to accept optional `onActivate`
+    callback. Uses `onActivateRef` (synced via useEffect, not during
+    render) so the latest callback fires without stale closures.
+  - Pressing Enter when a row is active calls `onActivate(rowId)`.
+  - In `api-keys-manager.tsx`, `handleActivateRow` finds the row's Edit
+    button via `[data-row-id="${rowId}"] [aria-label^="Edit "]` and clicks
+    it programmatically — opens the EditApiKeyDialog.
+  - Updated kbd hint in card header to include "Enter to edit".
+- **Styling polish**:
+  - Filter chip animates between active/inactive with `transition-colors`.
+  - Expiring-soon chip has bordered amber tone matching the IP allowlist
+    chip pattern.
+  - Audit log action badges use the same color palette as the existing
+    method badges (emerald/sky/rose).
+  - OpenAPI explorer uses a 2-column layout (sidebar + detail) on large
+    screens, stacked on mobile.
+  - Response panel uses the same dark code block (`bg-zinc-950`) as the
+    hero curl example for visual consistency.
+- **Integration test additions** (in `scripts/test-api-keys.sh`):
+  - Test 17: OpenAPI spec endpoint (5 assertions) — status, version
+    "3.1.0", 4 paths, /me present, bearerAuth defined.
+  - Test 18: Audit log endpoint (4 assertions) — status, has create
+    entries, entries have required fields, update entries have before/after
+    diff.
+  - Total assertions: 46 (up from 37).
+- **Verification**:
+  - `bun run lint` → clean, 0 errors.
+  - `bash scripts/test-api-keys.sh` → ALL PASSED (46 assertions).
+  - Audit log: 30 entries across all 3 action types (16 create, 12
+    revoke, 2 update).
+  - agent-browser QA: full page renders, all 4 new sections visible
+    (OpenAPI explorer, audit log panel, expiring-soon filter, expiry
+    chips). No console errors.
+  - VLM (glm-4.6v) verification of screenshots:
+    - round4-desktop-full.png: confirms keys table shows expiring-soon
+      amber chips with calendar icons, IP allowlist chips, rate-limit
+      chips. New sections visible. No visual bugs.
+    - round4-audit-log-full.png: confirms all 3 action badges (Created
+      green, Edited blue, Revoked red) visible. Before→after diff chips
+      shown for edited rows.
+- **Dev server restart issue**: deleting `.next/` while Turbopack was
+  running corrupted its RocksDB cache. The dev server had to be killed and
+  restarted (the system supervisor doesn't auto-restart killed processes).
+  Workaround used throughout this round: start `bun run dev` via
+  `setsid bash -c 'exec bun run dev > dev.log 2>&1' < /dev/null > /dev/null 2>&1 &`
+  in each Bash session, since the system process reaper kills child
+  processes when the shell session ends.
+
+Stage Summary:
+- **Status**: ✅ Round 4 complete and verified end-to-end.
+- **New features shipped**:
+  1. OpenAPI 3.1 spec endpoint (`/api/openapi.json`) — importable by
+     OpenFN, N8N, Postman, Swagger
+  2. Interactive OpenAPI explorer with live "Try it" form (bearer token,
+     JSON body editor, response panel with status/headers/latency)
+  3. SettingsAuditLog Prisma model + writeAuditLog helper + auditContext
+     helper in api-auth.ts
+  4. Audit log writes on POST (create) / PATCH (update with before/after
+     diff) / DELETE (revoke) handlers
+  5. Audit log API endpoint (`/api/settings/api-keys/audit`)
+  6. AuditLogPanel UI component with action badges + diff chips + IP +
+     timestamps + empty state
+  7. Key expiration warnings: 3-state ExpiryCell (expired / expiring soon /
+     normal) with tooltips
+  8. "Expiring soon" filter toggle in keys card header (amber chip + Filter
+     button) with dedicated empty state
+  9. Enter-key handler on keyboard-nav rows — opens Edit dialog
+  10. 9 new integration test assertions (5 for OpenAPI, 4 for audit log)
+- **Artifacts produced**:
+  - `prisma/schema.prisma` — added SettingsAuditLog model
+  - `src/lib/api-auth.ts` — writeAuditLog, auditContext, AuditAction type
+  - `src/app/api/openapi.json/route.ts` — new, full OpenAPI 3.1 spec
+  - `src/app/api/settings/api-keys/audit/route.ts` — new, audit log list
+  - `src/app/api/settings/api-keys/route.ts` — POST writes create audit
+  - `src/app/api/settings/api-keys/[id]/route.ts` — PATCH writes update
+    audit with diff; DELETE writes revoke audit
+  - `src/components/api-keys/openapi-explorer.tsx` — new, 360 lines
+  - `src/components/api-keys/audit-log-panel.tsx` — new, 280 lines
+  - `src/components/api-keys/use-row-keyboard-nav.ts` — added onActivate
+    option + Enter handler
+  - `src/components/api-keys/api-keys-manager.tsx` — wired OpenApiExplorer
+    + AuditLogPanel + expiringOnly filter state + handleActivateRow +
+    ExpiryCell component
+  - `scripts/test-api-keys.sh` — added Tests 17 (OpenAPI) + 18 (audit log)
+  - QA screenshots: round4-baseline.png, round4-desktop-full.png,
+    round4-keys-table.png, round4-openapi-explorer.png,
+    round4-audit-log.png, round4-audit-log-full.png,
+    round4-expiring-filter.png, round4-keyboard-nav.png,
+    round4-command-palette.png, round4-curl-copied.png
+- **Verification**:
+  - `bun run lint` → 0 errors
+  - `bash scripts/test-api-keys.sh` → ALL PASSED (46 assertions)
+  - Audit log: 30 entries (16 create / 12 revoke / 2 update)
+  - VLM (glm-4.6v) verified 2 screenshots — all features render correctly,
+    no visual bugs
+
+Unresolved issues / next-phase recommendations:
+1. **OpenAPI spec is hand-maintained** — if a route handler changes (e.g.
+   new query param, new response field), the spec drifts. Next phase:
+   auto-generate from Zod schemas + route metadata, OR use a library like
+   `@asteasolutions/zod-to-openapi` to derive the spec from the same Zod
+   schemas the routes already validate with.
+2. **Try-it form sends plaintext key to the browser** — by design (the user
+   is testing their own key), but the openapi-explorer stores the key in
+   component state. Consider adding a "forget key" button or auto-clearing
+   on unmount.
+3. **No webhook on revoke/rate-limit** — when a key is revoked or hits 429,
+   it would be useful to fire a webhook to the key owner. Requires a
+   Webhook model (url + secret) + a fire-and-forget dispatcher.
+4. **Audit log doesn't capture public API auth failures** — only management
+   actions (create/update/revoke) are audited. For security forensics,
+   consider logging failed auth attempts (401/403/429) to a separate
+   SecurityEventLog.
+5. **No audit log retention policy** — entries accumulate forever. Add a
+   `pruneOldAuditEntries(days=365)` job that runs on a schedule.
+6. **No audit log export** — compliance teams may want CSV/JSON export of
+   the audit trail. Add a `?format=csv` query param to the audit endpoint.
+7. **OpenAPI explorer doesn't show request/response examples** — the spec
+   has example values but the UI doesn't render them. Could add a
+   "Examples" section per operation.
+8. **Expiring-soon filter doesn't persist across reloads** — state is
+   component-local. Could sync to URL query param (?filter=expiring) for
+   shareable links.
+9. **Cron review cadence** — the recurring webDevReview cron (job 228854)
+   fires every 15 min. Future runs should:
+   - Auto-generate OpenAPI spec from Zod schemas (eliminate drift)
+   - Add webhook on revoke (Webhook model + dispatcher)
+   - Add SecurityEventLog for auth failures
+   - Add audit log retention pruning
+   - Add CSV audit log export
+   - Sync expiring-soon filter to URL
+   - Add request/response examples to OpenAPI explorer
+   - Add a "Copy as JavaScript fetch" button next to "Copy curl"

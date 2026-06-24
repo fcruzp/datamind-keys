@@ -71,3 +71,26 @@ model ApiRequestLog {
   @@index([apiKeyId, createdAt])
   @@index([createdAt])
 }
+
+/// Audit trail for management actions on API keys (create / edit / revoke).
+/// Used to satisfy compliance: "who did what, when".
+model SettingsAuditLog {
+  id          String   @id @default(cuid())
+  userId      String
+  /// "api_key.create" | "api_key.update" | "api_key.revoke"
+  action      String
+  /// Target API key id (null only if action target was unknown)
+  apiKeyId    String?
+  /// Target API key label (denormalized for human-readable audit even after key is deleted)
+  apiKeyLabel String?
+  /// JSON snapshot of the change. For create: full new record (minus hash).
+  /// For update: { before: {...}, after: {...} }. For revoke: { revokedAt }.
+  diff        String   @default("{}")
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([apiKeyId])
+  @@index([action])
+}

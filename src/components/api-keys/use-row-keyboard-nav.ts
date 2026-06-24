@@ -6,20 +6,29 @@ import * as React from 'react'
  * Hook that enables ↑/↓ keyboard navigation through table rows.
  * - ArrowDown / ArrowUp move the focus between rows
  * - Home / End jump to first / last row
+ * - Enter activates the active row (calls `onActivate`)
  * - The focused row gets a visible ring; the active element's data-row-id
  *   is exposed via `activeRowId` so the parent can react (e.g. scroll into view)
  *
  * Usage:
- *   const { activeRowId, rowProps } = useRowKeyboardNav(rowIds)
+ *   const { activeRowId, rowProps } = useRowKeyboardNav(rowIds, { onActivate: (id) => openEdit(id) })
  *   <TableRow {...rowProps(row.id)}>...</TableRow>
  *
  * The hook attaches a keydown listener to the container returned by
  * `containerProps`. Pressing ↑/↓ when focus is inside the container moves
  * the active row.
  */
-export function useRowKeyboardNav(rowIds: string[]) {
+export function useRowKeyboardNav(
+  rowIds: string[],
+  options?: { onActivate?: (rowId: string) => void },
+) {
   const [activeIndex, setActiveIndex] = React.useState<number>(-1)
   const containerRef = React.useRef<HTMLDivElement>(null)
+  const onActivateRef = React.useRef(options?.onActivate)
+  // Keep the ref in sync with the latest callback (without touching it during render)
+  React.useEffect(() => {
+    onActivateRef.current = options?.onActivate
+  }, [options?.onActivate])
 
   const activeRowId = activeIndex >= 0 ? rowIds[activeIndex] : null
 
@@ -60,9 +69,18 @@ export function useRowKeyboardNav(rowIds: string[]) {
           setActiveIndex(rowIds.length - 1)
           break
         }
+        case 'Enter': {
+          // Only fire if a row is active
+          if (activeIndex >= 0 && onActivateRef.current) {
+            e.preventDefault()
+            const id = rowIds[activeIndex]
+            if (id) onActivateRef.current(id)
+          }
+          break
+        }
       }
     },
-    [rowIds.length],
+    [rowIds, activeIndex],
   )
 
   // Scroll the active row into view when it changes
@@ -80,7 +98,7 @@ export function useRowKeyboardNav(rowIds: string[]) {
     onKeyDown: handleKeyDown,
     tabIndex: 0,
     role: 'grid' as const,
-    'aria-label': 'API keys table. Use arrow keys to navigate rows.',
+    'aria-label': 'API keys table. Use arrow keys to navigate rows. Press Enter to edit.',
   }
 
   const rowProps = (rowId: string) => ({
