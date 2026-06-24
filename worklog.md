@@ -1913,3 +1913,47 @@ Unresolved Issues / Risks:
   `settings_audit_logs` before relying on audit data.
 - Supabase Auth redirect URLs must be configured (Site URL =
   `https://datamind-api.mooo.com`) for the sign-in flow to work.
+
+---
+Task ID: 8 (main agent — post-deploy QA + SSL explanation)
+Agent: main (Z.ai Code)
+Task: User confirmed the app is live and login works. Two questions:
+1) Why does the browser say "Not secure"?
+2) How to test that everything is working (no console errors)?
+
+Work Log:
+- Analyzed user's screenshot of https://datamind-api.mooo.com via VLM.
+  - User is logged in as Francisco Cruz (fcruzp@gmail.com).
+  - Dashboard renders: hero, stats cards, quickstart, endpoints, integrations.
+  - VLM noted stats cards show "undefined" — investigated root cause.
+- Reviewed dashboard-view.tsx + usage/route.ts + withDbSafe fallback.
+  - Root cause: withDbSafe's GET fallback payload was missing `totals` and
+    `hourlyHistogram` fields that the dashboard usage query expects. When the
+    usage API hit a DB error, `totals` was undefined → dashboard showed "—"
+    (not literally "undefined", but empty state).
+  - Fix: added `totals: { requests7d: 0, avgDurationMs: 0, lastRequestAt: null }`
+    and `hourlyHistogram: new Array(24).fill(0)` to the fallback payload.
+- Committed fix: 1372e45 "Improve withDbSafe fallback..."
+- Pushed to GitHub main.
+- Explained "Not secure" warning: this is an SSL certificate issue. The URL
+  is https:// but Chrome shows "Not secure" because the cert is invalid
+  (self-signed, expired, wrong domain, or untrusted issuer). In Coolify,
+  this means Let's Encrypt failed to provision. User must check the
+  resource's "SSL Certificates" / "HTTPS" section in Coolify.
+- Provided comprehensive testing guide (DevTools console, Network tab,
+  create API key, test public API with curl, check audit logs).
+
+Stage Summary:
+- App is live and working at https://datamind-api.mooo.com
+- Login works (Supabase Auth)
+- Minor fix pushed: withDbSafe fallback now includes dashboard fields
+- User needs to: bump CACHEBUST → 7 in Coolify, redeploy to get the fix
+- User needs to: fix SSL certificate in Coolify (Let's Encrypt) to remove
+  the "Not secure" warning
+- Testing guide provided for end-to-end verification
+
+Unresolved Issues / Risks:
+- SSL certificate not properly provisioned (browser shows "Not secure")
+- The "undefined" stats display may still appear if the usage API returns
+  401 (unauthenticated) — but user confirmed no console errors, so the
+  API is likely returning 200 with proper data.
