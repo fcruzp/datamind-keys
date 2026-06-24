@@ -210,7 +210,7 @@ function Tooltip({
 
 /**
  * Renders a one-line summary of what changed in the audit entry.
- * - create: shows scopes + IP allowlist count + rate limit
+ * - create: shows scopes + expiry
  * - update: shows only the changed fields with before → after
  * - revoke: shows when revoked
  */
@@ -223,17 +223,10 @@ function DiffSummary({
 }) {
   if (action === 'api_key.create') {
     const scopes = (diff.scopes as string[] | undefined) ?? []
-    const allowedIps = (diff.allowedIps as string[] | undefined) ?? []
-    const rate = diff.rateLimitPerMinute as number | null | undefined
     const expiresAt = diff.expiresAt as string | null | undefined
     return (
       <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
         <DiffChip label="scopes" value={scopes.join(', ') || 'none'} />
-        <DiffChip label="IPs" value={String(allowedIps.length)} />
-        <DiffChip
-          label="rate"
-          value={rate == null ? '60/min (default)' : `${rate}/min`}
-        />
         {expiresAt ? (
           <DiffChip
             label="expires"

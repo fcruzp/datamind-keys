@@ -6,8 +6,6 @@ export interface ApiKeyListItem {
   keyMasked: string
   keyPrefix: string
   scopes: ApiScope[]
-  allowedIps: string[]
-  rateLimitPerMinute: number | null
   lastUsedAt: string | null
   lastUsedIp: string | null
   expiresAt: string | null
@@ -19,8 +17,6 @@ export interface RevokedApiKey {
   label: string
   keyMasked: string
   scopes: ApiScope[]
-  allowedIps: string[]
-  rateLimitPerMinute: number | null
   lastUsedAt: string | null
   lastUsedIp: string | null
   expiresAt: string | null
@@ -34,8 +30,6 @@ export interface CreatedApiKey {
   plaintext: string
   keyMasked: string
   scopes: ApiScope[]
-  allowedIps: string[]
-  rateLimitPerMinute: number | null
   expiresAt: string | null
   createdAt: string
 }

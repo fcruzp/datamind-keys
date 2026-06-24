@@ -1,7 +1,17 @@
-import { createHash, randomBytes, randomUUID } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import { db } from '@/lib/db'
 import type { NextRequest } from 'next/server'
 import { getCurrentUser, type SessionUser } from '@/lib/session'
+
+// ===========================================================================
+// API authentication + authorization layer
+// ===========================================================================
+// FULL INTEGRATION: The `api_keys` table is shared with BIweb and does NOT
+// have `allowed_ips` or `rate_limit_per_minute` columns. Those features have
+// been removed from persistence:
+//   - Rate limiting is now in-memory only, using the global default (60/min).
+//   - IP allowlisting is removed (always allows).
+// ===========================================================================
 
 // ---------------------------------------------------------------------------
 // Types
@@ -12,12 +22,15 @@ export type ApiScope = 'read' | 'execute' | 'admin'
 export const ALL_SCOPES: ApiScope[] = ['read', 'execute', 'admin']
 
 export interface AuthenticatedUser {
+  /** users.id (cuid) — used as FK for api_keys.user_id */
   id: string
+  /** users.supabase_id (UUID) — used for settings_audit_logs.user_id */
+  supabaseId: string
   email: string
   name: string | null
-  /** Tenant / workspace name this user belongs to. */
+  /** Tenant / workspace name this user belongs to (derived). */
   tenantName?: string
-  /** User role within the tenant: "owner" | "admin" | "viewer". */
+  /** User role: "user" | "admin". */
   role?: string
 }
 
@@ -27,8 +40,6 @@ export interface AuthenticatedApiKey {
   scopes: ApiScope[]
   prefix: string
   lastUsedAt: Date | null
-  allowedIps: string[]
-  rateLimitPerMinute: number | null
 }
 
 export interface AuthSuccess {
@@ -58,30 +69,28 @@ export interface AuthFailure {
 export type AuthResult = AuthSuccess | AuthFailure
 
 // ---------------------------------------------------------------------------
-// Current-user resolution (multi-tenant)
-//
-// The sandbox simulates "logged-in user" with a cookie (see src/lib/session.ts).
-// In real DataMind BI this would resolve the Supabase session user instead.
-//
-// `getDemoUser()` is kept as a thin backwards-compatible wrapper, but new
-// code should call `getCurrentUser(req)` directly so the cookie is honoured.
+// Current-user resolution
 // ---------------------------------------------------------------------------
 
 /**
- * @deprecated Use `getCurrentUser(req)` from `@/lib/session` instead.
- * Returns the sandbox user bound to the current request's session cookie,
- * falling back to the default demo tenant when no cookie is set.
+ * Returns the current user from the Supabase Auth session.
+ * In integrated mode there is no demo-cookie fallback — if no Supabase
+ * session exists, this throws so the caller can return 401.
  */
 export async function getDemoUser(
   req?: NextRequest,
 ): Promise<AuthenticatedUser> {
   const u = await getCurrentUser(req)
+  if (!u) {
+    throw new Error('Not authenticated')
+  }
   return toAuthenticatedUser(u)
 }
 
 export function toAuthenticatedUser(u: SessionUser): AuthenticatedUser {
   return {
     id: u.id,
+    supabaseId: u.supabaseId,
     email: u.email,
     name: u.name,
     tenantName: u.tenantName,
@@ -224,21 +233,9 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
     return { ok: false, error: 'API key has expired.', status: 401 }
   }
 
-  // IP allowlist check (strict if allowlist non-empty)
-  const clientIp = getClientIp(req)
-  const allowlist = parseAllowedIps(apiKey.allowedIps)
-  if (!isIpAllowed(clientIp, allowlist)) {
-    return {
-      ok: false,
-      error: `IP ${clientIp ?? '(unknown)'} is not in this key's IP allowlist.`,
-      status: 403,
-    }
-  }
-
-  // Rate limit (token bucket per key)
-  const rateLimitPerMinute = apiKey.rateLimitPerMinute
-  const limit = rateLimitPerMinute ?? DEFAULT_RATE_LIMIT_PER_MINUTE
-  const rate = checkRateLimit(apiKey.id, rateLimitPerMinute)
+  // Rate limit (in-memory token bucket per key, global default 60/min)
+  const limit = DEFAULT_RATE_LIMIT_PER_MINUTE
+  const rate = checkRateLimit(apiKey.id)
   if (!rate.ok) {
     return {
       ok: false,
@@ -256,7 +253,7 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
   db.apiKey
     .update({
       where: { id: apiKey.id },
-      data: { lastUsedAt: new Date(), lastUsedIp: clientIp },
+      data: { lastUsedAt: new Date(), lastUsedIp: getClientIp(req) },
     })
     .catch(() => {
       /* best-effort, ignore */
@@ -266,9 +263,9 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
     ok: true,
     user: {
       id: apiKey.user.id,
+      supabaseId: apiKey.user.supabaseId,
       email: apiKey.user.email,
       name: apiKey.user.name,
-      tenantName: apiKey.user.tenantName,
       role: apiKey.user.role,
     },
     apiKey: {
@@ -277,8 +274,6 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
       scopes: parseScopes(apiKey.scopes),
       prefix: apiKey.keyPrefix,
       lastUsedAt: apiKey.lastUsedAt,
-      allowedIps: allowlist,
-      rateLimitPerMinute,
     },
     rateLimit: {
       limit,
@@ -321,7 +316,6 @@ export async function logApiRequest(params: {
   try {
     await db.apiRequestLog.create({
       data: {
-        id: randomUUID(),
         apiKeyId: params.apiKeyId,
         endpoint: params.endpoint,
         method: params.method,
@@ -337,164 +331,10 @@ export async function logApiRequest(params: {
 }
 
 // ---------------------------------------------------------------------------
-// IP allowlist
+// In-memory rate limiting (token bucket per API key)
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_RATE_LIMIT_PER_MINUTE = 60
-
-export function parseAllowedIps(json: string): string[] {
-  try {
-    const parsed = JSON.parse(json) as unknown
-    if (!Array.isArray(parsed)) return []
-    return parsed
-      .filter((x): x is string => typeof x === 'string')
-      .map((s) => s.trim())
-      .filter(Boolean)
-  } catch {
-    return []
-  }
-}
-
-export function serializeAllowedIps(ips: string[]): string {
-  return JSON.stringify([...new Set(ips.map((s) => s.trim()).filter(Boolean))])
-}
-
-/**
- * Validates a client IP against the key's allowlist.
- * - Empty allowlist → allow all
- * - Otherwise the IP must match exactly OR fall within a CIDR range
- *   Supports both IPv4 (e.g. "10.0.0.0/8") and IPv6 (e.g. "2001:db8::/32").
- *
- * Returns true if allowed (or if allowlist is empty / client IP unknown).
- */
-export function isIpAllowed(clientIp: string | null, allowlist: string[]): boolean {
-  if (!allowlist.length) return true
-  if (!clientIp) return false // strict: if allowlist set but no IP detected, deny
-
-  // Strip IPv6-mapped IPv4 prefix "::ffff:"
-  const ip = clientIp.startsWith('::ffff:') ? clientIp.slice(7) : clientIp
-
-  for (const rule of allowlist) {
-    if (rule === ip || rule === clientIp) return true
-    if (rule.includes('/')) {
-      // CIDR — dispatch by IP version
-      const isV4 = ip.includes('.') && !ip.includes(':')
-      const ruleIsV4 = rule.includes('.') && !rule.includes(':')
-      if (isV4 && ruleIsV4) {
-        if (ipInV4Cidr(ip, rule)) return true
-      } else if (!isV4 && !ruleIsV4) {
-        if (ipInV6Cidr(ip, rule)) return true
-      }
-    }
-  }
-  return false
-}
-
-function ipInV4Cidr(ip: string, cidr: string): boolean {
-  const [base, bitsStr] = cidr.split('/')
-  if (!base || !bitsStr) return false
-  const bits = parseInt(bitsStr, 10)
-  if (isNaN(bits) || bits < 0 || bits > 32) return false
-
-  const ipParts = ip.split('.').map((p) => parseInt(p, 10))
-  const baseParts = base.split('.').map((p) => parseInt(p, 10))
-  if (ipParts.length !== 4 || baseParts.length !== 4) return false
-  if (ipParts.some((p) => isNaN(p) || p < 0 || p > 255)) return false
-  if (baseParts.some((p) => isNaN(p) || p < 0 || p > 255)) return false
-
-  const ipNum =
-    (ipParts[0]! << 24) | (ipParts[1]! << 16) | (ipParts[2]! << 8) | ipParts[3]!
-  const baseNum =
-    (baseParts[0]! << 24) | (baseParts[1]! << 16) | (baseParts[2]! << 8) | baseParts[3]!
-  // Note: the >>> 0 coerces to unsigned 32-bit (the bitwise ops above produce signed)
-  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
-  return (ipNum >>> 0) & mask === (baseNum >>> 0) & mask
-}
-
-/**
- * IPv6 CIDR check using BigInt (128-bit). Normalizes both IPs to full
- * 8-group hex form before comparing.
- */
-function ipInV6Cidr(ip: string, cidr: string): boolean {
-  const [base, bitsStr] = cidr.split('/')
-  if (!base || !bitsStr) return false
-  const bits = parseInt(bitsStr, 10)
-  if (isNaN(bits) || bits < 0 || bits > 128) return false
-
-  const ipBig = ipv6ToBigInt(ip)
-  const baseBig = ipv6ToBigInt(base)
-  if (ipBig === null || baseBig === null) return false
-
-  if (bits === 0) return true
-  if (bits === 128) return ipBig === baseBig
-
-  // Build a 128-bit mask: top `bits` bits set, rest 0
-  const mask = 0xffff_ffff_ffff_ffffn << 64n | 0xffff_ffff_ffff_ffffn
-  const shift = BigInt(128 - bits)
-  const maskShifted = (mask >> shift) << shift
-  return (ipBig & maskShifted) === (baseBig & maskShifted)
-}
-
-/**
- * Converts an IPv6 address (possibly compressed, with ::) to a BigInt.
- * Returns null if the input is not a valid IPv6 address.
- */
-function ipv6ToBigInt(ip: string): bigint | null {
-  // Handle IPv4-mapped IPv6 (::ffff:1.2.3.4)
-  const v4MappedMatch = ip.match(/^(.*):(\d+)\.(\d+)\.(\d+)\.(\d+)$/)
-  if (v4MappedMatch) {
-    const [, prefix, a, b, c, d] = v4MappedMatch
-    const v4Part =
-      (BigInt(a!) << 24n) | (BigInt(b!) << 16n) | (BigInt(c!) << 8n) | BigInt(d!)
-    const v6Part = ipv6GroupsToBigInt(expandV6Groups(prefix || ''))
-    if (v6Part === null) return null
-    // Last 32 bits come from v4Part, prefix is the first 96 bits
-    const maskHigh96 = 0xffff_ffff_ffff_ffffn << 64n | 0xffff_ffff_0000_0000n
-    return (v6Part & maskHigh96) | v4Part
-  }
-
-  const groups = expandV6Groups(ip)
-  if (!groups) return null
-  return ipv6GroupsToBigInt(groups)
-}
-
-function expandV6Groups(ip: string): string[] | null {
-  if (!ip.includes(':')) return null
-  // Handle :: expansion
-  const parts = ip.split('::')
-  if (parts.length > 2) return null // only one :: allowed
-  let left: string[]
-  let right: string[]
-  if (parts.length === 2) {
-    left = parts[0] ? parts[0]!.split(':') : []
-    right = parts[1] ? parts[1]!.split(':') : []
-    const missing = 8 - left.length - right.length
-    if (missing < 0) return null
-    left = [...left, ...new Array(missing).fill('0')]
-  } else {
-    left = ip.split(':')
-    right = []
-  }
-  const groups = [...left, ...right]
-  if (groups.length !== 8) return null
-  for (const g of groups) {
-    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null
-  }
-  return groups.map((g) => g.toLowerCase().padStart(4, '0'))
-}
-
-function ipv6GroupsToBigInt(groups: string[] | null): bigint | null {
-  if (!groups) return null
-  let result = 0n
-  for (const g of groups) {
-    result = (result << 16n) | BigInt(parseInt(g, 16))
-  }
-  return result
-}
-
-// ---------------------------------------------------------------------------
-// In-memory rate limiting (token bucket per API key)
-// ---------------------------------------------------------------------------
 
 interface RateBucket {
   tokens: number
@@ -516,14 +356,13 @@ globalForRate.__rateBuckets = buckets
  * Returns { ok: true } if the request is allowed, or { ok: false, retryAfter }
  * with seconds-to-wait if the bucket is empty.
  *
- * Bucket capacity = rateLimitPerMinute tokens, refilled continuously at
- * rateLimitPerMinute/60 tokens per ms.
+ * Uses the global default (60 req/min). Per-key custom limits are not
+ * persisted in integrated mode (BIweb's api_keys table has no such column).
  */
 export function checkRateLimit(
   apiKeyId: string,
-  rateLimitPerMinute: number | null,
 ): { ok: true; remaining: number } | { ok: false; retryAfter: number; remaining: 0 } {
-  const capacity = rateLimitPerMinute ?? DEFAULT_RATE_LIMIT_PER_MINUTE
+  const capacity = DEFAULT_RATE_LIMIT_PER_MINUTE
   const now = Date.now()
 
   let bucket = buckets.get(apiKeyId)
@@ -532,7 +371,6 @@ export function checkRateLimit(
     buckets.set(apiKeyId, bucket)
   }
 
-  // Refill: tokens added = (elapsed_ms / 60_000) * capacity
   const elapsed = now - bucket.lastRefill
   const refill = (elapsed / DEFAULT_REFILL_INTERVAL_MS) * capacity
   bucket.tokens = Math.min(capacity, bucket.tokens + refill)
@@ -543,7 +381,6 @@ export function checkRateLimit(
     return { ok: true, remaining: Math.floor(bucket.tokens) }
   }
 
-  // Empty: time until 1 token refills
   const msUntilNext = Math.ceil((1 - bucket.tokens) * (DEFAULT_REFILL_INTERVAL_MS / capacity))
   const retryAfter = Math.max(1, Math.ceil(msUntilNext / 1000))
   return { ok: false, retryAfter, remaining: 0 }
@@ -552,7 +389,6 @@ export function checkRateLimit(
 // Lightweight cleanup: drop empty stale buckets occasionally to bound memory
 export function pruneRateBuckets(maxSize = 10_000): void {
   if (buckets.size < maxSize) return
-  // Drop the oldest 25% by lastRefill
   const entries = [...buckets.entries()].sort(
     (a, b) => a[1].lastRefill - b[1].lastRefill,
   )
@@ -567,16 +403,22 @@ export function pruneRateBuckets(maxSize = 10_000): void {
 // Records management actions on API keys (create / update / revoke) so the
 // owner can review "who did what, when" — useful for compliance + debugging
 // integration breakages ("who revoked the OpenFN key at 3am?").
+//
+// NOTE: settings_audit_logs.user_id is a UUID referencing auth.users(id).
+// Callers must pass the Supabase Auth UUID (SessionUser.supabaseId), NOT
+// the Prisma User.id (cuid).
 // ---------------------------------------------------------------------------
 
 export type AuditAction = 'api_key.create' | 'api_key.update' | 'api_key.revoke'
 
 export interface AuditEntry {
+  /** Supabase Auth UUID — NOT users.id. Used for settings_audit_logs.user_id. */
   userId: string
   action: AuditAction
+  /** users.id (cuid) of the API key — stored as uuid (nullable) */
   apiKeyId?: string | null
   apiKeyLabel?: string | null
-  /** Will be JSON.stringified before storage. */
+  /** Will be stored as jsonb. */
   diff?: Record<string, unknown>
   ip?: string | null
   userAgent?: string | null
@@ -594,12 +436,13 @@ export async function writeAuditLog(entry: AuditEntry): Promise<void> {
         action: entry.action,
         apiKeyId: entry.apiKeyId ?? null,
         apiKeyLabel: entry.apiKeyLabel ?? null,
-        diff: JSON.stringify(entry.diff ?? {}),
+        diff: (entry.diff ?? {}) as object,
         ip: entry.ip ?? null,
         userAgent: entry.userAgent ?? null,
       },
     })
-  } catch {
+  } catch (e) {
+    console.error('[audit] writeAuditLog failed:', e)
     /* best-effort — audit log must never break the user flow */
   }
 }

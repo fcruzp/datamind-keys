@@ -47,8 +47,6 @@ const SPEC = {
           },
           prefix: { type: 'string', example: 'dm_live_a1B2' },
           lastUsedAt: { type: 'string', format: 'date-time', nullable: true },
-          allowedIps: { type: 'array', items: { type: 'string' } },
-          rateLimitPerMinute: { type: 'integer', nullable: true },
         },
       },
       Error: {
@@ -151,7 +149,7 @@ const SPEC = {
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           '403': {
-            description: 'IP not in allowlist, or scope insufficient',
+            description: 'Scope insufficient',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           '429': {
@@ -195,7 +193,7 @@ const SPEC = {
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           '403': {
-            description: 'Forbidden (IP / scope)',
+            description: 'Forbidden (scope)',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           '429': {
@@ -234,7 +232,7 @@ const SPEC = {
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           '403': {
-            description: 'Forbidden (IP / scope)',
+            description: 'Forbidden (scope)',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
         },
@@ -270,7 +268,7 @@ const SPEC = {
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           '403': {
-            description: 'Forbidden (IP / scope — requires `execute`)',
+            description: 'Forbidden (scope — requires `execute`)',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           '422': {

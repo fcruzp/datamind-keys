@@ -29,12 +29,15 @@ import type { PortalUser } from './types'
  * This replaces the <TenantSwitcher/> when a Supabase session is active,
  * because tenants are tied to Supabase accounts in production — you switch
  * tenants by signing in with a different account, not by toggling a cookie.
+ *
+ * If `user` is null (unauthenticated), falls back to a compact Sign In button.
  */
-export function AuthMenu({ user }: { user: PortalUser }) {
+export function AuthMenu({ user }: { user: PortalUser | null }) {
   const router = useRouter()
   const [signingOut, setSigningOut] = React.useState(false)
 
   const initials = React.useMemo(() => {
+    if (!user) return '?'
     const src = user.name ?? user.email ?? '?'
     return src
       .split(/[\s@._-]+/)
@@ -42,7 +45,21 @@ export function AuthMenu({ user }: { user: PortalUser }) {
       .slice(0, 2)
       .map((s) => s[0]!.toUpperCase())
       .join('')
-  }, [user.name, user.email])
+  }, [user])
+
+  if (!user) {
+    return (
+      <SignInCTA
+        onClick={() => {
+          if (typeof window !== 'undefined') {
+            document
+              .getElementById('signin')
+              ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+          }
+        }}
+      />
+    )
+  }
 
   async function handleSignOut() {
     setSigningOut(true)

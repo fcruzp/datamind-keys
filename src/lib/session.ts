@@ -1,199 +1,100 @@
 import { cookies } from 'next/headers'
 import { db } from '@/lib/db'
+import type { User } from '@prisma/client'
 import type { NextRequest } from 'next/server'
 import { getSupabaseServer } from '@/lib/supabase/server'
 
-/**
- * Multi-tenant session layer for the DataMind BI portal.
- *
- * Resolution order:
- *   1. Supabase Auth session (JWT in cookies) — used in production.
- *      If a real Supabase user is signed in, we mirror them into the local
- *      SQLite `User` table (id = supabase uuid, email, name from metadata)
- *      so the rest of the codebase (which queries Prisma) continues to work
- *      unchanged.
- *   2. Demo cookie (`dm_session_email`) — sandbox fallback so the portal
- *      remains explorable without a Supabase account. Seeded with 4 demo
- *      tenants (DataMind BI, Acme Analytics, Norte Logistics, …).
- *
- * In a future phase, when the Prisma client is migrated to Postgres, the
- * local SQLite `User` mirror is no longer needed — the production tables
- * (`auth.users` + `public.user_profiles`) become the source of truth.
- */
+// ===========================================================================
+// Session layer — FULL INTEGRATION with BIweb (datamind.mooo.com)
+// ===========================================================================
+// The `users` table is shared with BIweb. When a user signs in via Supabase
+// Auth, we look them up by `supabase_id` (which mirrors auth.users.id).
+//
+// There are NO demo tenants in this mode — the sandbox demo-seeding logic
+// has been removed because we must not pollute the shared `users` table
+// with fake accounts.
+//
+// `tenantName` and `avatarColor` are NOT columns in BIweb's schema. They are
+// derived in-memory from the user's `company` field and email so the
+// existing UI (tenant badge, avatar gradient) continues to work without
+// any DB changes.
+// ===========================================================================
 
 export const SESSION_COOKIE = 'dm_session_email'
 
 // ---------------------------------------------------------------------------
-// Demo tenant seed
+// Types
 // ---------------------------------------------------------------------------
 
-interface DemoTenantSeed {
+export interface SessionUser {
+  /** users.id (cuid) — used as FK for api_keys.user_id */
+  id: string
+  /** users.supabase_id (UUID) — used for settings_audit_logs.user_id */
+  supabaseId: string
   email: string
-  name: string
+  name: string | null
+  /** users.company — used as the tenant/workspace display name */
+  company: string | null
+  /** users.avatar_url from Supabase user_metadata (if any) */
+  avatarUrl: string | null
+  role: string
+  /** Derived from company or email — NOT stored in DB */
   tenantName: string
+  /** Derived from email hash — NOT stored in DB */
   avatarColor: string
-  role: 'owner' | 'admin' | 'viewer'
+  /** True when the session comes from Supabase Auth (production). */
+  isSupabase?: boolean
 }
 
-const DEMO_TENANTS: DemoTenantSeed[] = [
-  {
-    email: 'demo@datamind.bi',
-    name: 'DataMind Demo',
-    tenantName: 'DataMind BI',
-    avatarColor: 'from-emerald-500 to-teal-600',
-    role: 'owner',
-  },
-  {
-    email: 'ana@acme.io',
-    name: 'Ana Martínez',
-    tenantName: 'Acme Analytics',
-    avatarColor: 'from-sky-500 to-cyan-600',
-    role: 'owner',
-  },
-  {
-    email: 'luis@norte.com',
-    name: 'Luis Pereira',
-    tenantName: 'Norte Logistics',
-    avatarColor: 'from-amber-500 to-orange-600',
-    role: 'owner',
-  },
-  {
-    email: 'viewer@acme.io',
-    name: 'Marta (viewer)',
-    tenantName: 'Acme Analytics',
-    avatarColor: 'from-rose-500 to-pink-600',
-    role: 'viewer',
-  },
+// ---------------------------------------------------------------------------
+// Derivation helpers (tenantName + avatarColor are UI-only, not in DB)
+// ---------------------------------------------------------------------------
+
+const AVATAR_GRADIENTS = [
+  'from-emerald-500 to-teal-600',
+  'from-sky-500 to-cyan-600',
+  'from-amber-500 to-orange-600',
+  'from-rose-500 to-pink-600',
+  'from-violet-500 to-purple-600',
+  'from-lime-500 to-green-600',
+  'from-fuchsia-500 to-pink-600',
+  'from-indigo-500 to-blue-600',
 ]
 
-/**
- * Idempotently seeds the demo tenants. Safe to call on every request — it
- * upserts each seeded user so their tenantName / avatarColor / role always
- * match the spec below (important because older sandbox DBs may already
- * contain a `demo@datamind.bi` user created before the multi-tenant
- * schema migration, with the default `tenantName = "Personal"`).
- */
-export async function seedDemoTenants(): Promise<void> {
-  for (const seed of DEMO_TENANTS) {
-    await db.user.upsert({
-      where: { email: seed.email },
-      create: {
-        email: seed.email,
-        name: seed.name,
-        tenantName: seed.tenantName,
-        avatarColor: seed.avatarColor,
-        role: seed.role,
-      },
-      update: {
-        name: seed.name,
-        tenantName: seed.tenantName,
-        avatarColor: seed.avatarColor,
-        role: seed.role,
-      },
-    })
+function deriveAvatarColor(seed: string): string {
+  let hash = 0
+  for (let i = 0; i < seed.length; i++) {
+    hash = (hash << 5) - hash + seed.charCodeAt(i)
+    hash |= 0
   }
+  return AVATAR_GRADIENTS[Math.abs(hash) % AVATAR_GRADIENTS.length]!
+}
+
+function deriveTenantName(company: string | null, email: string): string {
+  if (company && company.trim()) return company.trim()
+  const domain = email.split('@')[1]?.toLowerCase() ?? 'personal'
+  const tenant = domain.split('.')[0] ?? 'personal'
+  return tenant.charAt(0).toUpperCase() + tenant.slice(1)
 }
 
 // ---------------------------------------------------------------------------
 // Current-user resolution
 // ---------------------------------------------------------------------------
 
-export interface SessionUser {
-  id: string
-  email: string
-  name: string | null
-  tenantName: string
-  avatarColor: string
-  role: string
-  /** True when the session comes from Supabase Auth (production). */
-  isSupabase?: boolean
-  /** Avatar URL from Supabase user_metadata (if any). */
-  avatarUrl?: string | null
-}
-
-const DEFAULT_SESSION_EMAIL = DEMO_TENANTS[0]!.email
-
 /**
- * Derives a tenant name + avatar color from a Supabase user's email /
- * metadata. Used when we mirror a Supabase user into the local User table
- * (the Supabase `user_profiles` table is authoritative in production, but
- * the sandbox SQLite mirror doesn't have those columns joined).
- */
-function deriveTenantFromEmail(email: string): {
-  tenantName: string
-  avatarColor: string
-} {
-  const domain = email.split('@')[1]?.toLowerCase() ?? 'personal'
-  // Map a handful of well-known domains to brand colours; everything else
-  // gets a default emerald avatar and a tenant name based on the domain.
-  const palette: Record<string, string> = {
-    'datamind.bi': 'from-emerald-500 to-teal-600',
-    'acme.io': 'from-sky-500 to-cyan-600',
-    'norte.com': 'from-amber-500 to-orange-600',
-  }
-  const tenant = domain.split('.')[0]
-  return {
-    tenantName: tenant.charAt(0).toUpperCase() + tenant.slice(1),
-    avatarColor: palette[domain] ?? 'from-emerald-500 to-teal-600',
-  }
-}
-
-async function fetchUserFields(id: string, email: string, name: string | null) {
-  // Look for an existing local row; if found, keep its tenant fields.
-  const existing = await db.user.findUnique({
-    where: { id },
-    select: { tenantName: true, avatarColor: true, role: true, name: true },
-  })
-  if (existing) {
-    // Refresh email + name in case they changed upstream.
-    if (existing.name !== name) {
-      await db.user.update({ where: { id }, data: { name } })
-    }
-    return existing
-  }
-  // First-time login from Supabase: mirror into local SQLite.
-  const derived = deriveTenantFromEmail(email)
-  return db.user
-    .upsert({
-      where: { email },
-      create: {
-        id,
-        email,
-        name,
-        tenantName: derived.tenantName,
-        avatarColor: derived.avatarColor,
-        role: 'owner',
-        lastLoginAt: new Date(),
-      },
-      update: { id, name, lastLoginAt: new Date() },
-      select: { tenantName: true, avatarColor: true, role: true, name: true },
-    })
-    .then((r) => r ?? derived)
-}
-
-/**
- * Returns the currently logged-in user.
+ * Returns the currently logged-in user via Supabase Auth.
  *
- * Tries Supabase Auth first. If a real Supabase session exists, the user is
- * mirrored into the local SQLite `User` table so the rest of the codebase
- * (which queries Prisma) sees a consistent row. The returned SessionUser is
- * flagged `isSupabase: true` so the UI can show "Signed in via Supabase"
- * and offer a Sign Out button.
+ * Resolution:
+ *   1. Supabase Auth session → look up `users` row by `supabase_id`.
+ *   2. If no Supabase session or user not found in DB → return null
+ *      (the UI shows a Sign In card).
  *
- * If no Supabase session, falls back to the demo cookie (`dm_session_email`)
- * seeded with 4 deterministic demo tenants.
+ * There is NO demo-cookie fallback in integrated mode — the shared `users`
+ * table must not be polluted with fake accounts.
  */
 export async function getCurrentUser(
-  req?: NextRequest,
-): Promise<SessionUser> {
-  // Seed demo tenants — wrapped in try/catch so a transient DB issue
-  // (e.g. pgbouncer connection reset) doesn't crash the entire page.
-  try {
-    await seedDemoTenants()
-  } catch (e) {
-    console.error('[session] seedDemoTenants failed:', e)
-  }
-
+  _req?: NextRequest,
+): Promise<SessionUser | null> {
   // --- 1. Try Supabase Auth -------------------------------------------------
   try {
     const supabase = await getSupabaseServer()
@@ -203,136 +104,108 @@ export async function getCurrentUser(
 
     if (user) {
       const email = user.email ?? ''
+      const supabaseId = user.id
+
+      // Look up the user in BIweb's `users` table by supabase_id.
+      // The row should exist (created by BIweb's signup trigger), but if it
+      // doesn't we create a minimal row so API key operations work.
+      let dbUser: User | null = null
+      try {
+        dbUser = await db.user.findUnique({
+          where: { supabaseId },
+        })
+      } catch (e) {
+        console.error('[session] DB lookup by supabaseId failed:', e)
+      }
+
+      // If the user doesn't exist in the `users` table yet (e.g. they signed
+      // up through Supabase Auth but BIweb's trigger hasn't run), create a
+      // minimal row. This is safe — it uses the same schema as BIweb.
+      if (!dbUser) {
+        try {
+          dbUser = await db.user.create({
+            data: {
+              supabaseId,
+              email,
+              name:
+                (user.user_metadata?.full_name as string | undefined) ??
+                (user.user_metadata?.name as string | undefined) ??
+                (email ? email.split('@')[0] : 'User'),
+              avatarUrl:
+                (user.user_metadata?.avatar_url as string | undefined) ??
+                (user.user_metadata?.picture as string | undefined) ??
+                null,
+            },
+          })
+        } catch (e) {
+          console.error('[session] Failed to create user row:', e)
+          // Last resort: return a transient user object (no DB row).
+          // API key operations will fail, but the page can still render.
+          return {
+            id: '',
+            supabaseId,
+            email,
+            name: email ? email.split('@')[0] ?? null : null,
+            company: null,
+            avatarUrl: null,
+            role: 'user',
+            tenantName: deriveTenantName(null, email),
+            avatarColor: deriveAvatarColor(email || supabaseId),
+            isSupabase: true,
+          }
+        }
+      }
+
+      // After the above, dbUser is guaranteed non-null (we either found it
+      // or created it, or returned early). Assert non-null for TypeScript.
+      const u = dbUser!
+
       const name =
         (user.user_metadata?.full_name as string | undefined) ??
         (user.user_metadata?.name as string | undefined) ??
-        (email ? email.split('@')[0] : 'Supabase User')
-      const avatarUrl = (user.user_metadata?.avatar_url as string | undefined) ??
+        u.name ??
+        (email ? email.split('@')[0] : 'User')
+      const avatarUrl =
+        (user.user_metadata?.avatar_url as string | undefined) ??
         (user.user_metadata?.picture as string | undefined) ??
+        u.avatarUrl ??
         null
 
-      const fields = await fetchUserFields(user.id, email, name)
-
       return {
-        id: user.id,
-        email,
-        name: fields.name ?? name,
-        tenantName: fields.tenantName,
-        avatarColor: fields.avatarColor,
-        role: fields.role,
-        isSupabase: true,
+        id: u.id,
+        supabaseId: u.supabaseId,
+        email: u.email,
+        name,
+        company: u.company,
         avatarUrl,
+        role: u.role,
+        tenantName: deriveTenantName(u.company, u.email),
+        avatarColor: deriveAvatarColor(u.email || supabaseId),
+        isSupabase: true,
       }
     }
-  } catch {
-    // Supabase unreachable (e.g. sandbox without network) — fall through
-    // to the demo cookie session.
-  }
-
-  // --- 2. Fall back to demo cookie session ---------------------------------
-  let email: string | undefined
-  try {
-    if (req) {
-      email = req.cookies.get(SESSION_COOKIE)?.value
-    } else {
-      const c = await cookies()
-      email = c.get(SESSION_COOKIE)?.value
-    }
-  } catch {
-    // cookies() not available in this context — continue with no email.
-  }
-
-  // Defensive DB lookup — if the DB is unreachable or tables don't exist,
-  // fall through to the hardcoded demo user instead of crashing the page.
-  let user: SessionUser | null = null
-  try {
-    if (email) {
-      user = await db.user.findUnique({
-        where: { email },
-        select: {
-          id: true,
-          email: true,
-          name: true,
-          tenantName: true,
-          avatarColor: true,
-          role: true,
-        },
-      })
-    }
-
-    if (!user) {
-      user = await db.user.findUnique({
-        where: { email: DEFAULT_SESSION_EMAIL },
-        select: {
-          id: true,
-          email: true,
-          name: true,
-          tenantName: true,
-          avatarColor: true,
-          role: true,
-        },
-      })
-    }
   } catch (e) {
-    console.error('[session] DB lookup failed:', e)
+    console.error('[session] Supabase Auth failed:', e)
   }
 
-  // Hard fallback: if the DB is down or the demo user doesn't exist,
-  // return a synthetic anonymous demo user so the page can still render.
-  if (!user) {
-    return {
-      id: 'anonymous-demo',
-      email: DEFAULT_SESSION_EMAIL,
-      name: 'DataMind Demo',
-      tenantName: 'DataMind BI',
-      avatarColor: 'from-emerald-500 to-teal-600',
-      role: 'owner',
-    }
-  }
-
-  return user
-}
-
-/**
- * Lists every demo tenant the current operator is allowed to switch into.
- *
- * NOTE: this is only relevant for the demo cookie session. When a Supabase
- * user is logged in, the tenant switcher is hidden (Supabase users switch
- * tenants by signing out + into a different account, OR by joining multiple
- * orgs — which is a future feature).
- */
-export async function listSwitchableUsers(): Promise<SessionUser[]> {
-  await seedDemoTenants()
-  const users = await db.user.findMany({
-    orderBy: [{ tenantName: 'asc' }, { email: 'asc' }],
-    select: {
-      id: true,
-      email: true,
-      name: true,
-      tenantName: true,
-      avatarColor: true,
-      role: true,
-    },
-  })
-  return users
-}
-
-/**
- * Touch `lastLoginAt` for the user that just switched-in. Best-effort.
- */
-export async function touchLastLogin(email: string): Promise<void> {
-  try {
-    await db.user.update({
-      where: { email },
-      data: { lastLoginAt: new Date() },
-    })
-  } catch {
-    /* best-effort */
-  }
+  // --- 2. No session --------------------------------------------------------
+  return null
 }
 
 // ---------------------------------------------------------------------------
-// Cookie helpers (used by the /api/auth/switch route)
+// Tenant switcher (kept for backwards compat — returns empty in integrated mode)
+// ---------------------------------------------------------------------------
+
+/**
+ * In integrated mode there are no switchable demo tenants. Returns an empty
+ * array. The tenant switcher UI is hidden when isSupabase=true (see page.tsx).
+ */
+export async function listSwitchableUsers(): Promise<SessionUser[]> {
+  return []
+}
+
+// ---------------------------------------------------------------------------
+// Cookie helpers (used by /api/auth/switch — now a no-op in integrated mode)
 // ---------------------------------------------------------------------------
 
 export const SESSION_COOKIE_OPTS = {
@@ -340,4 +213,13 @@ export const SESSION_COOKIE_OPTS = {
   sameSite: 'lax' as const,
   path: '/',
   maxAge: 60 * 60 * 24 * 30, // 30 days
+}
+
+// ---------------------------------------------------------------------------
+// Backwards-compat: touchLastLogin (no-op — BIweb's users table has no
+// lastLoginAt column; we rely on Supabase Auth's last_sign_in_at instead)
+// ---------------------------------------------------------------------------
+
+export async function touchLastLogin(_email: string): Promise<void> {
+  /* no-op in integrated mode */
 }

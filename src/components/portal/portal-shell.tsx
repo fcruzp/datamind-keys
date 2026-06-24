@@ -20,6 +20,7 @@ import { Sidebar } from './sidebar'
 import { DashboardView } from './dashboard-view'
 import { ApiKeysManager } from '@/components/api-keys/api-keys-manager'
 import { ComingSoon } from './coming-soon'
+import { SignInCard } from './sign-in-card'
 import type { AuthMeResponse, PortalView } from './types'
 
 /**
@@ -52,12 +53,12 @@ export function PortalShell({ initial }: { initial: AuthMeResponse }) {
   // Whenever the user switches tenant, the auth/me query invalidates (the
   // switch mutation calls qc.invalidateQueries()). When that resolves,
   // reset to the dashboard so the user lands on the new tenant's overview.
-  const currentTenantId = authQuery.data?.current.id
+  const currentTenantId = authQuery.data?.current?.id
   React.useEffect(() => {
     setView('dashboard')
   }, [currentTenantId])
 
-  const current = authQuery.data?.current ?? initial.current
+  const current = authQuery.data?.current ?? initial.current ?? null
   const switchable = authQuery.data?.switchable ?? initial.switchable
   const stats = authQuery.data?.stats ?? initial.stats
 
@@ -77,36 +78,38 @@ export function PortalShell({ initial }: { initial: AuthMeResponse }) {
         <div className="flex h-14 items-center justify-between px-4 sm:px-6 gap-3">
           {/* Left: logo + mobile nav trigger */}
           <div className="flex items-center gap-2.5 min-w-0">
-            {/* Mobile sidebar trigger */}
-            <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
-              <SheetTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="lg:hidden size-8"
-                  aria-label="Open navigation"
-                >
-                  <Menu className="size-4" />
-                </Button>
-              </SheetTrigger>
-              <SheetContent side="left" className="w-72 p-0">
-                <SheetHeader className="px-4 py-3 border-b">
-                  <SheetTitle className="flex items-center gap-2 text-sm">
-                    <div className="grid size-6 place-items-center rounded-md bg-gradient-to-br from-emerald-500 to-teal-600 text-white">
-                      <KeyRound className="size-3.5" />
-                    </div>
-                    DataMind BI
-                  </SheetTitle>
-                </SheetHeader>
-                <div className="overflow-y-auto h-[calc(100vh-3.5rem)]">
-                  <Sidebar
-                    view={view}
-                    onViewChange={handleViewChange}
-                    stats={{ activeKeys: stats.activeKeys, requests7d: stats.requests7d }}
-                  />
-                </div>
-              </SheetContent>
-            </Sheet>
+            {/* Mobile sidebar trigger (hidden when unauthenticated) */}
+            {current && (
+              <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
+                <SheetTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="lg:hidden size-8"
+                    aria-label="Open navigation"
+                  >
+                    <Menu className="size-4" />
+                  </Button>
+                </SheetTrigger>
+                <SheetContent side="left" className="w-72 p-0">
+                  <SheetHeader className="px-4 py-3 border-b">
+                    <SheetTitle className="flex items-center gap-2 text-sm">
+                      <div className="grid size-6 place-items-center rounded-md bg-gradient-to-br from-emerald-500 to-teal-600 text-white">
+                        <KeyRound className="size-3.5" />
+                      </div>
+                      DataMind BI
+                    </SheetTitle>
+                  </SheetHeader>
+                  <div className="overflow-y-auto h-[calc(100vh-3.5rem)]">
+                    <Sidebar
+                      view={view}
+                      onViewChange={handleViewChange}
+                      stats={{ activeKeys: stats.activeKeys, requests7d: stats.requests7d }}
+                    />
+                  </div>
+                </SheetContent>
+              </Sheet>
+            )}
 
             <div className="flex items-center gap-2.5 min-w-0">
               <div className="grid size-8 place-items-center rounded-lg bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-sm shrink-0">
@@ -159,10 +162,22 @@ export function PortalShell({ initial }: { initial: AuthMeResponse }) {
             <div className="h-5 w-px bg-border/60 hidden md:block mx-1" />
 
             {/* Auth surface:
+                - No session → SignInCTA (scrolls to sign-in card)
                 - Supabase session → AuthMenu (avatar + sign out)
-                - Demo session w/ switchable tenants → TenantSwitcher
-                - Demo session w/ no switcher → SignInCTA */}
-            {current.isSupabase ? (
+                - Demo session w/ switchable tenants → TenantSwitcher */}
+            {!current ? (
+              <SignInCTA
+                onClick={() => {
+                  if (typeof window !== 'undefined') {
+                    window.setTimeout(() => {
+                      document
+                        .getElementById('signin')
+                        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                    }, 50)
+                  }
+                }}
+              />
+            ) : current.isSupabase ? (
               <AuthMenu user={current} />
             ) : switchable.length > 0 ? (
               <TenantSwitcher current={current} switchable={switchable} />
@@ -187,29 +202,45 @@ export function PortalShell({ initial }: { initial: AuthMeResponse }) {
 
       {/* Body: sidebar + main */}
       <div className="flex-1 mx-auto w-full max-w-7xl flex gap-0 lg:gap-6 px-0 lg:px-6 py-0 lg:py-6">
-        {/* Desktop sidebar */}
-        <aside className="hidden lg:block w-60 shrink-0">
-          <div className="sticky top-20 rounded-xl border border-border/60 bg-card/50 backdrop-blur-sm overflow-hidden">
-            <Sidebar
-              view={view}
-              onViewChange={handleViewChange}
-              stats={{ activeKeys: stats.activeKeys, requests7d: stats.requests7d }}
-            />
-            {/* Sidebar footer: tenant hint */}
-            <div className="border-t border-border/40 p-3 text-[11px] text-muted-foreground">
-              <div className="flex items-center gap-1.5">
-                <span
-                  className={`size-2 rounded-full bg-gradient-to-br ${current.avatarColor}`}
-                />
-                <span className="truncate">Signed in as {current.email}</span>
+        {/* Desktop sidebar (only when authenticated) */}
+        {current && (
+          <aside className="hidden lg:block w-60 shrink-0">
+            <div className="sticky top-20 rounded-xl border border-border/60 bg-card/50 backdrop-blur-sm overflow-hidden">
+              <Sidebar
+                view={view}
+                onViewChange={handleViewChange}
+                stats={{ activeKeys: stats.activeKeys, requests7d: stats.requests7d }}
+              />
+              {/* Sidebar footer: tenant hint */}
+              <div className="border-t border-border/40 p-3 text-[11px] text-muted-foreground">
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className={`size-2 rounded-full bg-gradient-to-br ${current.avatarColor}`}
+                  />
+                  <span className="truncate">Signed in as {current.email}</span>
+                </div>
               </div>
             </div>
-          </div>
-        </aside>
+          </aside>
+        )}
 
         {/* Main content */}
         <main className="flex-1 min-w-0 px-4 lg:px-0 py-6 lg:py-0">
-          {view === 'dashboard' && (
+          {!current ? (
+            // Unauthenticated state — show the sign-in card prominently.
+            <div id="signin" className="scroll-mt-20 max-w-md mx-auto py-8 lg:py-12">
+              <div className="mb-5 text-center space-y-1.5">
+                <h1 className="text-xl font-bold tracking-tight">
+                  Sign in to DataMind BI
+                </h1>
+                <p className="text-sm text-muted-foreground">
+                  Authenticate with Supabase to manage your API keys, view usage
+                  stats, and grant scoped access to integrations like OpenFN and N8N.
+                </p>
+              </div>
+              <SignInCard />
+            </div>
+          ) : view === 'dashboard' ? (
             <DashboardView
               current={current}
               stats={stats}
@@ -222,26 +253,24 @@ export function PortalShell({ initial }: { initial: AuthMeResponse }) {
                 }
               }}
             />
-          )}
-          {view === 'api-keys' && <ApiKeysManager />}
-          {view === 'datasources' && (
+          ) : view === 'api-keys' ? (
+            <ApiKeysManager />
+          ) : view === 'datasources' ? (
             <ComingSoon
               title="Datasources"
               description="Per-tenant datasource management — connection strings, schema introspection, sync schedule. The read-only /api/public/v1/datasources endpoint already works; this UI is coming next."
             />
-          )}
-          {view === 'activity' && (
+          ) : view === 'activity' ? (
             <ComingSoon
               title="Activity feed"
               description="Real-time stream of API requests across all keys in this tenant, with filtering by endpoint / status / IP. Currently visible per-key under API Keys."
             />
-          )}
-          {view === 'docs' && (
+          ) : view === 'docs' ? (
             <ComingSoon
               title="API documentation"
               description="Interactive OpenAPI explorer with copy-paste curl examples. Available today as the OpenAPI Explorer panel under API Keys."
             />
-          )}
+          ) : null}
         </main>
       </div>
 
@@ -249,23 +278,29 @@ export function PortalShell({ initial }: { initial: AuthMeResponse }) {
       <footer className="mt-auto border-t border-border/60 bg-muted/20">
         <div className="mx-auto max-w-7xl px-4 sm:px-6 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 text-xs text-muted-foreground">
           <div className="flex items-center gap-2">
-            <span
-              className={`inline-grid size-4 place-items-center rounded bg-gradient-to-br ${current.avatarColor} text-white text-[8px] font-bold`}
-            >
-              {current.name?.[0] ?? current.email[0]!.toUpperCase()}
-            </span>
-            <span>
-              Tenant: <strong className="text-foreground">{current.tenantName}</strong>{' '}
-              · {current.email}
-            </span>
-            {current.isSupabase && (
-              <Badge
-                variant="outline"
-                className="text-[9px] font-mono px-1 py-0 gap-0.5 text-emerald-600 border-emerald-500/40 bg-emerald-500/5"
-              >
-                <ShieldCheck className="size-2.5" />
-                Supabase
-              </Badge>
+            {current ? (
+              <>
+                <span
+                  className={`inline-grid size-4 place-items-center rounded bg-gradient-to-br ${current.avatarColor} text-white text-[8px] font-bold`}
+                >
+                  {current.name?.[0] ?? current.email[0]!.toUpperCase()}
+                </span>
+                <span>
+                  Tenant: <strong className="text-foreground">{current.tenantName}</strong>{' '}
+                  · {current.email}
+                </span>
+                {current.isSupabase && (
+                  <Badge
+                    variant="outline"
+                    className="text-[9px] font-mono px-1 py-0 gap-0.5 text-emerald-600 border-emerald-500/40 bg-emerald-500/5"
+                  >
+                    <ShieldCheck className="size-2.5" />
+                    Supabase
+                  </Badge>
+                )}
+              </>
+            ) : (
+              <span className="italic">Not signed in</span>
             )}
           </div>
           <div className="flex items-center gap-3">

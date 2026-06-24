@@ -8,14 +8,12 @@ import {
   Clock,
   Copy,
   FlaskConical,
-  Gauge,
   Globe,
   Hash,
   KeyRound,
   Loader2,
   Pencil,
   Plus,
-  Shield,
   ShieldCheck,
   Trash2,
   Activity,
@@ -506,54 +504,6 @@ function KeyRow({
     >
       <TableCell className="pl-6 py-3 align-top">
         <div className="font-medium text-sm">{apiKey.label}</div>
-        <div className="flex flex-wrap items-center gap-1 mt-1">
-          {/* IP allowlist chip */}
-          {apiKey.allowedIps.length > 0 ? (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-300 cursor-default">
-                  <Shield className="size-3" />
-                  {apiKey.allowedIps.length} IP
-                  {apiKey.allowedIps.length === 1 ? '' : 's'}
-                </span>
-              </TooltipTrigger>
-              <TooltipContent side="top" className="text-xs">
-                <div className="font-medium mb-1">IP allowlist</div>
-                {apiKey.allowedIps.map((ip) => (
-                  <div key={ip} className="font-mono">
-                    {ip}
-                  </div>
-                ))}
-              </TooltipContent>
-            </Tooltip>
-          ) : (
-            <span className="inline-flex items-center gap-1 rounded-md border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
-              <Globe className="size-3" />
-              any IP
-            </span>
-          )}
-          {/* Rate limit chip */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span
-                className={cn(
-                  'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium cursor-default',
-                  apiKey.rateLimitPerMinute === null
-                    ? 'border-border/60 bg-muted/40 text-muted-foreground'
-                    : 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300',
-                )}
-              >
-                <Gauge className="size-3" />
-                {apiKey.rateLimitPerMinute === null
-                  ? '60/min (default)'
-                  : `${apiKey.rateLimitPerMinute}/min`}
-              </span>
-            </TooltipTrigger>
-            <TooltipContent side="top" className="text-xs">
-              Per-key rate limit (token bucket)
-            </TooltipContent>
-          </Tooltip>
-        </div>
       </TableCell>
       <TableCell className="py-3 align-top">
         <button
@@ -640,7 +590,7 @@ function KeyRow({
                 variant="ghost"
                 className="h-8 px-2 text-muted-foreground hover:text-foreground hover:bg-muted/60"
                 aria-label={`Edit ${apiKey.label}`}
-                title="Edit label, rate limit, IPs"
+                title="Edit label"
               >
                 <Pencil className="size-3.5" />
               </Button>
@@ -702,26 +652,6 @@ function KeyRow({
                 <div className="flex items-center gap-2 text-xs">
                   <ShieldCheck className="size-3 text-muted-foreground" />
                   <span>Scopes: {apiKey.scopes.join(', ') || 'none'}</span>
-                </div>
-                {apiKey.allowedIps.length > 0 && (
-                  <div className="flex items-center gap-2 text-xs">
-                    <Shield className="size-3 text-muted-foreground" />
-                    <span>
-                      IP allowlist:{' '}
-                      <span className="font-mono">
-                        {apiKey.allowedIps.join(', ')}
-                      </span>
-                    </span>
-                  </div>
-                )}
-                <div className="flex items-center gap-2 text-xs">
-                  <Gauge className="size-3 text-muted-foreground" />
-                  <span>
-                    Rate limit:{' '}
-                    {apiKey.rateLimitPerMinute === null
-                      ? '60/min (default)'
-                      : `${apiKey.rateLimitPerMinute}/min`}
-                  </span>
                 </div>
               </div>
               <AlertDialogFooter>
@@ -974,16 +904,6 @@ function SecurityNote() {
                 Set an expiry for short-lived syncs, and{' '}
                 <strong className="text-foreground">rotate keys</strong>{' '}
                 periodically. Revoking is instant and irreversible.
-              </span>
-            </li>
-            <li className="flex gap-2">
-              <span className="text-emerald-500">•</span>
-              <span>
-                Restrict keys to known IPs with the{' '}
-                <Shield className="inline size-3 -mt-0.5" /> allowlist, and
-                cap burst traffic with a per-key{' '}
-                <Gauge className="inline size-3 -mt-0.5" /> rate limit. Excess
-                calls return <code className="text-foreground">429</code>.
               </span>
             </li>
             <li className="flex gap-2">

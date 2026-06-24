@@ -56,7 +56,6 @@ export async function GET(req: Request) {
         id: auth.user.id,
         email: auth.user.email,
         name: auth.user.name,
-        tenantName: auth.user.tenantName ?? null,
         role: auth.user.role ?? null,
       },
       apiKey: {
@@ -65,8 +64,6 @@ export async function GET(req: Request) {
         scopes: auth.apiKey.scopes,
         prefix: auth.apiKey.prefix,
         lastUsedAt: auth.apiKey.lastUsedAt,
-        allowedIps: auth.apiKey.allowedIps,
-        rateLimitPerMinute: auth.apiKey.rateLimitPerMinute,
       },
       account: {
         activeKeys,

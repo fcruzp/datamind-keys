@@ -85,7 +85,7 @@ export async function POST(req: Request) {
     {
       ok: true,
       sql,
-      datasourceId: parsed.datasourceId ?? 'demo',
+      datasourceId: parsed.data.datasourceId ?? 'demo',
       rowCount: rows.length,
       durationMs,
       rows,

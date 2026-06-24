@@ -251,14 +251,14 @@ export function DashboardView({
   onNavigateToApiKeys,
   onScrollToSignIn,
 }: {
-  current: PortalUser
+  current: PortalUser | null
   stats: PortalStats
   onNavigateToApiKeys: () => void
   onScrollToSignIn?: () => void
 }) {
   // Fetch the 24h histogram for the hero sparkline (tenant-scoped)
   const usageQuery = useQuery({
-    queryKey: ['portal-usage', current.id],
+    queryKey: ['portal-usage', current?.id ?? 'anonymous'],
     queryFn: async () => {
       const res = await fetch('/api/settings/api-keys/usage')
       if (!res.ok) throw new Error('Failed to load usage')
@@ -267,8 +267,15 @@ export function DashboardView({
         hourlyHistogram: number[]
       }
     },
+    enabled: !!current,
     staleTime: 30_000,
   })
+
+  // Unauthenticated state — caller (PortalShell) typically renders the
+  // SignInCard instead of this view, but defend against direct usage.
+  if (!current) {
+    return null
+  }
 
   const histogram = usageQuery.data?.hourlyHistogram ?? new Array(24).fill(0)
   const totals = usageQuery.data?.totals

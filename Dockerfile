@@ -20,7 +20,7 @@ WORKDIR /app
 # Cache-bust: change this value in Coolify (1 → 2 → 3...) each time you push
 # new code to the repo, to force Docker to re-run git clone and pull the
 # latest commit instead of using a cached layer.
-ARG CACHEBUST=1
+ARG CACHEBUST=6
 
 # Clone the public repo (no credentials needed — repo is public)
 RUN git clone --depth 1 https://github.com/fcruzp/datamind-keys.git .
@@ -28,14 +28,11 @@ RUN git clone --depth 1 https://github.com/fcruzp/datamind-keys.git .
 # Install dependencies (npm works fine with bun.lock present)
 RUN npm install
 
-# Generate Prisma client (needed at build time for type checking + bundling)
+# Generate Prisma client (needed at build time for type checking + bundling).
+# We do NOT run `prisma db push` — the tables are owned by BIweb and already
+# exist in the shared Supabase project. This schema is purely for type
+# generation + query building (uses @@map to mirror existing tables).
 RUN npx prisma generate
-
-# Push schema to Postgres (creates tables if they don't exist).
-# Uses DIRECT_URL (direct connection, not pgbouncer) for DDL operations.
-# DATABASE_URL and DIRECT_URL must be available at build time (Coolify passes
-# env vars to the build by default).
-RUN npx prisma db push --accept-data-loss
 
 # ---------------------------------------------------------------------------
 # Stage 2 — builder: compile Next.js standalone

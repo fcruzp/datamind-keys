@@ -24,7 +24,8 @@ export interface PortalStats {
 }
 
 export interface AuthMeResponse {
-  current: PortalUser & { isDefault?: boolean }
+  /** null when no Supabase session is active (UI shows Sign In card). */
+  current: (PortalUser & { isDefault?: boolean }) | null
   switchable: (PortalUser & { isCurrent: boolean })[]
   stats: PortalStats
 }

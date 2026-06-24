@@ -3,18 +3,35 @@ import type { NextRequest } from 'next/server'
 import {
   getCurrentUser,
   listSwitchableUsers,
-  SESSION_COOKIE,
 } from '@/lib/session'
 import { db } from '@/lib/db'
 import { withDbSafe } from '@/lib/api-wrapper'
 
 // GET /api/auth/me
-// Returns the currently-logged-in user (resolved from the session cookie),
-// the list of switchable demo tenants, and quick stats so the portal shell
-// can render the sidebar / dashboard without N round-trips.
+// Returns the currently-logged-in user (resolved from Supabase Auth),
+// the list of switchable tenants (empty in integrated mode), and quick stats
+// so the portal shell can render the sidebar / dashboard without N round-trips.
+//
+// If no Supabase session exists, returns 401 so the UI can show a Sign In card.
 
 export const GET = withDbSafe<NextRequest>(async (req) => {
   const user = await getCurrentUser(req)
+
+  if (!user) {
+    return NextResponse.json(
+      {
+        current: null,
+        switchable: [],
+        stats: {
+          activeKeys: 0,
+          revokedKeys: 0,
+          requests7d: 0,
+          lastRequestAt: null,
+        },
+      },
+      { status: 200 },
+    )
+  }
 
   // Defensive: listSwitchableUsers may fail if DB is unreachable.
   let switchable: Awaited<ReturnType<typeof listSwitchableUsers>> = []
@@ -55,12 +72,10 @@ export const GET = withDbSafe<NextRequest>(async (req) => {
     console.error('[/api/auth/me] stats query failed:', e)
   }
 
-  // The cookie that's actually set (may be undefined → defaults to demo@datamind.bi)
-  const cookieEmail = req.cookies.get(SESSION_COOKIE)?.value
-
   return NextResponse.json({
     current: {
       id: user.id,
+      supabaseId: user.supabaseId,
       email: user.email,
       name: user.name,
       tenantName: user.tenantName,
@@ -68,10 +83,9 @@ export const GET = withDbSafe<NextRequest>(async (req) => {
       role: user.role,
       isSupabase: user.isSupabase ?? false,
       avatarUrl: user.avatarUrl ?? null,
-      isDefault: !cookieEmail || cookieEmail === user.email,
     },
-    // When a real Supabase user is logged in, we hide the demo tenant
-    // switcher entirely — they should sign out + back in to switch accounts.
+    // In integrated mode there are no switchable tenants (Supabase users
+    // switch by signing out + into a different account).
     switchable: (user.isSupabase ? [] : switchable).map((u) => ({
       id: u.id,
       email: u.email,

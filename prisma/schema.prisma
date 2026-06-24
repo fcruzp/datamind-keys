@@ -1,109 +1,128 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
+//
+// ============================================================================
+// FULL INTEGRATION with BIweb (datamind.mooo.com)
+// ============================================================================
+// This schema MIRRORS the existing tables in the shared Supabase project
+// (rsrcdaepiwjqfynwwzcn). It does NOT create or alter any table — the tables
+// are owned by BIweb. We use @@map / @map to map our Prisma models to the
+// existing snake_case table and column names.
+//
+// The Dockerfile runs ONLY `prisma generate` (never `prisma db push`), so
+// this schema is used purely for type generation + query building.
+// ============================================================================
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
 
-/// A DataMind BI account. In production this is provisioned by Supabase Auth;
-/// in the sandbox we seed a handful of deterministic demo users (one per
-/// "tenant") so the per-tenant API key flows can be exercised end-to-end.
+// ===========================================================================
+// User — mirrors BIweb's `users` table (NOT auth.users).
+// In BIweb, this row is created on signup via a trigger. The `supabaseId`
+// field links to auth.users.id (the Supabase Auth UUID).
+// ===========================================================================
 model User {
-  id          String   @id @default(cuid())
-  email       String   @unique
-  name        String?
-  /// Display name of the tenant/workspace this user owns (e.g. "Acme Analytics").
-  /// In production this maps to the Supabase org/tenant; in the sandbox it
-  /// lets us render a clear "Logged in as <tenant>" badge in the portal.
-  tenantName  String   @default("Personal")
-  /// Tailwind gradient class used to colour the avatar in the switcher.
-  avatarColor String   @default("from-emerald-500 to-teal-600")
-  /// "owner" | "admin" | "viewer" — drives what the portal shows.
-  role        String   @default("owner")
-  lastLoginAt DateTime?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id                  String   @id @default(cuid())
+  supabaseId          String   @unique @map("supabase_id")
+  email               String   @unique
+  name                String?
+  avatarUrl           String?  @map("avatar_url")
+  company             String?
+  phone               String?
+  role                String   @default("user") // admin, user
+  country             String?
+  taxId               String?  @map("tax_id")
+  preferredLang       String   @default("es") @map("preferred_lang")
+  openRouterKey       String?  @map("open_router_key")
+  onboardingCompleted Boolean  @default(false) @map("onboarding_completed")
+  interestArea        String?  @map("interest_area")
 
   apiKeys ApiKey[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("users")
 }
 
-model Post {
-  id        String   @id @default(cuid())
-  title     String
-  content   String?
-  published Boolean  @default(false)
-  authorId  String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-}
-
-/// API Keys for third-party integrations (OpenFN, N8N, etc.)
+// ===========================================================================
+// ApiKey — mirrors BIweb's `api_keys` table.
+// NOTE: BIweb does NOT have `allowed_ips` or `rate_limit_per_minute` columns.
+// Rate limiting is handled in-memory (default 60 req/min). IP allowlisting
+// is not persisted (feature removed for integration compatibility).
+// ===========================================================================
 model ApiKey {
-  id          String    @id @default(cuid())
-  userId      String
-  keyHash     String    @unique
-  keyPrefix   String
-  label       String
-  scopes      String    @default("[]")
-  /// JSON array of allowed IPs/CIDRs. Empty = allow all.
-  allowedIps  String    @default("[]")
-  /// Per-key rate limit (requests per minute). Null = use global default (60).
-  rateLimitPerMinute Int?
-  revokedAt   DateTime?
-  lastUsedAt  DateTime?
-  lastUsedIp  String?
-  expiresAt   DateTime?
-  createdAt   DateTime  @default(now())
+  id         String    @id @default(cuid())
+  userId     String    @map("user_id")
+  keyHash    String    @unique @map("key_hash")
+  keyPrefix  String    @map("key_prefix")
+  label      String
+  scopes     String    @default("[]")
+  revokedAt  DateTime? @map("revoked_at")
+  lastUsedAt DateTime? @map("last_used_at")
+  lastUsedIp String?   @map("last_used_ip")
+  expiresAt  DateTime? @map("expires_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
 
   user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   requestLogs ApiRequestLog[]
 
   @@index([userId])
   @@index([keyHash])
+  @@map("api_keys")
 }
 
+// ===========================================================================
+// ApiRequestLog — mirrors BIweb's `api_request_logs` table.
+// ===========================================================================
 model ApiRequestLog {
-  id          String   @id @default(cuid())
-  apiKeyId    String
-  endpoint    String
-  method      String
-  statusCode  Int
-  durationMs  Int
-  rowCount    Int?
-  ip          String?
-  createdAt   DateTime @default(now())
+  id         String   @id @default(cuid())
+  apiKeyId   String   @map("api_key_id")
+  endpoint   String
+  method     String
+  statusCode Int      @map("status_code")
+  durationMs Int      @map("duration_ms")
+  rowCount   Int?     @map("row_count")
+  ip         String?
+  createdAt  DateTime @default(now()) @map("created_at")
 
-  apiKey      ApiKey @relation(fields: [apiKeyId], references: [id], onDelete: Cascade)
+  apiKey ApiKey @relation(fields: [apiKeyId], references: [id], onDelete: Cascade)
 
   @@index([apiKeyId, createdAt])
   @@index([createdAt])
+  @@map("api_request_logs")
 }
 
-/// Audit trail for management actions on API keys (create / edit / revoke).
-/// Used to satisfy compliance: "who did what, when".
+// ===========================================================================
+// SettingsAuditLog — mirrors the `settings_audit_logs` table.
+// This table is NOT in BIweb's Prisma schema; it was created by our
+// supabase/migrations/0001_schema_additions.sql. It uses native Postgres
+// types (uuid, jsonb, inet, timestamptz) so we use @db modifiers.
+//
+// IMPORTANT: `user_id` references auth.users(id) — the Supabase Auth UUID,
+// NOT users.id (cuid). When writing audit entries, pass the Supabase UUID
+// (SessionUser.supabaseId), not the Prisma User.id.
+// ===========================================================================
 model SettingsAuditLog {
-  id          String   @id @default(cuid())
-  userId      String
-  /// "api_key.create" | "api_key.update" | "api_key.revoke"
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
   action      String
-  /// Target API key id (null only if action target was unknown)
-  apiKeyId    String?
-  /// Target API key label (denormalized for human-readable audit even after key is deleted)
-  apiKeyLabel String?
-  /// JSON snapshot of the change. For create: full new record (minus hash).
-  /// For update: { before: {...}, after: {...} }. For revoke: { revokedAt }.
-  diff        String   @default("{}")
-  ip          String?
-  userAgent   String?
-  createdAt   DateTime @default(now())
+  apiKeyId    String?  @map("api_key_id") @db.Uuid
+  apiKeyLabel String?  @map("api_key_label")
+  diff        Json     @default("{}")
+  ip          String?  @db.Inet
+  userAgent   String?  @map("user_agent")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
 
   @@index([userId, createdAt])
   @@index([apiKeyId])
   @@index([action])
+  @@map("settings_audit_logs")
 }

@@ -1776,3 +1776,55 @@ Stage Summary:
   4. Para que los datos funcionen de verdad, debe marcar DATABASE_URL y
      DIRECT_URL como "Available at Buildtime" en Coolify y redeployar
      (así prisma db push creará las tablas)
+
+---
+Task ID: 6
+Agent: full-stack-developer
+Task: Remove allowedIps/rateLimitPerMinute from UI components + handle null user
+
+Work Log:
+- Read worklog.md, src/components/api-keys/types.ts, and all 8 target files to understand current structure.
+- Updated `src/components/api-keys/create-api-key-dialog.tsx`:
+  - Removed `allowedIps` and `rateLimitPerMinute` from Zod schema.
+  - Removed IP allowlist input, rate-limit Select, and the entire "Advanced" Collapsible block.
+  - Removed state: `rateLimit`, `ipInput`, `allowedIps`, `advancedOpen`; removed `addIp`/`removeIp` helpers and `RATE_LIMIT_OPTIONS`.
+  - Removed unused imports: `Shield`, `Gauge`, `ChevronDown`, `X`, `Globe`, `Collapsible*`.
+  - POST body now sends only `label`, `scopes`, `expiresInDays`.
+- Updated `src/components/api-keys/edit-api-key-dialog.tsx`:
+  - Stripped the form down to a single Label input; removed IP allowlist + rate-limit inputs and related state.
+  - PATCH body now sends only `label` (when changed).
+  - Removed unused imports (`Shield`, `Gauge`, `X`, `Globe`, `Select*`).
+- Updated `src/components/api-keys/api-keys-manager.tsx`:
+  - Removed the IP-allowlist chip + rate-limit chip block under each KeyRow label (kept the masked key, scopes, sparkline, dates).
+  - Removed `allowedIps` and `rateLimitPerMinute` display from the revoke confirmation dialog.
+  - Updated Edit button title from "Edit label, rate limit, IPs" → "Edit label".
+  - Removed the bullet in `SecurityNote` that referenced IP allowlist + rate limit; kept `Globe` import (still used for `lastUsedIp` tooltip).
+  - Removed unused `Shield`, `Gauge` imports.
+- Updated `src/components/api-keys/audit-log-panel.tsx`:
+  - `diff` field is already typed as `Record<string, unknown>` (Prisma Json returns parsed objects); no `JSON.parse` calls were present.
+  - Removed `IPs` and `rate` DiffChips from the `api_key.create` DiffSummary; kept only `scopes` and `expires`.
+  - Updated JSDoc to say "shows scopes + expiry" instead of "scopes + IP allowlist count + rate limit".
+- Updated `src/components/portal/portal-shell.tsx`:
+  - Imported `SignInCard` from `./sign-in-card`.
+  - `current` is now `(PortalUser & { isDefault?: boolean }) | null`; `currentTenantId` uses optional chaining `authQuery.data?.current?.id`.
+  - Auth-surface conditional now leads with `!current ? SignInCTA : ...` so the sign-in button is the only thing shown in the header when unauthenticated.
+  - When `current` is null, the desktop sidebar + mobile sidebar Sheet are hidden, and `<main>` renders a centered `SignInCard` (wrapped in a `#signin` anchor with heading + description) instead of the DashboardView.
+  - Footer gracefully renders "Not signed in" when `current` is null instead of crashing on `current.email[0]`.
+- Updated `src/components/portal/dashboard-view.tsx`:
+  - Changed `current: PortalUser` prop type to `current: PortalUser | null`.
+  - Usage query uses `current?.id ?? 'anonymous'` as key and `enabled: !!current`.
+  - Added early `if (!current) return null` after all hooks (defensive — PortalShell already routes unauthenticated users to the SignInCard).
+- Updated `src/components/portal/auth-menu.tsx`:
+  - `AuthMenu` now accepts `user: PortalUser | null`; if null, returns a `SignInCTA` (compact sign-in button) instead of the avatar dropdown.
+  - Moved `initials` useMemo above the early return and added `if (!user) return '?'` guard inside it (rules of hooks).
+- Verified `src/components/portal/tenant-switcher.tsx`: parent (PortalShell) already gates it behind `switchable.length > 0`, so in integrated (Supabase) mode it's never rendered. Left the component itself unchanged (rendering an empty dropdown is the worst case and is harmless).
+- Ran `bun run lint` → no errors. Ran `bunx tsc --noEmit` and filtered for `src/components/` → no type errors in any of the modified files (errors elsewhere in `src/lib/session.ts`, `src/lib/api-auth.ts`, etc. are pre-existing from the Supabase schema refactor and outside this task's scope).
+- Verified dev.log shows successful `GET /` (200) with no UI errors after the changes.
+
+Stage Summary:
+- All 8 target files updated; zero remaining references to `allowedIps`, `rateLimitPerMinute`, `RATE_LIMIT_OPTIONS`, or `JSON.parse(diff)` anywhere under `src/components/`.
+- Create flow now sends `{ label, scopes, expiresInDays }`; edit flow now sends only `{ label }`.
+- The audit log panel treats `diff` as a parsed object (no JSON.parse) and only renders `scopes` + `expires` for create events.
+- Unauthenticated state (`initial.current === null`) is fully handled: header shows a "Sign in" button, body shows a centered `SignInCard` with heading + description, sidebar nav is hidden, and the footer renders "Not signed in" instead of crashing.
+- `DashboardView` and `AuthMenu` both defensively accept nullable `current`/`user` props so they cannot crash if called directly with null.
+- No new dependencies added; no visual styling changes (only field/logic removal + the new unauthenticated-state block, which reuses the existing `SignInCard` component).

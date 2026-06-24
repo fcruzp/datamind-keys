@@ -4,19 +4,37 @@ import { PortalShell } from '@/components/portal/portal-shell'
 import type { AuthMeResponse } from '@/components/portal/types'
 
 // ---------------------------------------------------------------------------
-// /  —  DataMind BI Portal (sandbox)
+// /  —  DataMind BI Portal (integrated with BIweb)
 //
-// Server Component: resolves the current tenant from the session cookie,
-// pulls quick stats from the DB (no HTTP round-trip), and hands the bundle
-// to the client-side <PortalShell/> which owns view switching + mutations.
+// Server Component: resolves the current user from the Supabase Auth session,
+// pulls quick stats from the shared DB (no HTTP round-trip), and hands the
+// bundle to the client-side <PortalShell/> which owns view switching +
+// mutations.
+//
+// If no Supabase session exists, PortalShell shows a Sign In card.
 // ---------------------------------------------------------------------------
 
-// Force dynamic rendering — this page depends on the request session cookie
+// Force dynamic rendering — this page depends on the Supabase session cookie
 // and the database, so it must NOT be prerendered at build time.
 export const dynamic = 'force-dynamic'
 
 export default async function Home() {
   const user = await getCurrentUser()
+
+  // Not signed in — PortalShell will render the Sign In card.
+  if (!user) {
+    const empty: AuthMeResponse = {
+      current: null,
+      switchable: [],
+      stats: {
+        activeKeys: 0,
+        revokedKeys: 0,
+        requests7d: 0,
+        lastRequestAt: null,
+      },
+    }
+    return <PortalShell initial={empty} />
+  }
 
   // Defensive: listSwitchableUsers + stats queries may fail if the DB is
   // unreachable or tables don't exist yet. Wrap everything so the page

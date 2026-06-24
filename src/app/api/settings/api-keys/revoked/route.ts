@@ -4,7 +4,6 @@ import { db } from '@/lib/db'
 import {
   getDemoUser,
   maskApiKey,
-  parseAllowedIps,
   parseScopes,
 } from '@/lib/api-auth'
 import { withDbSafe } from '@/lib/api-wrapper'
@@ -25,8 +24,6 @@ export const GET = withDbSafe<NextRequest>(async (req) => {
       label: true,
       keyPrefix: true,
       scopes: true,
-      allowedIps: true,
-      rateLimitPerMinute: true,
       lastUsedAt: true,
       lastUsedIp: true,
       expiresAt: true,
@@ -42,8 +39,6 @@ export const GET = withDbSafe<NextRequest>(async (req) => {
       label: k.label,
       keyMasked: maskApiKey(k.keyPrefix),
       scopes: parseScopes(k.scopes),
-      allowedIps: parseAllowedIps(k.allowedIps),
-      rateLimitPerMinute: k.rateLimitPerMinute,
       lastUsedAt: k.lastUsedAt,
       lastUsedIp: k.lastUsedIp,
       expiresAt: k.expiresAt,

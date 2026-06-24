@@ -36,6 +36,15 @@ export function withDbSafe<T extends NextRequest>(
         msg.includes('connect') ||
         msg.includes('prisma')
 
+      // Authentication errors (thrown by getDemoUser when no Supabase session)
+      // are returned as 401, not 503.
+      if (msg.includes('Not authenticated') || msg.includes('authentication')) {
+        return NextResponse.json(
+          { error: 'Not authenticated. Please sign in.' },
+          { status: 401 },
+        )
+      }
+
       console.error('[api] DB error:', code, msg)
 
       if (req.method === 'GET') {
