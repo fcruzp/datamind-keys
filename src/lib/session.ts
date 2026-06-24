@@ -231,15 +231,23 @@ export async function getCurrentUser(
 
   // --- 2. Fall back to demo cookie session ---------------------------------
   let email: string | undefined
-  if (req) {
-    email = req.cookies.get(SESSION_COOKIE)?.value
-  } else {
-    const c = await cookies()
-    email = c.get(SESSION_COOKIE)?.value
+  try {
+    if (req) {
+      email = req.cookies.get(SESSION_COOKIE)?.value
+    } else {
+      const c = await cookies()
+      email = c.get(SESSION_COOKIE)?.value
+    }
+  } catch {
+    // cookies() not available in this context — continue with no email.
   }
 
-  let user = email
-    ? await db.user.findUnique({
+  // Defensive DB lookup — if the DB is unreachable or tables don't exist,
+  // fall through to the hardcoded demo user instead of crashing the page.
+  let user: SessionUser | null = null
+  try {
+    if (email) {
+      user = await db.user.findUnique({
         where: { email },
         select: {
           id: true,
@@ -250,25 +258,36 @@ export async function getCurrentUser(
           role: true,
         },
       })
-    : null
+    }
 
-  if (!user) {
-    user = await db.user.findUnique({
-      where: { email: DEFAULT_SESSION_EMAIL },
-      select: {
-        id: true,
-        email: true,
-        name: true,
-        tenantName: true,
-        avatarColor: true,
-        role: true,
-      },
-    })
+    if (!user) {
+      user = await db.user.findUnique({
+        where: { email: DEFAULT_SESSION_EMAIL },
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          tenantName: true,
+          avatarColor: true,
+          role: true,
+        },
+      })
+    }
+  } catch (e) {
+    console.error('[session] DB lookup failed:', e)
   }
 
-  // Extremely defensive: should never happen because seedDemoTenants() ran.
+  // Hard fallback: if the DB is down or the demo user doesn't exist,
+  // return a synthetic anonymous demo user so the page can still render.
   if (!user) {
-    throw new Error('Failed to resolve session user')
+    return {
+      id: 'anonymous-demo',
+      email: DEFAULT_SESSION_EMAIL,
+      name: 'DataMind Demo',
+      tenantName: 'DataMind BI',
+      avatarColor: 'from-emerald-500 to-teal-600',
+      role: 'owner',
+    }
   }
 
   return user

@@ -17,30 +17,46 @@ export const dynamic = 'force-dynamic'
 
 export default async function Home() {
   const user = await getCurrentUser()
-  const switchable = await listSwitchableUsers()
 
-  // Quick stats — same shape as /api/auth/me, computed server-side to avoid
-  // a waterfall of fetches on first paint.
+  // Defensive: listSwitchableUsers + stats queries may fail if the DB is
+  // unreachable or tables don't exist yet. Wrap everything so the page
+  // still renders with zeros instead of crashing.
+  let switchable: Awaited<ReturnType<typeof listSwitchableUsers>> = []
+  try {
+    switchable = await listSwitchableUsers()
+  } catch (e) {
+    console.error('[/] listSwitchableUsers failed:', e)
+  }
+
   const since7d = new Date(Date.now() - 1000 * 60 * 60 * 24 * 7)
-  const [activeKeys, revokedKeys, requests7d, lastLogAt] = await Promise.all([
-    db.apiKey.count({
-      where: { userId: user.id, revokedAt: null },
-    }),
-    db.apiKey.count({
-      where: { userId: user.id, revokedAt: { not: null } },
-    }),
-    db.apiRequestLog.count({
-      where: {
-        apiKey: { userId: user.id },
-        createdAt: { gte: since7d },
-      },
-    }),
-    db.apiRequestLog.findFirst({
-      where: { apiKey: { userId: user.id } },
-      orderBy: { createdAt: 'desc' },
-      select: { createdAt: true },
-    }),
-  ])
+  let activeKeys = 0
+  let revokedKeys = 0
+  let requests7d = 0
+  let lastLogAt: { createdAt: Date } | null = null
+
+  try {
+    ;[activeKeys, revokedKeys, requests7d, lastLogAt] = await Promise.all([
+      db.apiKey.count({
+        where: { userId: user.id, revokedAt: null },
+      }),
+      db.apiKey.count({
+        where: { userId: user.id, revokedAt: { not: null } },
+      }),
+      db.apiRequestLog.count({
+        where: {
+          apiKey: { userId: user.id },
+          createdAt: { gte: since7d },
+        },
+      }),
+      db.apiRequestLog.findFirst({
+        where: { apiKey: { userId: user.id } },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true },
+      }),
+    ])
+  } catch (e) {
+    console.error('[/] stats query failed:', e)
+  }
 
   const initial: AuthMeResponse = {
     current: {
