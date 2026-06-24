@@ -1,9 +1,6 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -19,6 +16,8 @@ model User {
   name      String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  apiKeys ApiKey[]
 }
 
 model Post {
@@ -29,4 +28,42 @@ model Post {
   authorId  String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+/// API Keys for third-party integrations (OpenFN, N8N, etc.)
+model ApiKey {
+  id          String    @id @default(cuid())
+  userId      String
+  keyHash     String    @unique
+  keyPrefix   String
+  label       String
+  scopes      String    @default("[]")
+  revokedAt   DateTime?
+  lastUsedAt  DateTime?
+  lastUsedIp  String?
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  requestLogs ApiRequestLog[]
+
+  @@index([userId])
+  @@index([keyHash])
+}
+
+model ApiRequestLog {
+  id          String   @id @default(cuid())
+  apiKeyId    String
+  endpoint    String
+  method      String
+  statusCode  Int
+  durationMs  Int
+  rowCount    Int?
+  ip          String?
+  createdAt   DateTime @default(now())
+
+  apiKey      ApiKey @relation(fields: [apiKeyId], references: [id], onDelete: Cascade)
+
+  @@index([apiKeyId, createdAt])
+  @@index([createdAt])
 }
