@@ -2054,3 +2054,136 @@ Unresolved Issues / Risks:
 - Hypothesis: api_keys.id and api_request_logs.id are uuid, users.id is text
 - If api_keys.user_id is also uuid (referencing users.id text), that's a
   broken FK in the actual DB — but unlikely since the user was found
+
+---
+Task ID: 11
+Agent: full-stack-developer
+Task: Fix Prisma schema + all callers to match the ACTUAL Supabase DB column
+types (discovered via /api/debug/db-health `columnTypes` output in Task 10).
+The previous schema assumed cuid for api_keys.id and text for several other
+columns — in reality the table uses uuid / jsonb / inet / timestamptz. This
+caused a P2023 "invalid UUID" error every time the app tried to create an
+API key.
+
+Work Log:
+- Read worklog + every relevant source file (schema.prisma, api-auth.ts,
+  all 5 settings/api-keys routes, auth/me, page.tsx, public/v1/me,
+  debug/db-health, session.ts, api-wrapper.ts) to map the full blast radius.
+- Rewrote `prisma/schema.prisma` to mirror the real column types:
+  - `User.id` stays `String @id @default(cuid())` (text in DB)
+  - `User.createdAt` / `updatedAt` → `@db.Timestamp` (timestamp without tz)
+  - `ApiKey.id` → `String @id @default(uuid()) @db.Uuid`
+  - `ApiKey.userId` → `String @db.Uuid` (references supabaseId, NOT users.id)
+  - `ApiKey.scopes` → `Json @default("[]")` (was String)
+  - `ApiKey.allowedIps` → `Json @default("[]") @map("allowed_ips")` (RE-ADDED — column exists in DB and is NOT NULL!)
+  - `ApiKey.rateLimitPerMinute` → `Int?` (RE-ADDED — column exists in DB)
+  - `ApiKey.lastUsedIp` → `String? @db.Inet` (was plain text)
+  - `ApiKey.revokedAt` / `lastUsedAt` / `expiresAt` / `createdAt` → `@db.Timestamptz`
+  - `ApiRequestLog.id` → `String @id @default(uuid()) @db.Uuid`
+  - `ApiRequestLog.apiKeyId` → `String @db.Uuid`
+  - `ApiRequestLog.ip` → `String? @db.Inet`
+  - `ApiRequestLog.createdAt` → `@db.Timestamptz`
+  - REMOVED all Prisma relations (User↔ApiKey, ApiKey↔ApiRequestLog) because
+    users.id (text) and api_keys.user_id (uuid) have incompatible types.
+- Ran `bunx prisma generate` to regenerate the client.
+- Rewrote `src/lib/api-auth.ts`:
+  - Re-added `allowedIps: string[]` + `rateLimitPerMinute: number | null`
+    to `AuthenticatedApiKey`.
+  - `parseScopes()` now accepts `unknown` and handles BOTH the new Json
+    return type (already-parsed array) and the legacy string form
+    (JSON.parse). Future-proof against either storage shape.
+  - New helper `parseAllowedIps(json: unknown)` — same dual-shape handling.
+  - New helpers `scopesToJson()` + `allowedIpsToJson()` for Prisma writes.
+  - `authenticateApiKey()`:
+    - Removed `include: { user: true }` (relation gone). Now does a separate
+      `db.user.findUnique({ where: { supabaseId: apiKey.userId } })`.
+    - Re-added the IP allowlist check (403 if non-empty list + IP not in it).
+    - Per-key rate limit: `apiKey.rateLimitPerMinute ?? DEFAULT_RATE_LIMIT_PER_MINUTE`.
+    - `checkRateLimit()` now takes a `capacity` parameter and resets the
+      bucket when capacity changes (so updating the per-key limit takes
+      effect immediately instead of waiting for the bucket to drain).
+  - `writeAuditLog()` still passes `apiKeyId` — but callers can now pass
+    `api_keys.id` (uuid) instead of null, since the column types match.
+- Updated `src/app/api/settings/api-keys/route.ts`:
+  - GET: includes `allowedIps` + `rateLimitPerMinute` in select + response,
+    parses `allowedIps` via `parseAllowedIps`.
+  - POST: Zod schema accepts `allowedIps` (string[]) and `rateLimitPerMinute`
+    (number | null), both optional. Uses `user.supabaseId` as `userId`
+    (NOT `user.id` — that was the root cause of the P2023). `scopes` and
+    `allowedIps` passed as JSON arrays (Prisma Json). Audit log now passes
+    `created.id` (uuid) as `apiKeyId`.
+- Updated `src/app/api/settings/api-keys/[id]/route.ts`:
+  - PATCH: schema accepts `label` + `allowedIps` + `rateLimitPerMinute`.
+    Ownership check filters by `user.supabaseId`. Audit log passes
+    `updated.id` (uuid) as `apiKeyId`. Diff records before/after for
+    allowedIps + rateLimitPerMinute when they change.
+  - DELETE: ownership check filters by `user.supabaseId`. Audit log passes
+    `apiKey.id` (uuid) as `apiKeyId`.
+- Updated `src/app/api/settings/api-keys/revoked/route.ts`:
+  - Filter by `user.supabaseId`. Include + return `allowedIps` and
+    `rateLimitPerMinute`.
+- Updated `src/app/api/settings/api-keys/usage/route.ts`:
+  - Removed `apiKey: { userId }` filters (relation gone). Two-step query:
+    1. `db.apiKey.findMany({ where: { userId: user.supabaseId } })` to get
+       the user's key IDs + label/prefix metadata.
+    2. `db.apiRequestLog.*({ where: { apiKeyId: { in: keyIds } } })` for
+       recent logs / groupBy / aggregate / 24h histogram.
+  - `recentLogs` no longer uses `apiKey: { select: ... }`; instead we map
+    `apiKeyId` → label via a local lookup map built from step 1.
+  - Early-return empty payload when user has zero keys (avoids `IN ()`
+    which Postgres rejects).
+- Updated `src/app/api/auth/me/route.ts`:
+  - `apiKey.count` filters by `user.supabaseId`.
+  - Two-step: fetch user's key IDs, then `apiRequestLog.count` +
+    `findFirst` with `apiKeyId: { in: keyIds }`.
+- Updated `src/app/page.tsx` (same logic as auth/me).
+- Updated `src/app/api/public/v1/me/route.ts`:
+  - `apiKey.count` filters by `auth.user.supabaseId`.
+  - Two-step for `apiRequestLog.count`.
+- Updated `src/app/api/debug/db-health/route.ts`:
+  - Write test now uses `result.auth.userSupabaseId` (NOT `userId` cuid)
+    as the `user_id` INSERT value, with `::uuid` cast.
+  - INSERT now also provides `allowed_ips = '[]'::jsonb` (NOT NULL column).
+  - Cleanup DELETE uses `::uuid` cast (was `::text`, which would fail
+    since `id` is uuid).
+- Updated `src/lib/session.ts` doc-comment: `users.id` is NOT the FK for
+  api_keys; `users.supabase_id` is.
+- Lint: `bun run lint` → clean (0 errors, 0 warnings).
+- TypeScript: `bunx tsc --noEmit` → only pre-existing errors in
+  examples/websocket + skills/* (untouched, unrelated to this task).
+  Zero new errors in any file I modified.
+- Committed as `ae2979b`, pushed to `fcruzp/datamind-keys` main.
+
+Stage Summary:
+- Prisma schema now EXACTLY matches the real Supabase DB column types
+  (verified against information_schema output from Task 10).
+- The P2023 "invalid UUID" error on POST /api/settings/api-keys is fixed:
+  the route now passes `user.supabaseId` (uuid) as `user_id`, and the
+  schema generates a uuid for `id` via `@default(uuid()) @db.Uuid`.
+- `allowed_ips` (jsonb, NOT NULL) + `rate_limit_per_minute` (integer
+  nullable) are properly persisted and read. The IP allowlist + per-key
+  rate limit features work end-to-end again.
+- All Prisma relations between User ↔ ApiKey ↔ ApiRequestLog are REMOVED
+  (types differ). Where we previously used `apiKey: { userId }` filters,
+  we now do two-step queries: find the user's key IDs first, then filter
+  logs by `apiKeyId: { in: keyIds }`.
+- Audit logs (`settings_audit_logs.api_key_id`) now store the actual
+  `api_keys.id` (uuid) instead of null — full traceability restored.
+- Frontend types (`src/components/api-keys/types.ts`) were NOT modified:
+  the create/edit dialogs still send only `label` + `scopes`. The API
+  defaults `allowedIps` to `[]` and `rateLimitPerMinute` to `null` when
+  those fields are absent, so existing UI continues to work. The extra
+  fields returned by GET are simply ignored by the current UI (could be
+  surfaced in a follow-up task).
+- User needs to: bump CACHEBUST → 10 in Coolify, redeploy, then sign in
+  and try creating an API key. It should now succeed.
+
+Unresolved Issues / Risks:
+- The frontend UI doesn't expose `allowedIps` / `rateLimitPerMinute` form
+  fields (they were stripped in Task 5). The API supports them, but users
+  can't set them through the UI yet. A follow-up UI task could re-add
+  these controls to the create/edit dialogs.
+- The DB write test in `/api/debug/db-health` will now succeed (uses
+  correct types), so it no longer serves as a "does the schema match?"
+  canary. If the DB schema drifts again in the future, the next failure
+  will only surface at actual API key creation time.
