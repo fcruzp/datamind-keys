@@ -10,7 +10,7 @@
 -- ============================================================================
 SELECT
   t.table_name,
-  pg_size_pretty(pg_total_relation_size(schemaname || '.' || tablename)) AS total_size,
+  pg_size_pretty(pg_total_relation_size(format('%I.%I', t.table_schema, t.table_name)::regclass)) AS total_size,
   COALESCE(s.n_live_tup, 0) AS approx_row_count
 FROM information_schema.tables t
 LEFT JOIN pg_stat_user_tables s
