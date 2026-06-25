@@ -26,12 +26,14 @@ export async function GET() {
     db: { connected: boolean; error?: string }
     auth: { hasSession: boolean; userId?: string; userSupabaseId?: string; userEmail?: string; error?: string }
     tables: Record<string, { exists: boolean; readable: boolean; count?: number; error?: string }>
-    writeTest?: { ok: boolean; error?: string }
+    columnTypes: Record<string, Array<{ column: string; type: string; nullable: string; default: string | null }>>
+    writeTest?: { ok: boolean; error?: string; triedWith?: string }
   } = {
     timestamp: new Date().toISOString(),
     db: { connected: false },
     auth: { hasSession: false },
     tables: {},
+    columnTypes: {},
   }
 
   // --- 1. DB connectivity ----------------------------------------------------
@@ -107,34 +109,64 @@ export async function GET() {
     }
   }
 
+  // --- 3b. Column types from information_schema ------------------------------
+  // This tells us the EXACT data type of every column so we can detect
+  // mismatches between our Prisma schema (e.g. @default(cuid())) and the
+  // actual DB (which might use uuid).
+  try {
+    const rows = await db.$queryRaw<Array<{
+      table_name: string
+      column_name: string
+      data_type: string
+      is_nullable: string
+      column_default: string | null
+    }>>`
+      SELECT table_name, column_name, data_type, is_nullable, column_default
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name IN ('users', 'api_keys', 'api_request_logs', 'settings_audit_logs')
+      ORDER BY table_name, ordinal_position
+    `
+    for (const row of rows) {
+      const t = row.table_name as string
+      if (!result.columnTypes[t]) result.columnTypes[t] = []
+      result.columnTypes[t].push({
+        column: row.column_name as string,
+        type: row.data_type as string,
+        nullable: row.is_nullable as string,
+        default: row.column_default as string | null,
+      })
+    }
+  } catch (e: unknown) {
+    console.error('[db-health] column type query failed:', e)
+  }
+
   // --- 4. Write test (only if user is logged in + api_keys table exists) ----
   if (result.auth.hasSession && result.auth.userId && result.tables.api_keys?.readable) {
+    // First, try with the default Prisma behavior (cuid for id).
+    // If that fails with P2023 (UUID error), we know the id column is uuid.
     try {
-      // Attempt to create a key — if this fails, we get the EXACT Prisma
-      // error that the real POST /api/settings/api-keys would get.
-      // We immediately delete it so nothing persists.
       const { generateApiKey, serializeScopes } = await import('@/lib/api-auth')
       const { hash, prefix } = generateApiKey()
 
-      const created = await db.apiKey.create({
-        data: {
-          userId: result.auth.userId,
-          keyHash: hash,
-          keyPrefix: prefix,
-          label: '__healthcheck__',
-          scopes: serializeScopes(['read']),
-        },
-      })
-
+      // Use a raw SQL insert with gen_random_uuid() to bypass Prisma's
+      // @default(cuid()). This tells us if the ONLY issue is the id type.
+      const uuidResult = await db.$queryRaw<{ id: string }[]>`
+        INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label, scopes, created_at)
+        VALUES (gen_random_uuid(), ${result.auth.userId}, ${hash}, ${prefix}, '__healthcheck__', ${serializeScopes(['read'])}, NOW())
+        RETURNING id
+      `
+      const insertedId = uuidResult[0]?.id as string
       // Clean up immediately
-      await db.apiKey.delete({ where: { id: created.id } })
+      await db.$executeRaw`DELETE FROM api_keys WHERE id = ${insertedId}::text`
 
-      result.writeTest = { ok: true }
+      result.writeTest = { ok: true, triedWith: 'gen_random_uuid() via raw SQL' }
     } catch (e: unknown) {
       const err = e as { code?: string; message?: string; meta?: unknown }
       result.writeTest = {
         ok: false,
-        error: `${err?.code ?? ''}: ${err?.message?.slice(0, 300) ?? 'Unknown'}`,
+        triedWith: 'gen_random_uuid() via raw SQL',
+        error: `${err?.code ?? ''}: ${err?.message?.slice(0, 400) ?? 'Unknown'}`,
       }
     }
   }
