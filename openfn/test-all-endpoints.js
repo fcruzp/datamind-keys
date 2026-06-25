@@ -133,14 +133,21 @@ fn(state => {
 // Returns: { ok, sql, datasourceId, rowCount, durationMs,
 //            rows:[{id,label,value,generated_at}, …] }
 //
-// @openfn/language-http post() accepts { body: <object> } and JSON-serializes
-// it automatically, setting Content-Type: application/json.
+// @openfn/language-http v7.x GOTCHA: the `body` option must be a JSON
+// STRING, not an object. If you pass an object, the adaptor sends it as
+// "[object Object]" or form-encodes it, and the server's Zod parser sees
+// `sql: undefined` → 422 "expected string, received undefined".
+// The fix is two parts:
+//   1. JSON.stringify() the body yourself
+//   2. Set content-type: application/json explicitly (the adaptor does NOT
+//      set it automatically when body is a string)
 post('/api/public/v1/queries', {
-  body: {
+  body: JSON.stringify({
     sql: 'SELECT 1 AS one',
     datasourceId: 'demo',
     limit: 3,
-  },
+  }),
+  headers: { 'content-type': 'application/json' },
 });
 
 fn(state => {
