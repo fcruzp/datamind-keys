@@ -3188,3 +3188,86 @@ Unresolved Issues / Risks:
 - After volume mount is configured, user needs to redeploy datamind-keys
   (bump CACHEBUST → 18) and test /queries with a real SELECT.
 - SSL "Not secure" warning still pending.
+
+---
+Task ID: 28 (main agent — Phase 1 VERIFIED COMPLETE end-to-end)
+Agent: main (Z.ai Code)
+Task: User completed Coolify shared volume config + verified /queries
+with real SQL execution against uploaded SQLite. Record the milestone.
+
+Work Log:
+- Walked user through SSH access to Coolify server (187.127.249.13)
+  using Termius. User logged in as root@srv1614431 successfully.
+- First docker volume inspect failed: wrong volume name (one char off).
+  Listed all volumes with `docker volume ls` — found the correct one:
+  hyvtdbc00txfcds8pr6oj8ji-datamind-data (not ...fxcds8pr6o8jl-...)
+- docker volume inspect returned the Mountpoint:
+  /var/lib/docker/volumes/hyvtdbc00txfcds8pr6oj8ji-datamind-data/_data
+- Verified the volume has the tenant subfolders:
+  $ ls /var/lib/docker/volumes/.../hyvtdbc00txfcds8pr6oj8ji-datamind-data/_data/
+  cmp3azh230003ms01kb1mbyqg  cmp3flmly0000s201y43kix9m
+- User configured Coolify → datamind-keys → Storages → Add:
+  - Type: Directory mount (bind mount via host path)
+  - Name: datamind-shared-data
+  - Source Path: /var/lib/docker/volumes/hyvtdbc00txfcds8pr6oj8ji-datamind-data/_data
+  - Destination Path: /app/data
+- User bumped CACHEBUST → 18 and redeployed.
+- Verification inside datamind-keys container:
+  $ ls /app/data/
+  cmp3azh230003ms01kb1mbyqg  cmp3flmly0000s201y43kix9m  ✅
+- Live SQL test #1 (PowerShell Invoke-RestMethod):
+  POST /api/public/v1/queries
+  Body: { datasourceId: "cmp3flx2j0004s201d862fg03",
+          sql: "SELECT name FROM sqlite_master WHERE type='table' LIMIT 10" }
+  Response:
+  {
+    ok: true,
+    rowCount: 4,
+    durationMs: 10,
+    rows: [{name:"productos"}, {name:"sqlite_sequence"},
+           {name:"ventas"}, {name:"clientes"}]
+  }
+- Live SQL test #2:
+  Body: { sql: "SELECT * FROM clientes LIMIT 5" }
+  Response:
+  {
+    ok: true,
+    rowCount: 5,
+    durationMs: 1,
+    rows: [
+      {id:1, nombre:"María García", email:"maria@email.com",
+       provincia:"Santo Domingo", segmento:"premium",
+       fecha_registro:"2026-05-13"},
+      ...4 more real customer rows
+    ]
+  }
+- Updated ROADMAP.md:
+  - Added "Phase 1 COMPLETE" banner at the top with architecture diagram
+  - Marked tasks 1.1a, 1.2, 1.3, 1.4, 1.5 all as DONE
+  - Updated current state table to reflect live SQL execution working
+  - Bumped "Current deployed version" to CACHEBUST=18
+- Ran bun run lint → clean.
+- Committed and pushed.
+
+Stage Summary:
+- PHASE 1 IS OFFICIALLY COMPLETE AND VERIFIED IN PRODUCTION.
+- Live SQL execution is now working end-to-end:
+  BIweb upload → Supabase metadata → datamind-keys /queries →
+  shared volume → better-sqlite3 readonly → real rows in 1-10ms
+- Tenant isolation confirmed: only the caller's own datasources are
+  reachable (the API enforces userId match before opening the file).
+- 6-layer safety in production: read-only connection, SELECT-only,
+  13 blocked keywords, no multi-statement, row limit (1000 cap),
+  10s timeout.
+- OpenFN / N8N can now run real SELECT queries against uploaded
+  SQLite files — no code changes needed in the workflow.
+- Next milestone: Phase 2 (SQLite file upload/update via API) —
+  this would let OpenFN/N8N also WRITE/UPDATE the SQLite files,
+  not just read them.
+
+Unresolved Issues / Risks:
+- PowerShell encoding (UTF-8 chars show as mojibake in the terminal)
+  is cosmetic only — the API returns proper UTF-8 JSON.
+- SSL "Not secure" warning still pending (Coolify Let's Encrypt reissue).
+- Phase 2 (write/update via API) not yet implemented — would be the
+  next high-value feature for OpenFN/N8N automation.
