@@ -48,43 +48,55 @@ the SQLite files they uploaded via BIweb — e.g. `SELECT * FROM clientes LIMIT
 
 #### Tasks
 
-- [ ] **1.1 Investigate BIweb's file storage**
-  - Run a SQL probe to inspect `data_sources.file_path` values and determine
-    whether BIweb stores files on disk, in Supabase Storage, or both.
-  - SQL to run:
-    ```sql
-    SELECT id, user_id, name, file_name, file_path, file_type, file_size, status
-    FROM public.data_sources
-    LIMIT 10;
-    ```
-  - Check Supabase Storage for a `datasources` or `uploads` bucket.
-  - **Decision point:** if files are in Supabase Storage, we download on-demand
-    to a temp file; if on disk, we read directly (only works if datamind-keys
-    runs on the same host as BIweb — it doesn't, so Storage is more likely).
+- [x] **1.1 Investigate BIweb's file storage** ✅ DONE (2026-06-25)
+  - **Finding:** BIweb stores SQLite files on the **container filesystem** at
+    `/home/z/my-project/upload/{file_name}` — NOT in Supabase Storage.
+  - Supabase only stores metadata (the `data_sources` table with `file_path`).
+  - The upload directory is a Coolify-managed persistent volume attached to
+    the BIweb container.
+  - **Implication:** datamind-keys runs in a separate container and cannot
+    access BIweb's filesystem directly. We need a **shared persistent volume**
+    in Coolify (mount the same host directory into both containers).
+  - **Next step:** Configure the shared volume in Coolify (see instructions
+    below), then proceed to 1.2.
+
+- [ ] **1.1a Configure shared volume in Coolify**
+  - In Coolify, go to the **datamind-keys** resource → **Persistent Storage**.
+  - Add a new volume mapping:
+    - **Host path:** the same host path BIweb uses for its upload directory
+      (check BIweb's Coolify config for the exact host path — it's typically
+      something like `/data/coolify/applications/<biweb-uuid>/upload/`).
+    - **Container path:** `/home/z/my-project/upload/` (same as BIweb's).
+  - After adding the volume, redeploy datamind-keys.
+  - **Verification:** exec into the datamind-keys container and check that
+    `ls /home/z/my-project/upload/` shows the SQLite files.
 
 - [ ] **1.2 Install a SQLite driver**
   - `better-sqlite3` (synchronous, fastest, Node native) — preferred for
     server-side read-only queries.
-  - Add to `package.json` + verify it builds in the Dockerfile (alpine may
-    need `python3` + `build-base` for the native addon).
+  - Add to `package.json` + verify it builds in the Dockerfile (alpine already
+    has `python3` + `make` + `g++` in the base image for native compilation).
 
 - [ ] **1.3 Implement `/queries` live execution**
   - When `datasourceId` is provided and owned by the caller:
     1. Fetch the `data_sources` row (tenant-scoped).
-    2. Download the SQLite file from Supabase Storage to a temp path (cache
-       per `datasourceId + updatedAt` to avoid re-downloading).
-    3. Open with `better-sqlite3` in read-only mode (`readonly: true`).
-    4. Execute the user's SQL (already validated as `SELECT`-only).
-    5. Apply `limit` as a row cap (default 100, max 1000).
-    6. Return `{ ok, sql, datasourceId, rowCount, durationMs, rows }`.
+    2. Resolve the file path: if `file_path` is absolute, use it directly;
+       if it's just a filename, prepend `/home/z/my-project/upload/`.
+    3. Check the file exists on disk (if not, return a clear error — the
+       shared volume may not be configured).
+    4. Open with `better-sqlite3` in read-only mode (`readonly: true`).
+    5. Execute the user's SQL (already validated as `SELECT`-only).
+    6. Apply `limit` as a row cap (default 100, max 1000).
+    7. Return `{ ok, sql, datasourceId, rowCount, durationMs, rows }`.
   - **Security:** read-only mode + SELECT-only validation + row cap + no
     `PRAGMA` / `ATTACH` allowed (strip from SQL before execution).
 
-- [ ] **1.4 Cache downloaded SQLite files**
-  - Cache key: `datasourceId + updatedAt timestamp`.
-  - Cache location: `/tmp/datamind-cache/<datasourceId>.sqlite`.
-  - Invalidate when `data_sources.updated_at` changes.
-  - TTL: 1 hour (re-download if file is older).
+- [ ] **1.4 Cache open SQLite handles (not files)**
+  - No need to cache files — they're on a shared volume, direct access.
+  - Instead, cache open `better-sqlite3` Database handles per
+    `datasourceId + updatedAt` to avoid re-opening on every request.
+  - Invalidate (close handle) when `data_sources.updated_at` changes.
+  - Close all handles on process exit (graceful shutdown).
 
 - [ ] **1.5 Update OpenFN test workflow**
   - Change `sql: 'SELECT 1 AS one'` to `sql: 'SELECT * FROM clientes LIMIT 5'`
@@ -116,6 +128,8 @@ dashboards".
 **Complexity:** High
 **Priority:** Medium-High (depends on Phase 1 being stable)
 **Requires new scope:** `write` (distinct from `execute`)
+**Storage:** Writes directly to the shared volume at
+`/home/z/my-project/upload/{file_name}` (same as BIweb).
 
 #### Tasks
 
@@ -126,20 +140,26 @@ dashboards".
 
 - [ ] **2.2 `POST /api/public/v1/datasources` (upload)**
   - Accepts `multipart/form-data` with the SQLite file + a `name` field.
-  - Creates a `data_sources` row + uploads the file to Supabase Storage
-    (same bucket BIweb uses — determined in Phase 1).
+  - Writes the file to `/home/z/my-project/upload/{generated_id}.sqlite`
+    on the shared volume.
+  - Creates a `data_sources` row with the file metadata + `file_path`.
   - Tenant-scoped: the new datasource's `user_id` = `auth.user.id`.
   - Returns the new datasource metadata.
+  - **Note:** BIweb and datamind-keys share the same upload directory, so
+    the new file is immediately visible to both apps.
 
 - [ ] **2.3 `PUT /api/public/v1/datasources/:id` (replace file)**
-  - Accepts a new SQLite file, replaces the storage object, bumps
-    `updated_at` (invalidates the cache from Phase 1.4).
+  - Accepts a new SQLite file, writes it to the same `file_path` on the
+    shared volume, bumps `updated_at` (invalidates the handle cache from
+    Phase 1.4).
   - Ownership check: `where: { id, userId: auth.user.id }` → 404 if not owned.
   - Keeps the same `data_sources.id` and `name`; only the file changes.
+  - **Atomic write:** write to a temp file, then rename (avoid partial writes
+    that could corrupt ongoing queries from BIweb).
 
 - [ ] **2.4 `DELETE /api/public/v1/datasources/:id`**
   - Soft delete vs hard delete decision needed.
-  - Removes the file from Storage + deletes the `data_sources` row.
+  - Removes the file from the shared volume + deletes the `data_sources` row.
   - Cascade: what happens to dashboards/widgets that reference this datasource?
     Probably: block deletion if widgets reference it, or null out their
     `data_source_id`.

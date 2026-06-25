@@ -8,19 +8,18 @@ import {
   rateLimitHeaders,
 } from '@/lib/api-auth'
 import { db } from '@/lib/db'
+import {
+  executeSqliteQuery,
+  SqliteQueryError,
+} from '@/lib/sqlite-executor'
 
 // POST /api/public/v1/queries
-// Accepts a SQL SELECT + optional datasourceId. Tenant-scoped:
-//   - If datasourceId is provided, verifies it belongs to the caller
-//     (userId = auth.user.id). Returns 404 if not found or not owned.
-//   - Returns the datasource's real metadata as the result row(s) so the
-//     caller can confirm tenant isolation.
+// Executes a SELECT against the caller's uploaded SQLite datasource.
+// Tenant-scoped: the datasource must be owned by the API key's user.
 //
-// NOTE: data_sources stores UPLOADED SQLITE FILES (file_name, file_path,
-// file_type='sqlite'), NOT live database connections. Executing arbitrary
-// SQL against an uploaded file requires reading it from disk/storage and
-// using a SQLite driver — that's a future enhancement. For now, the endpoint
-// validates ownership and returns real tenant-scoped datasource metadata.
+// Storage: SQLite files live on a shared volume at /home/z/my-project/upload/
+// (mounted from BIweb's persistent storage in Coolify). If the volume is not
+// configured, the endpoint returns a clear error.
 const bodySchema = z.object({
   sql: z
     .string()
@@ -63,15 +62,6 @@ export async function POST(req: Request) {
   }
 
   const { sql, limit } = parsed.data
-  const lower = sql.toLowerCase().trim()
-
-  // Safety: refuse anything that doesn't start with SELECT
-  if (!lower.startsWith('select')) {
-    return NextResponse.json(
-      { error: 'Only SELECT statements are permitted on this endpoint.' },
-      { status: 400 },
-    )
-  }
 
   // --- Tenant-scoped datasource resolution --------------------------------
   // data_sources.user_id is TEXT → users.id (cuid). Filter with auth.user.id.
@@ -82,6 +72,7 @@ export async function POST(req: Request) {
     fileSize: number
     fileType: string
     status: string
+    filePath: string
     userId: string | null
   } | null = null
 
@@ -90,7 +81,7 @@ export async function POST(req: Request) {
     datasource = await db.dataSource.findFirst({
       where: {
         id: parsed.data.datasourceId,
-        userId: auth.user.id, // tenant scoping — only the caller's datasources
+        userId: auth.user.id, // tenant scoping
       },
       select: {
         id: true,
@@ -99,12 +90,12 @@ export async function POST(req: Request) {
         fileSize: true,
         fileType: true,
         status: true,
+        filePath: true,
         userId: true,
       },
     })
 
     if (!datasource) {
-      // Don't reveal whether the datasource exists for another tenant.
       const durationMs = Date.now() - started
       await logApiRequest({
         apiKeyId: auth.apiKey.id,
@@ -133,26 +124,84 @@ export async function POST(req: Request) {
         fileSize: true,
         fileType: true,
         status: true,
+        filePath: true,
         userId: true,
       },
     })
   }
 
-  // Build a tenant-scoped result. If a datasource was found, return its real
-  // metadata as a single row — proving the response is scoped to the caller.
-  // If no datasource exists, return an empty rows array (still tenant-scoped).
-  const rows: Record<string, unknown>[] = []
-  if (datasource) {
-    rows.push({
-      datasource_id: datasource.id,
-      datasource_name: datasource.name,
-      file_name: datasource.fileName,
-      file_size: datasource.fileSize,
-      file_type: datasource.fileType,
-      status: datasource.status,
-      owner_user_id: datasource.userId,
-      note: 'SQLite file upload — live SQL execution against uploaded files is not yet supported. Metadata is real and tenant-scoped.',
+  // If no datasource exists at all, return empty rows (still tenant-scoped).
+  if (!datasource) {
+    const durationMs = Date.now() - started
+    await logApiRequest({
+      apiKeyId: auth.apiKey.id,
+      endpoint: '/api/public/v1/queries',
+      method: 'POST',
+      statusCode: 200,
+      durationMs,
+      rowCount: 0,
+      ip: getClientIp(req),
     })
+    return NextResponse.json(
+      {
+        ok: true,
+        sql,
+        datasourceId: 'none',
+        rowCount: 0,
+        durationMs,
+        rows: [],
+      },
+      { headers: rateLimitHeaders(auth) },
+    )
+  }
+
+  // --- Execute the SQL against the SQLite file ----------------------------
+  let result: { rows: Record<string, unknown>[]; rowCount: number; durationMs: number }
+  let statusCode = 200
+
+  try {
+    result = executeSqliteQuery(datasource.filePath, sql, limit)
+  } catch (e) {
+    if (e instanceof SqliteQueryError) {
+      statusCode = e.code === 'VALIDATION' ? 400 : e.code === 'FILE_NOT_FOUND' ? 503 : 500
+      const durationMs = Date.now() - started
+      await logApiRequest({
+        apiKeyId: auth.apiKey.id,
+        endpoint: '/api/public/v1/queries',
+        method: 'POST',
+        statusCode,
+        durationMs,
+        ip: getClientIp(req),
+      })
+      return NextResponse.json(
+        {
+          ok: false,
+          error: e.message,
+          code: e.code,
+          datasourceId: datasource.id,
+        },
+        { status: statusCode, headers: rateLimitHeaders(auth) },
+      )
+    }
+    // Unexpected error
+    statusCode = 500
+    const durationMs = Date.now() - started
+    await logApiRequest({
+      apiKeyId: auth.apiKey.id,
+      endpoint: '/api/public/v1/queries',
+      method: 'POST',
+      statusCode,
+      durationMs,
+      ip: getClientIp(req),
+    })
+    return NextResponse.json(
+      {
+        ok: false,
+        error: 'An unexpected error occurred during query execution.',
+        datasourceId: datasource.id,
+      },
+      { status: 500, headers: rateLimitHeaders(auth) },
+    )
   }
 
   const durationMs = Date.now() - started
@@ -162,7 +211,7 @@ export async function POST(req: Request) {
     method: 'POST',
     statusCode: 200,
     durationMs,
-    rowCount: rows.length,
+    rowCount: result.rowCount,
     ip: getClientIp(req),
   })
 
@@ -170,10 +219,10 @@ export async function POST(req: Request) {
     {
       ok: true,
       sql,
-      datasourceId: datasource?.id ?? parsed.data.datasourceId ?? 'none',
-      rowCount: rows.length,
-      durationMs,
-      rows: rows.slice(0, limit),
+      datasourceId: datasource.id,
+      rowCount: result.rowCount,
+      durationMs: result.durationMs,
+      rows: result.rows,
     },
     { headers: rateLimitHeaders(auth) },
   )
