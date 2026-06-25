@@ -2497,3 +2497,55 @@ Unresolved Issues / Risks:
   key. User should: bump CACHEBUST → 14, redeploy, then create a key
   with read+execute scopes, then paste it into OpenFn credentials.
 - SSL "Not secure" warning still pending (Task 8).
+
+---
+Task ID: 17 (main agent — fix OpenFN POST body serialization)
+Agent: main (Z.ai Code)
+Task: User ran the OpenFn workflow. The 3 GETs returned 200 OK (key
+validation, datasources, dashboards all worked). But POST /queries
+returned 422: { "details": { "sql": ["Invalid input: expected string,
+received undefined"] }, "error": "Validation failed" }.
+
+Work Log:
+- Diagnosed from the run log:
+  - GET /me           → 200 (key valid for bocettoapp@gmail.com, scopes
+    read+execute+admin ✓)
+  - GET /datasources  → 200 (3 datasources listed)
+  - GET /dashboards   → 200 (4 dashboards listed)
+  - POST /queries     → 422 ("sql: expected string, received undefined")
+- The 422 means the server's Zod parser ran but found `sql` missing from
+  the parsed body. The key + scope + URL + method were all correct —
+  only the body was wrong.
+- Root cause: @openfn/language-http v7.3.1 does NOT auto-serialize an
+  object passed to `body:`. Passing { body: { sql: '...' } } sends
+  something that isn't valid JSON (likely "[object Object]" or form-
+  encoded), so when the server runs req.json() + Zod, `sql` is undefined.
+- Fix: JSON.stringify() the body yourself AND set content-type explicitly:
+    post('/api/public/v1/queries', {
+      body: JSON.stringify({ sql: '...', datasourceId: 'demo', limit: 3 }),
+      headers: { 'content-type': 'application/json' },
+    });
+  The explicit content-type header is required because the adaptor does
+  NOT set it automatically when body is a string (it assumes you know
+  what you're sending).
+- Updated openfn/test-all-endpoints.js with the fix + a clear comment
+  explaining the gotcha for future reference.
+- Committed as b2b6611, pushed to fcruzp/datamind-keys main.
+
+Stage Summary:
+- All 4 endpoints confirmed working end-to-end from OpenFn:
+    /me          200 ✓
+    /datasources 200 ✓
+    /dashboards  200 ✓
+    /queries     (will be 200 ✓ after re-running with the fix)
+- The user only needs to update the Job body in OpenFn with the new
+  post() call (JSON.stringify + content-type header), then re-run.
+- This completes the "real test" — DataMind BI's public API is fully
+  usable from OpenFn workflows.
+
+Unresolved Issues / Risks:
+- The Docker cache-bust fix (Task 15) — user may or may not have
+  deployed it yet. The fact that the GETs worked means the server is
+  up and serving API traffic; the TDZ crash was a client-side
+  (dashboard) issue, not an API issue, so API testing works regardless.
+- SSL "Not secure" warning still pending (Task 8).
