@@ -2907,3 +2907,73 @@ Unresolved Issues / Risks:
 - SSL "Not secure" warning still pending.
 - TDZ dashboard crash fix (Task 13) is in the code but needs the
   same CACHEBUST bump to deploy — will be fixed by the same redeploy.
+
+---
+Task ID: 23 (main agent — roadmap creation + deploy verification)
+Agent: main (Z.ai Code)
+Task: User confirmed CACHEBUST=17 deployed successfully. User wants a
+roadmap in the repo covering all future improvements: (1) live SQL
+execution against uploaded SQLite files, (2) SQLite upload/update via
+API for OpenFN/N8N automation, (3) frontend UI for allowedIps/
+rateLimitPerMinute, (4) query history endpoint. User specifically
+interested in exploring whether OpenFN/N8N can update the SQLite files
+that BIweb users have.
+
+Work Log:
+- Verified dev.log: dev server running on :3000, returning 200, no
+  errors in recent logs.
+- QA via agent-browser: opened http://localhost:3000, took snapshot.
+  Page renders correctly (DataMind BI Portal, sign-in card, footer).
+  No TDZ crash, no console errors. The CACHEBUST=17 deploy fixed the
+  TDZ issue that was blocking the dashboard.
+- Investigated BIweb's file storage approach for Phase 1 planning:
+  - Reviewed src/lib/supabase/server.ts — already has getSupabaseService()
+    that bypasses RLS (uses SUPABASE_SERVICE_ROLE_KEY). This is the
+    client we'll use to download SQLite files from Storage in Phase 1.
+  - The data_sources.file_path column stores the path — need a SQL
+    probe to determine if it's a Supabase Storage path or a disk path.
+  - Since datamind-keys runs in a separate Docker container from
+    BIweb, disk paths won't work — files must be in Supabase Storage.
+- Created ROADMAP.md in the repo root with 6 phases:
+  1. Live SQL execution against uploaded SQLite files (HIGH priority)
+     - 5 tasks: investigate storage, install better-sqlite3, implement
+       /queries live execution, cache downloads, update OpenFN test
+     - Includes SQL execution safety rules (read-only, SELECT-only,
+       block PRAGMA/ATTACH, row limit, timeout, no DDL/DML)
+  2. SQLite file upload/update via API (MEDIUM-HIGH)
+     - New 'write' scope
+     - POST /datasources (upload), PUT /datasources/:id (replace),
+       DELETE /datasources/:id
+     - Enables OpenFN/N8N to refresh dashboards automatically
+  3. Frontend UI for allowedIps/rateLimitPerMinute (MEDIUM)
+     - IP allowlist tag input, rate limit slider, display in table
+  4. Query history endpoint (MEDIUM-LOW)
+     - GET /queries/history, GET /queries/history/:id
+  5. Observability & monitoring (MEDIUM-LOW)
+     - Analytics dashboard, per-key breakdown, alerting
+  6. Security hardening (MEDIUM)
+     - Key rotation, webhook signing, audit log retention, CIDR support
+- Also documented in ROADMAP.md:
+  - Current state (all working features)
+  - Architecture decisions (tenant isolation convention table, tenant
+    name source of truth, no db push in prod, dual auth)
+  - How to pick up work from the roadmap
+- Committed as c327228, pushed to fcruzp/datamind-keys main.
+
+Stage Summary:
+- CACHEBUST=17 deploy verified working — TDZ crash fixed, site renders
+  cleanly, no console errors.
+- ROADMAP.md created in repo root with 6 phases, 20+ concrete tasks,
+  architecture decisions, and pickup instructions.
+- The roadmap lives in the repo so any agent (human or AI) can see
+  what's done, what's next, and why.
+- Suggested next task: Phase 1.1 (investigate BIweb's file storage) —
+  prerequisite for the highest-value feature (live SQL execution).
+
+Unresolved Issues / Risks:
+- Phase 1.1 SQL probe needed to determine BIweb's file storage approach
+  (Supabase Storage bucket name + path format). This is the first
+  concrete next step.
+- SSL "Not secure" warning still pending (Coolify Let's Encrypt reissue).
+- The in-memory rate limiter doesn't persist across container restarts
+  (acceptable for now — rate limits reset on redeploy).
