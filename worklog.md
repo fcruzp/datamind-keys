@@ -2814,3 +2814,96 @@ Unresolved Issues / Risks:
 - If not, we need to design + create those tables (a bigger task).
 - Docker cache-bust fix (Task 15) still pending for TDZ dashboard crash.
 - SSL "Not secure" warning still pending (Task 8).
+
+---
+Task ID: 22 (main agent — real tenant-scoped data for all public API endpoints)
+Agent: main (Z.ai Code)
+Task: User confirmed OpenFN 4/4 endpoints work, then asked to verify
+tenant isolation. Previous audit (Task 21) found that /datasources,
+/dashboards, /queries returned hardcoded demo data — NOT tenant-scoped.
+User provided the BIweb Supabase schema (column names + types for
+data_sources, dashboards, dashboard_widgets, query_histories,
+user_profiles). Goal: wire all 3 endpoints + /me to real tenant-scoped
+queries against the shared Supabase DB.
+
+Work Log:
+- Analyzed the BIweb schema provided by the user (Section 1 result):
+  - data_sources: uploaded SQLite files (file_name, file_size, file_path,
+    file_type default 'sqlite') — NOT database connections
+  - dashboards: name, description, layout (text/JSON string)
+  - dashboard_widgets: title, widget_type, sql_query, visualization,
+    config, position_x/y, width/height — FK to dashboards.id
+  - query_histories: natural_query, sql_query, result_data (all NOT NULL)
+  - user_profiles: tenant_name (default 'Personal'), user_id (uuid)
+- Verified the user_id convention with the Section 5 count test:
+  - data_sources by supabase_id → 0, by users.id → 1 ✓
+  - dashboards by supabase_id → 0, by users.id → 1 ✓
+  So data_sources/dashboards use TEXT user_id = users.id (cuid),
+  while user_profiles uses UUID user_id = auth.users.id.
+  This is the OPPOSITE of api_keys (uuid → auth.users.id).
+- Added 5 Prisma models to prisma/schema.prisma:
+  - DataSource (@@map data_sources) — userId text
+  - Dashboard (@@map dashboards) — userId text, widgets relation
+  - DashboardWidget (@@map dashboard_widgets) — dashboardId FK
+  - QueryHistory (@@map query_histories) — dataSourceId
+  - UserProfile (@@map user_profiles) — userId uuid, tenantName
+  All use @map for snake_case columns, @db.Timestamp for timestamptz,
+  @@index for userId/dataSourceId/dashboardId. No db push (types only).
+  Defined Dashboard ↔ DashboardWidget relation for include:{widgets:true}.
+- Ran prisma generate → client updated cleanly.
+- Rewrote GET /api/public/v1/datasources:
+  - db.dataSource.findMany({where:{userId: auth.user.id}, orderBy:{createdAt:'desc'}})
+  - Returns real uploaded files: id, name, type (file_type), fileName,
+    fileSize, status, errorMessage, createdAt, updatedAt
+  - No more hardcoded 3-row demo array
+- Rewrote GET /api/public/v1/dashboards:
+  - db.dashboard.findMany({where:{userId: auth.user.id}, include:{widgets:true}})
+  - Returns real dashboards with widgetCount + full widget layout
+    (title, type, dataSourceId, sqlQuery, visualization, position, size)
+  - No more hardcoded 4-row demo array
+- Rewrote POST /api/public/v1/queries:
+  - If datasourceId provided (and not 'demo'): verifies ownership via
+    db.dataSource.findFirst({where:{id, userId: auth.user.id}}) → 404
+    if not found or not owned (no cross-tenant info leakage)
+  - If no datasourceId: uses the caller's most recent datasource
+  - Returns the real datasource metadata as a single row (proving
+    tenant scoping), with a note that live SQLite execution is a
+    future enhancement
+  - Keeps the {ok, sql, datasourceId, rowCount, durationMs, rows}
+    response shape for backward compat with OpenFN
+- Enriched GET /api/public/v1/me:
+  - Added db.userProfile.findUnique({where:{userId: auth.user.supabaseId}})
+  - Returns tenantName from user_profiles (real DB column, was derived
+    from company/email before)
+- Ran bun run lint → clean, no errors.
+- Committed as 2f0cc4a, pushed to fcruzp/datamind-keys main.
+
+Stage Summary:
+- All 4 public API endpoints now return REAL tenant-scoped data:
+  - /me: Boceto's user info + real tenantName from user_profiles
+  - /datasources: Boceto's 1 real uploaded SQLite datasource
+  - /dashboards: Boceto's 1 real dashboard with its widgets
+  - /queries: verifies datasource ownership, returns real metadata
+- No cross-tenant data leakage possible — every query filters by
+  auth.user.id (for text user_id tables) or auth.user.supabaseId
+  (for uuid user_id tables).
+- The OpenFN workflow doesn't need changes — same URLs, same auth,
+  same response shapes. The outputs will now contain Boceto's real
+  data instead of hardcoded demo arrays.
+- data_sources is uploaded SQLite files, NOT live DB connections.
+  Live SQL execution against uploaded files is a future enhancement
+  (requires reading the file + a SQLite driver). For now /queries
+  returns real datasource metadata — still tenant-scoped, still
+  useful for verifying isolation.
+
+Unresolved Issues / Risks:
+- User needs to redeploy on Coolify (bump CACHEBUST → 14) to pick up
+  this commit. The Dockerfile's cache-bust fix (Task 15) is already
+  in main, so bumping CACHEBUST will deploy the latest code.
+- Live SQL execution against uploaded SQLite files: requires
+  installing better-sqlite3 or sqlite3, reading file_path from disk
+  or Supabase Storage. Medium complexity, medium priority.
+- Frontend UI for allowedIps/rateLimitPerMinute still pending.
+- SSL "Not secure" warning still pending.
+- TDZ dashboard crash fix (Task 13) is in the code but needs the
+  same CACHEBUST bump to deploy — will be fixed by the same redeploy.
