@@ -133,51 +133,62 @@ fn(state => {
 // Returns: { ok, sql, datasourceId, rowCount, durationMs,
 //            rows:[{id,label,value,generated_at}, …] }
 //
-// WHY RAW fetch() INSTEAD OF THE ADAPTOR'S post():
-// @openfn/language-http v7.3.1's post() has a known issue where the `body`
-// option (whether an object OR a JSON.stringify'd string) is NOT sent
-// correctly — the server receives valid JSON but with no top-level `sql`
-// field, causing Zod to return 422 "expected string, received undefined".
-// Both `body: { sql: '...' }` and `body: JSON.stringify({...})` fail.
+// OPENFN PATTERN — WHY request() INSTEAD OF post():
+// Per the user's working POST example: post() at top-level correctly
+// propagates the Credential token, but the body handling in
+// @openfn/language-http v7.3.1 is buggy — the server receives valid JSON
+// but with no top-level `sql` field → 422 "expected string, received
+// undefined".
 //
-// WORKAROUND: use native fetch() inside fn(). The user's note about "don't
-// use fn() for HTTP calls" applies to the ADAPTOR's get()/post() (which
-// silently drop credential-injected headers inside fn()). Raw fetch() is
-// unaffected because we set the Authorization header MANUALLY from
-// state.configuration.token — we don't rely on the adaptor to inject it.
-fn(async state => {
-  const baseUrl = state.configuration.baseUrl.replace(/\/$/, '');
-  const token = state.configuration.token;
+// request() inside fn(async …) is the recommended alternative for POST:
+//   1. It still injects the Credential's Bearer token automatically (no
+//      manual Authorization header needed)
+//   2. It accepts body as a plain OBJECT (no JSON.stringify needed — the
+//      adaptor serializes it correctly when using request())
+//   3. It gives try/catch control so we can handle non-2xx responses
+//      gracefully (post() throws un-catchably at top level)
+//
+// NOTE: request() returns a function (state) => Promise<state>, so we
+// await request(...)(state). The response body lands in state.data.
+fn(async (state) => {
+  try {
+    await request('POST', '/api/public/v1/queries', {
+      body: {
+        sql: 'SELECT 1 AS one',
+        datasourceId: 'demo',
+        limit: 3,
+      },
+      headers: {
+        'content-type': 'application/json',
+      },
+    })(state);
 
-  const res = await fetch(`${baseUrl}/api/public/v1/queries`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      sql: 'SELECT 1 AS one',
-      datasourceId: 'demo',
-      limit: 3,
-    }),
-  });
+    // request() wrote its response body into state.data.
+    state.queryResult = state.data;
 
-  state.queryResult = await res.json();
+    if (!state.queryResult || !state.queryResult.ok) {
+      console.error('✗ /queries did not return ok:');
+      console.error(JSON.stringify(state.queryResult, null, 2));
+      return state;
+    }
 
-  if (!state.queryResult || !state.queryResult.ok) {
-    console.error('✗ /queries did not return ok:');
-    console.error('  HTTP ' + res.status + ' ' + res.statusText);
-    console.error('  Body: ' + JSON.stringify(state.queryResult, null, 2));
-    console.error('  (Does your key have the `execute` scope? Edit the key');
-    console.error('   in Portal → API Keys → Edit → add `execute`.)');
+    console.log('✓ Query returned ' + state.queryResult.rowCount +
+      ' rows in ' + state.queryResult.durationMs + 'ms');
+    console.log('  SQL: ' + state.queryResult.sql);
+    console.log('  First row: ' + JSON.stringify(state.queryResult.rows[0]));
     return state;
-  }
 
-  console.log('✓ Query returned ' + state.queryResult.rowCount +
-    ' rows in ' + state.queryResult.durationMs + 'ms');
-  console.log('  SQL: ' + state.queryResult.sql);
-  console.log('  First row: ' + JSON.stringify(state.queryResult.rows[0]));
-  return state;
+  } catch (error) {
+    // request() throws on non-2xx responses. error.statusCode is the
+    // HTTP status (per @openfn/language-http v7.x error structure).
+    console.error('✗ /queries failed: HTTP ' + error.statusCode);
+    console.error('  ' + error.message);
+    if (error.statusCode === 403) {
+      console.error('  (Does your key have the `execute` scope? Edit the');
+      console.error('   key in Portal → API Keys → Edit → add `execute`.)');
+    }
+    throw error;
+  }
 });
 
 // ============================================================================
