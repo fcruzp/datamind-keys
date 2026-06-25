@@ -2977,3 +2977,74 @@ Unresolved Issues / Risks:
 - SSL "Not secure" warning still pending (Coolify Let's Encrypt reissue).
 - The in-memory rate limiter doesn't persist across container restarts
   (acceptable for now — rate limits reset on redeploy).
+
+---
+Task ID: 24 (main agent — live SQLite execution + shared volume plan)
+Agent: main (Z.ai Code)
+Task: User informed that BIweb stores SQLite files on the container
+filesystem at /home/z/my-project/upload/{file_name} (Coolify persistent
+volume), NOT in Supabase Storage. Supabase only has metadata. User wants
+to explore OpenFN/N8N updating these SQLite files. Need to: (1) update
+roadmap with this finding, (2) implement live SQL execution, (3) give
+Coolify volume mount instructions.
+
+Work Log:
+- Analyzed the storage architecture:
+  - BIweb container: writes SQLite to /home/z/my-project/upload/*.sqlite
+    (Coolify persistent volume)
+  - datamind-keys container: separate, no access to BIweb's filesystem
+  - Solution: mount the same host directory into both containers
+- Updated ROADMAP.md:
+  - Phase 1.1 marked DONE — storage is filesystem, not Supabase Storage
+  - Phase 1.1a added — Coolify shared volume config instructions
+  - Phase 1.3 updated — reads directly from filesystem (no download)
+  - Phase 1.4 updated — cache open DB handles, not downloaded files
+  - Phase 2 updated — writes go directly to the shared volume, atomic
+    write (temp + rename) to avoid corrupting BIweb's ongoing reads
+- Installed better-sqlite3@12.11.1 + @types/better-sqlite3@7.6.13
+- Created src/lib/sqlite-executor.ts:
+  - validateSql(): SELECT-only enforcement, blocks 13 dangerous keywords
+    (PRAGMA, ATTACH, DETACH, VACUUM, REINDEX, CREATE, INSERT, UPDATE,
+    DELETE, DROP, ALTER, REPLACE, LOAD, IMPORT) via word-boundary regex,
+    rejects multi-statement injection (semicolons in the middle)
+  - enforceRowLimit(): wraps user SQL in "SELECT * FROM (...) LIMIT N"
+    subquery, hard cap 1000 rows
+  - executeSqliteQuery(): opens with readonly: true, 10s timeout,
+    returns { rows, rowCount, durationMs }
+  - resolveSqlitePath(): handles absolute paths + relative filenames
+  - SqliteQueryError: typed errors with code (VALIDATION/FILE_NOT_FOUND/
+    EXECUTION/TIMEOUT) for proper HTTP status mapping
+- Updated src/app/api/public/v1/queries/route.ts:
+  - Replaced metadata-only response with real SQL execution
+  - Error mapping: VALIDATION→400, FILE_NOT_FOUND→503 (shared volume
+    not configured), EXECUTION/TIMEOUT→500
+  - Now includes filePath in the datasource select (needed for executor)
+  - Empty result if no datasource exists (still tenant-scoped)
+- Ran bun run lint → clean, no errors.
+- Dev server running on :3000, no errors in logs.
+- Committed as fcbc991, pushed to fcruzp/datamind-keys main.
+
+Stage Summary:
+- Phase 1 (live SQL execution) is CODE-COMPLETE. The /queries endpoint
+  now opens the user's SQLite file in read-only mode and executes the
+  SELECT, returning real rows.
+- DEPENDS ON: the user configuring a shared volume in Coolify (Phase
+  1.1a). Without the volume mount, /queries returns 503 with a clear
+  error: "SQLite file not found at /home/z/my-project/upload/... The
+  shared volume may not be configured."
+- SAFETY: 6 layers of protection — read-only connection, SELECT-only
+  validation, 13 blocked keywords, no multi-statement, row limit
+  subquery wrapping (1000 cap), 10s timeout.
+- Phase 2 (upload/update via API) is documented in the roadmap but not
+  yet implemented. It depends on Phase 1 being stable + the shared
+  volume being configured.
+
+Unresolved Issues / Risks:
+- User needs to configure the Coolify shared volume (Phase 1.1a) before
+  /queries can execute real SQL. Instructions are in ROADMAP.md.
+- User needs to bump CACHEBUST → 18 to deploy this commit.
+- After deploy, user should re-run the OpenFN workflow with a real
+  query (e.g. "SELECT * FROM clientes LIMIT 5") to verify.
+- SSL "Not secure" warning still pending.
+- Phase 2 (upload/update) not yet implemented — next milestone after
+  Phase 1 is verified working.
