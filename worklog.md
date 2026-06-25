@@ -2187,3 +2187,53 @@ Unresolved Issues / Risks:
   correct types), so it no longer serves as a "does the schema match?"
   canary. If the DB schema drifts again in the future, the next failure
   will only surface at actual API key creation time.
+
+---
+Task ID: 12 (main agent — UX polish: domain fix + copy buttons + cursor)
+Agent: main (Z.ai Code)
+Task: User reported the curl examples in the UI show the wrong domain
+(datamind.mooo.com instead of datamind-api.mooo.com). Also requested:
+- Copy button (icon type) for curl blocks
+- Cursor pointer (hand) on all links and buttons
+
+Work Log:
+- Grepped for all occurrences of "datamind.mooo.com" in src/ — found 10 files.
+- Identified the UI-facing curl examples in:
+  - dashboard-view.tsx (QuickstartCard) — hardcoded
+  - new-key-reveal-dialog.tsx — hardcoded
+  - command-palette.tsx (buildCurlExample) — default param
+  - api-keys-manager.tsx — SSR fallback
+- Created new reusable CopyButton component (src/components/ui/copy-button.tsx):
+  - Icon-only (Copy → Check on success)
+  - Sonner toast feedback
+  - Configurable icon size, label, custom icons
+  - ForwardRef, accessible (aria-label, title)
+- Created useOrigin() hook (src/lib/use-origin.ts):
+  - Returns window.location.origin on client
+  - Falls back to 'https://datamind-api.mooo.com' during SSR (hydration-safe)
+- Updated QuickstartCard (dashboard-view.tsx):
+  - Uses useOrigin() for dynamic domain
+  - Added CopyButton in top-right corner of the curl block
+- Updated NewKeyRevealDialog:
+  - Uses useOrigin() for the curl example domain
+  - Added CopyButton to the curl block (top-right corner)
+- Updated OpenApiExplorer:
+  - Added CopyButton to the API response body block
+- Updated command-palette.tsx + api-keys-manager.tsx:
+  - Changed fallback domain to datamind-api.mooo.com
+- Updated globals.css:
+  - Added cursor: pointer to all <a>, <button>, [role=button], <summary>,
+    <label[for]>, and input[type=button/submit/reset] (except when disabled)
+  - Added [data-cursor=pointer|default] escape hatches
+- bun run lint → clean
+- bunx tsc --noEmit → no new errors
+- Committed: c8efcec
+- Pushed to GitHub main
+
+Stage Summary:
+- All 3 UX issues fixed in commit c8efcec
+- User needs to: bump CACHEBUST → 11 in Coolify, redeploy
+- After redeploy:
+  1. The Quickstart curl block will show the correct domain
+  2. A copy icon button appears in the top-right of all curl blocks
+  3. All links and buttons show the hand cursor
