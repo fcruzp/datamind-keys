@@ -3090,3 +3090,40 @@ Unresolved Issues / Risks:
 - Waiting on user to run the SQL query and report file_path format.
 - Phase 1 (live SQL execution) still blocked on shared volume config.
 - SSL "Not secure" warning still pending.
+
+---
+Task ID: 26 (main agent — Phase 1.1 step 2 host path lookup)
+Agent: main (Z.ai Code)
+Task: User reported back file_path format from Supabase. Provide
+step 2 instruction (find Coolify host path for /app/data).
+
+Work Log:
+- Received user's SQL query result. Two rows in data_sources:
+  - id=cmp3flx2j0004s201d862fg03 → /app/data/cmp3flmly0000s201y43kix9m/demo_ecommerce_rd.sqlite
+  - id=cmp3azsu60007ms01jl89033h → /app/data/cmp3azh230003ms01kb1mbyqg/demo_ecommerce_rd.sqlite
+- Confirmed the path format: /app/data/{tenant_or_workspace_id}/{filename}.sqlite
+  This is an ABSOLUTE path inside the BIweb container, NOT Supabase Storage.
+  Our Task 24 architecture decision (shared volume mount) is correct.
+- Confirmed the subfolder structure: each datasource gets its own folder
+  by some ID (likely workspace_id from the path naming convention).
+  datamind-keys will need to resolve file_path as-is, no transformation.
+- Provided step 2 instruction: user needs to find the HOST path on the
+  Coolify server that maps to /app/data inside BIweb's container.
+  - Location: Coolify → BIweb service → Storages tab
+  - Looking for the row where Mount Path (Container) = /app/data
+  - Need the Host Path from that row
+  - Alternative: docker-compose volumes section
+- No code changes needed. Pure consultation step.
+
+Stage Summary:
+- Phase 1.1 storage format CONFIRMED: /app/data/{id}/{file}.sqlite on
+  BIweb's container filesystem. Coolify persistent storage volume.
+- Step 2 delivered: find the host path of /app/data in Coolify Storages
+  tab. Waiting for user to report back.
+- Next step (step 3) will be: the exact Coolify config for datamind-keys
+  to mount that same host path (likely as /app/data or a renamed mount).
+
+Unresolved Issues / Risks:
+- Waiting on user to find and report the host path from Coolify.
+- Phase 1 (live SQL execution) still blocked on shared volume config.
+- SSL "Not secure" warning still pending.
