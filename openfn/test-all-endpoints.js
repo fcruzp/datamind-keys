@@ -133,31 +133,43 @@ fn(state => {
 // Returns: { ok, sql, datasourceId, rowCount, durationMs,
 //            rows:[{id,label,value,generated_at}, …] }
 //
-// @openfn/language-http v7.x GOTCHA: the `body` option must be a JSON
-// STRING, not an object. If you pass an object, the adaptor sends it as
-// "[object Object]" or form-encodes it, and the server's Zod parser sees
-// `sql: undefined` → 422 "expected string, received undefined".
-// The fix is two parts:
-//   1. JSON.stringify() the body yourself
-//   2. Set content-type: application/json explicitly (the adaptor does NOT
-//      set it automatically when body is a string)
-post('/api/public/v1/queries', {
-  body: JSON.stringify({
-    sql: 'SELECT 1 AS one',
-    datasourceId: 'demo',
-    limit: 3,
-  }),
-  headers: { 'content-type': 'application/json' },
-});
+// WHY RAW fetch() INSTEAD OF THE ADAPTOR'S post():
+// @openfn/language-http v7.3.1's post() has a known issue where the `body`
+// option (whether an object OR a JSON.stringify'd string) is NOT sent
+// correctly — the server receives valid JSON but with no top-level `sql`
+// field, causing Zod to return 422 "expected string, received undefined".
+// Both `body: { sql: '...' }` and `body: JSON.stringify({...})` fail.
+//
+// WORKAROUND: use native fetch() inside fn(). The user's note about "don't
+// use fn() for HTTP calls" applies to the ADAPTOR's get()/post() (which
+// silently drop credential-injected headers inside fn()). Raw fetch() is
+// unaffected because we set the Authorization header MANUALLY from
+// state.configuration.token — we don't rely on the adaptor to inject it.
+fn(async state => {
+  const baseUrl = state.configuration.baseUrl.replace(/\/$/, '');
+  const token = state.configuration.token;
 
-fn(state => {
-  state.queryResult = state.data;
+  const res = await fetch(`${baseUrl}/api/public/v1/queries`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sql: 'SELECT 1 AS one',
+      datasourceId: 'demo',
+      limit: 3,
+    }),
+  });
+
+  state.queryResult = await res.json();
 
   if (!state.queryResult || !state.queryResult.ok) {
     console.error('✗ /queries did not return ok:');
-    console.error(JSON.stringify(state.queryResult, null, 2));
-    console.error('  (Does your key have the `execute` scope? Edit the key in');
-    console.error('   the Portal → API Keys → Edit → add `execute`.)');
+    console.error('  HTTP ' + res.status + ' ' + res.statusText);
+    console.error('  Body: ' + JSON.stringify(state.queryResult, null, 2));
+    console.error('  (Does your key have the `execute` scope? Edit the key');
+    console.error('   in Portal → API Keys → Edit → add `execute`.)');
     return state;
   }
 
