@@ -45,6 +45,10 @@ export interface AuthenticatedUser {
   supabaseId: string
   email: string
   name: string | null
+  /** users.company — BIweb's source of truth for the user's company/tenant.
+   *  Nullable because BIweb doesn't set a default. Used as fallback for
+   *  tenantName when user_profiles.tenant_name is missing. */
+  company: string | null
   /** Tenant / workspace name this user belongs to (derived). */
   tenantName?: string
   /** User role: "user" | "admin". */
@@ -114,6 +118,7 @@ export function toAuthenticatedUser(u: SessionUser): AuthenticatedUser {
     supabaseId: u.supabaseId,
     email: u.email,
     name: u.name,
+    company: u.company,
     tenantName: u.tenantName,
     role: u.role,
   }
@@ -358,6 +363,7 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
       supabaseId: dbUser.supabaseId,
       email: dbUser.email,
       name: dbUser.name,
+      company: dbUser.company,
       role: dbUser.role,
     },
     apiKey: {

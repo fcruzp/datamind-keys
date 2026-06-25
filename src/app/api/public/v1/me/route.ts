@@ -40,7 +40,7 @@ export async function GET(req: Request) {
   // - For api_request_logs, do a two-step query (no Prisma relation).
   let activeKeys = 0
   let totalRequests = 0
-  let tenantName: string | null = null
+  let tenantName: string = 'Personal'
   try {
     activeKeys = await db.apiKey.count({
       where: { userId: auth.user.supabaseId, revokedAt: null },
@@ -57,15 +57,26 @@ export async function GET(req: Request) {
       })
     }
 
-    // Fetch the real tenant name from user_profiles.
-    // user_profiles.user_id is a uuid = auth.users.id = auth.user.supabaseId.
+    // Tenant name resolution — cascading fallback:
+    //   1. user_profiles.tenant_name (preferred, but may not exist yet)
+    //   2. users.company (BIweb's source of truth, set by the app)
+    //   3. 'Personal' (final default)
+    //
+    // This ensures /me always returns a non-null tenantName regardless of
+    // whether user_profiles exists. BIweb doesn't need to change its code —
+    // users.company remains its source of truth, and we fall back to it.
     const profile = await db.userProfile.findUnique({
       where: { userId: auth.user.supabaseId },
       select: { tenantName: true },
     })
-    tenantName = profile?.tenantName ?? null
+    tenantName =
+      profile?.tenantName          // 1. user_profiles.tenant_name
+      ?? auth.user.company         // 2. users.company
+      ?? 'Personal'                // 3. default
   } catch (e) {
     console.error('[/api/public/v1/me] stats query failed:', e)
+    // Even if the DB query fails, fall back to company/Personal
+    tenantName = auth.user.company ?? 'Personal'
   }
 
   const durationMs = Date.now() - started
