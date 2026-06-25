@@ -49,27 +49,53 @@ the SQLite files they uploaded via BIweb — e.g. `SELECT * FROM clientes LIMIT
 #### Tasks
 
 - [x] **1.1 Investigate BIweb's file storage** ✅ DONE (2026-06-25)
-  - **Finding:** BIweb stores SQLite files on the **container filesystem** at
-    `/home/z/my-project/upload/{file_name}` — NOT in Supabase Storage.
-  - Supabase only stores metadata (the `data_sources` table with `file_path`).
-  - The upload directory is a Coolify-managed persistent volume attached to
+  - **Finding:** BIweb stores SQLite files inside a **named Docker volume**
+    (`hyvtdbc00tfxcds8pr6o8jl-datamind-data`) mounted at `/app/data` inside
     the BIweb container.
+  - Supabase only stores metadata (the `data_sources` table with `file_path`).
+  - `file_path` format: `/app/data/{tenant_id}/{filename}.sqlite` (absolute
+    container path).
   - **Implication:** datamind-keys runs in a separate container and cannot
-    access BIweb's filesystem directly. We need a **shared persistent volume**
-    in Coolify (mount the same host directory into both containers).
-  - **Next step:** Configure the shared volume in Coolify (see instructions
-    below), then proceed to 1.2.
+    access BIweb's filesystem directly. We need to mount the **same named
+    Docker volume** in datamind-keys at `/app/data`.
+  - **Next step:** Configure the shared volume in Coolify (see 1.1a).
 
 - [ ] **1.1a Configure shared volume in Coolify**
-  - In Coolify, go to the **datamind-keys** resource → **Persistent Storage**.
-  - Add a new volume mapping:
-    - **Host path:** the same host path BIweb uses for its upload directory
-      (check BIweb's Coolify config for the exact host path — it's typically
-      something like `/data/coolify/applications/<biweb-uuid>/upload/`).
-    - **Container path:** `/home/z/my-project/upload/` (same as BIweb's).
-  - After adding the volume, redeploy datamind-keys.
-  - **Verification:** exec into the datamind-keys container and check that
-    `ls /home/z/my-project/upload/` shows the SQLite files.
+  - The volume to share is the named Docker volume:
+    `hyvtdbc00tfxcds8pr6o8jl-datamind-data` (mounted at `/app/data` in BIweb).
+  - **Option A (bind mount via host path — simplest in Coolify UI):**
+    1. SSH into the Coolify server and run:
+       ```
+       docker volume inspect hyvtdbc00tfxcds8pr6o8jl-datamind-data
+       ```
+       Note the `Mountpoint` value (typically
+       `/var/lib/docker/volumes/hyvtdbc00tfxcds8pr6o8jl-datamind-data/_data`).
+    2. In Coolify → **datamind-keys** → **Storages** → add a new volume:
+       - **Source Path:** the Mountpoint from step 1
+       - **Destination Path:** `/app/data`
+    3. Save and redeploy datamind-keys.
+  - **Option B (docker-compose external volume — cleaner):**
+    1. In Coolify → **datamind-keys** → **Edit Compose** (or equivalent),
+       add to the service:
+       ```yaml
+       volumes:
+         - hyvtdbc00tfxcds8pr6o8jl-datamind-data:/app/data
+       ```
+       And declare the volume as external at the top level:
+       ```yaml
+       volumes:
+         hyvtdbc00tfxcds8pr6o8jl-datamind-data:
+           external: true
+       ```
+    2. Save and redeploy.
+  - **Why not just create a new named volume in Coolify UI?** Coolify v4
+    prefixes named volumes with the application UUID, so a new volume
+    named `datamind-data` in datamind-keys would become
+    `{datamind-keys-uuid}-datamind-data` — a DIFFERENT volume from
+    BIweb's. Option A or B bypasses this.
+  - **Verification after deploy:** exec into the datamind-keys container
+    and run `ls /app/data/` — should show the tenant subfolders
+    (e.g. `cmp3flmly0000s201y43kix9m/`).
 
 - [ ] **1.2 Install a SQLite driver**
   - `better-sqlite3` (synchronous, fastest, Node native) — preferred for

@@ -5,8 +5,12 @@ import path from 'path'
 // ===========================================================================
 // SQLite query executor — tenant-scoped, read-only, safe.
 // ===========================================================================
-// Opens uploaded SQLite files from BIweb's shared volume at
-// /home/z/my-project/upload/{file_name} and executes SELECT-only queries.
+// Opens uploaded SQLite files from BIweb's shared named Docker volume
+// (hyvtdbc00tfxcds8pr6o8jl-datamind-data), mounted at /app/data inside
+// both the BIweb container and this container. The file_path stored in
+// Supabase's data_sources table is an absolute container path like:
+//   /app/data/{tenant_id}/{filename}.sqlite
+// resolveSqlitePath() uses it directly when absolute.
 //
 // SAFETY RULES (enforced in validateSql):
 //   1. Read-only connection (better-sqlite3 readonly: true)

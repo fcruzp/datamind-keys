@@ -3127,3 +3127,64 @@ Unresolved Issues / Risks:
 - Waiting on user to find and report the host path from Coolify.
 - Phase 1 (live SQL execution) still blocked on shared volume config.
 - SSL "Not secure" warning still pending.
+
+---
+Task ID: 27 (main agent — Phase 1.1 step 3 volume config identified)
+Agent: main (Z.ai Code)
+Task: User shared Coolify screenshot of BIweb's volume config. Analyze
+it and provide step 3 (configure the same volume in datamind-keys).
+
+Work Log:
+- Located the user's pasted image at /home/z/my-project/upload/
+  pasted_image_1782360907769.png.
+- Used VLM (z-ai vision CLI) to analyze the Coolify screenshot.
+  Extracted:
+  - Section: "Volumes (1)", "Persistent storage to preserve data
+    between deployments."
+  - Volume Name: hyvtdbc00tfxcds8pr6o8jl-datamind-data
+  - Source Path: (empty — named Docker volume, not a bind mount)
+  - Destination Path: /app/data
+- Reconciled with Supabase data_sources.file_path
+  (/app/data/{tenant_id}/{file}.sqlite):
+  - The file_path is the CONTAINER-INTERNAL path
+  - BIweb's named volume is mounted at /app/data inside BIweb's
+    container
+  - To share: datamind-keys must mount the SAME named volume at
+    /app/data inside its own container
+- Identified a Coolify quirk: Coolify v4 prefixes named volumes with
+  the application UUID. So if datamind-keys creates a new volume named
+  "datamind-data", Coolify will create it as
+  {datamind-keys-uuid}-datamind-data, NOT the same as BIweb's
+  hyvtdbc00tfxcds8pr6o8jl-datamind-data.
+- Two viable options to share the exact same volume:
+  A. Bind mount via host path: run `docker volume inspect
+     hyvtdbc00tfxcds8pr6o8jl-datamind-data` on the Coolify server,
+     get the Mountpoint (usually /var/lib/docker/volumes/
+     hyvtdbc00tfxcds8pr6o8jl-datamind-data/_data), use that as
+     Source Path in datamind-keys Coolify volume config.
+  B. Edit datamind-keys's docker-compose.yml to reference the existing
+     volume as `external: true`.
+- Updated src/lib/sqlite-executor.ts comment to reflect the actual
+  storage path (/app/data via shared named volume) instead of the
+  outdated /home/z/my-project/upload/ reference.
+- Ran bun run lint → clean, no errors.
+
+Stage Summary:
+- Phase 1.1 storage investigation COMPLETE.
+  - Storage type: named Docker volume (not bind mount, not Supabase Storage)
+  - Volume name: hyvtdbc00tfxcds8pr6o8jl-datamind-data
+  - Container mount: /app/data (both BIweb and datamind-keys)
+  - file_path format: /app/data/{tenant_id}/{filename}.sqlite
+- Code is already compatible: resolveSqlitePath() uses absolute paths
+  as-is, so /app/data/... works directly once the volume is mounted.
+- Step 3 ready to deliver: instructions to mount the named volume in
+  datamind-keys's Coolify service, with two options (bind mount via
+  host path OR docker-compose external volume).
+
+Unresolved Issues / Risks:
+- Coolify v4 volume name prefixing may prevent direct named-volume
+  sharing via the UI. User will likely need Option A (bind mount via
+  docker volume inspect Mountpoint) or Option B (edit compose).
+- After volume mount is configured, user needs to redeploy datamind-keys
+  (bump CACHEBUST → 18) and test /queries with a real SELECT.
+- SSL "Not secure" warning still pending.
