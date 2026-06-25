@@ -2435,3 +2435,65 @@ Unresolved Issues / Risks:
 - The SSL "Not secure" warning (Task 8) is still pending.
 - The frontend UI still doesn't expose allowedIps / rateLimitPerMinute
   form fields (Task 11 noted this).
+
+---
+Task ID: 16 (main agent — OpenFN adaptor to test all 4 public endpoints)
+Agent: main (Z.ai Code)
+Task: User wants to do the "real test" — use the DataMind BI public API
+from OpenFN. Provided a working OpenFN template (using @openfn/language-http
+adaptor, get() at top level, Bearer token in state.configuration.token)
+and asked to adapt it to test ALL endpoints.
+
+Work Log:
+- Read all 4 public API routes to capture exact response shapes:
+  1. GET /api/public/v1/me → { ok, user:{id,email,name,role},
+     apiKey:{id,label,scopes,prefix,lastUsedAt}, account:{activeKeys,
+     totalApiRequests}, server:{time,durationMs} } — scope: read
+  2. GET /api/public/v1/datasources → { ok, count, datasources:[
+     {id,name,type,host,port,database,status,lastSyncAt}] } — scope: read
+  3. GET /api/public/v1/dashboards → { ok, count, dashboards:[
+     {id,name,description,widgets,lastEditedAt,url}] } — scope: read
+  4. POST /api/public/v1/queries → { ok, sql, datasourceId, rowCount,
+     durationMs, rows:[{id,label,value,generated_at}] } — scope: execute
+     Body: { sql:string, datasourceId?:string, limit?:1-1000 default 100 }
+- Honored the user's CRITICAL OpenFN constraint: get()/post() must be
+  declared at TOP LEVEL (not inside fn()) — otherwise @openfn/language-http
+  v7.x silently drops the Authorization header.
+- Pattern between calls: use fn() ONLY to snapshot state.data into a
+  named field (state.me, state.datasources, …) so the next top-level
+  get()/post() doesn't overwrite it. This preserves all 4 responses.
+- For POST /queries, used post(path, { body: { … } }) — the adaptor
+  JSON-serializes the object body automatically and sets Content-Type.
+- Added resilience: each fn() checks state.data.ok and logs the full
+  error response instead of crashing, so one failed endpoint doesn't
+  abort the remaining tests. The final summary fn() reports X/4 OK.
+- Added troubleshooting notes (401 = bad token, 403 = missing execute
+  scope, 429 = rate limit).
+- Saved as /home/z/my-project/openfn/test-all-endpoints.js for version
+  control + easy reference.
+- Committed (see below), pushed to fcruzp/datamind-keys main.
+
+Stage Summary:
+- Full OpenFN workflow delivered that tests all 4 DataMind BI public
+  endpoints in sequence, with per-endpoint logging + a final 4/4
+  summary.
+- Credential setup the user needs in OpenFn:
+    Name: DataMind BI API
+    Adaptor: @openfn/language-http
+    baseUrl: https://datamind-api.mooo.com
+    token:   dm_live_••••  (from Portal → API Keys → Create)
+- Job config:
+    Adaptor: @openfn/language-http
+    Credential: DataMind BI API
+    Body: paste the contents of openfn/test-all-endpoints.js
+- IMPORTANT: the API key used MUST have both `read` AND `execute`
+  scopes (execute is only needed for POST /queries). If the key only
+  has `read`, the first 3 endpoints pass and /queries returns 403.
+
+Unresolved Issues / Risks:
+- The Docker cache-bust fix (Task 15) must be deployed before this
+  test can run against production — if the old bundle is still served,
+  the TDZ crash will prevent the Portal from loading to even create a
+  key. User should: bump CACHEBUST → 14, redeploy, then create a key
+  with read+execute scopes, then paste it into OpenFn credentials.
+- SSL "Not secure" warning still pending (Task 8).
