@@ -40,6 +40,7 @@ export async function GET(req: Request) {
   // - For api_request_logs, do a two-step query (no Prisma relation).
   let activeKeys = 0
   let totalRequests = 0
+  let tenantName: string | null = null
   try {
     activeKeys = await db.apiKey.count({
       where: { userId: auth.user.supabaseId, revokedAt: null },
@@ -55,6 +56,14 @@ export async function GET(req: Request) {
         where: { apiKeyId: { in: keyIds } },
       })
     }
+
+    // Fetch the real tenant name from user_profiles.
+    // user_profiles.user_id is a uuid = auth.users.id = auth.user.supabaseId.
+    const profile = await db.userProfile.findUnique({
+      where: { userId: auth.user.supabaseId },
+      select: { tenantName: true },
+    })
+    tenantName = profile?.tenantName ?? null
   } catch (e) {
     console.error('[/api/public/v1/me] stats query failed:', e)
   }
@@ -77,6 +86,7 @@ export async function GET(req: Request) {
         email: auth.user.email,
         name: auth.user.name,
         role: auth.user.role ?? null,
+        tenantName,
       },
       apiKey: {
         id: auth.apiKey.id,

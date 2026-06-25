@@ -6,9 +6,16 @@ import {
   logApiRequest,
   rateLimitHeaders,
 } from '@/lib/api-auth'
+import { db } from '@/lib/db'
 
 // GET /api/public/v1/datasources
-// Lists demo datasources. Requires `read` scope.
+// Returns the caller's REAL uploaded datasources from BIweb's `data_sources`
+// table. Tenant-scoped via `userId = auth.user.id` (text cuid).
+//
+// IMPORTANT: data_sources.user_id is TEXT and references users.id (cuid),
+// NOT auth.users.id (uuid). So we filter with auth.user.id, NOT supabaseId.
+// This was verified empirically: count WHERE user_id = users.supabase_id → 0,
+// count WHERE user_id = users.id → 1 (for Boceto Perez).
 export async function GET(req: Request) {
   const started = Date.now()
   const auth = await authenticateApiKey(req)
@@ -26,37 +33,34 @@ export async function GET(req: Request) {
     )
   }
 
-  // Demo data — in real DataMind BI this would query the `DataSource` table.
-  const datasources = [
-    {
-      id: 'ds_postgres_main',
-      name: 'Production Postgres',
-      type: 'postgres',
-      host: 'db.datamind.mooo.com',
-      port: 5432,
-      database: 'datamind_prod',
-      status: 'connected',
-      lastSyncAt: new Date(Date.now() - 1000 * 60 * 12).toISOString(),
+  // Real tenant-scoped query — only datasources owned by the API key's user.
+  const rows = await db.dataSource.findMany({
+    where: { userId: auth.user.id },
+    orderBy: { createdAt: 'desc' },
+    select: {
+      id: true,
+      name: true,
+      fileName: true,
+      fileSize: true,
+      fileType: true,
+      status: true,
+      errorMessage: true,
+      createdAt: true,
+      updatedAt: true,
     },
-    {
-      id: 'ds_bigquery_analytics',
-      name: 'BigQuery Analytics',
-      type: 'bigquery',
-      project: 'datamind-analytics',
-      dataset: 'events',
-      status: 'connected',
-      lastSyncAt: new Date(Date.now() - 1000 * 60 * 60 * 3).toISOString(),
-    },
-    {
-      id: 'ds_mysql_legacy',
-      name: 'Legacy MySQL',
-      type: 'mysql',
-      host: 'legacy.internal',
-      port: 3306,
-      status: 'degraded',
-      lastSyncAt: new Date(Date.now() - 1000 * 60 * 60 * 26).toISOString(),
-    },
-  ]
+  })
+
+  const datasources = rows.map((ds) => ({
+    id: ds.id,
+    name: ds.name,
+    type: ds.fileType,
+    fileName: ds.fileName,
+    fileSize: ds.fileSize,
+    status: ds.status,
+    errorMessage: ds.errorMessage,
+    createdAt: ds.createdAt.toISOString(),
+    updatedAt: ds.updatedAt.toISOString(),
+  }))
 
   const durationMs = Date.now() - started
   await logApiRequest({

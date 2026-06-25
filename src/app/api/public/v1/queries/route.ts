@@ -7,9 +7,20 @@ import {
   logApiRequest,
   rateLimitHeaders,
 } from '@/lib/api-auth'
+import { db } from '@/lib/db'
 
 // POST /api/public/v1/queries
-// Executes a (sandboxed demo) SQL SELECT. Requires `execute` scope.
+// Accepts a SQL SELECT + optional datasourceId. Tenant-scoped:
+//   - If datasourceId is provided, verifies it belongs to the caller
+//     (userId = auth.user.id). Returns 404 if not found or not owned.
+//   - Returns the datasource's real metadata as the result row(s) so the
+//     caller can confirm tenant isolation.
+//
+// NOTE: data_sources stores UPLOADED SQLITE FILES (file_name, file_path,
+// file_type='sqlite'), NOT live database connections. Executing arbitrary
+// SQL against an uploaded file requires reading it from disk/storage and
+// using a SQLite driver — that's a future enhancement. For now, the endpoint
+// validates ownership and returns real tenant-scoped datasource metadata.
 const bodySchema = z.object({
   sql: z
     .string()
@@ -54,7 +65,7 @@ export async function POST(req: Request) {
   const { sql, limit } = parsed.data
   const lower = sql.toLowerCase().trim()
 
-  // Demo-safe: refuse anything that doesn't start with SELECT
+  // Safety: refuse anything that doesn't start with SELECT
   if (!lower.startsWith('select')) {
     return NextResponse.json(
       { error: 'Only SELECT statements are permitted on this endpoint.' },
@@ -62,13 +73,87 @@ export async function POST(req: Request) {
     )
   }
 
-  // Demo result: synthesize a tiny result set so OpenFN/N8N flows can wire end-to-end.
-  const rows = Array.from({ length: Math.min(limit, 3) }, (_, i) => ({
-    id: i + 1,
-    label: `row_${i + 1}`,
-    value: Math.round(Math.random() * 1000) / 10,
-    generated_at: new Date().toISOString(),
-  }))
+  // --- Tenant-scoped datasource resolution --------------------------------
+  // data_sources.user_id is TEXT → users.id (cuid). Filter with auth.user.id.
+  let datasource: {
+    id: string
+    name: string
+    fileName: string
+    fileSize: number
+    fileType: string
+    status: string
+    userId: string | null
+  } | null = null
+
+  if (parsed.data.datasourceId && parsed.data.datasourceId !== 'demo') {
+    // Caller specified a datasource — verify ownership.
+    datasource = await db.dataSource.findFirst({
+      where: {
+        id: parsed.data.datasourceId,
+        userId: auth.user.id, // tenant scoping — only the caller's datasources
+      },
+      select: {
+        id: true,
+        name: true,
+        fileName: true,
+        fileSize: true,
+        fileType: true,
+        status: true,
+        userId: true,
+      },
+    })
+
+    if (!datasource) {
+      // Don't reveal whether the datasource exists for another tenant.
+      const durationMs = Date.now() - started
+      await logApiRequest({
+        apiKeyId: auth.apiKey.id,
+        endpoint: '/api/public/v1/queries',
+        method: 'POST',
+        statusCode: 404,
+        durationMs,
+        ip: getClientIp(req),
+      })
+      return NextResponse.json(
+        {
+          error: `Datasource '${parsed.data.datasourceId}' not found in your account.`,
+        },
+        { status: 404, headers: rateLimitHeaders(auth) },
+      )
+    }
+  } else {
+    // No specific datasource — use the caller's most recent one (if any).
+    datasource = await db.dataSource.findFirst({
+      where: { userId: auth.user.id },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        name: true,
+        fileName: true,
+        fileSize: true,
+        fileType: true,
+        status: true,
+        userId: true,
+      },
+    })
+  }
+
+  // Build a tenant-scoped result. If a datasource was found, return its real
+  // metadata as a single row — proving the response is scoped to the caller.
+  // If no datasource exists, return an empty rows array (still tenant-scoped).
+  const rows: Record<string, unknown>[] = []
+  if (datasource) {
+    rows.push({
+      datasource_id: datasource.id,
+      datasource_name: datasource.name,
+      file_name: datasource.fileName,
+      file_size: datasource.fileSize,
+      file_type: datasource.fileType,
+      status: datasource.status,
+      owner_user_id: datasource.userId,
+      note: 'SQLite file upload — live SQL execution against uploaded files is not yet supported. Metadata is real and tenant-scoped.',
+    })
+  }
 
   const durationMs = Date.now() - started
   await logApiRequest({
@@ -85,10 +170,10 @@ export async function POST(req: Request) {
     {
       ok: true,
       sql,
-      datasourceId: parsed.data.datasourceId ?? 'demo',
+      datasourceId: datasource?.id ?? parsed.data.datasourceId ?? 'none',
       rowCount: rows.length,
       durationMs,
-      rows,
+      rows: rows.slice(0, limit),
     },
     { headers: rateLimitHeaders(auth) },
   )

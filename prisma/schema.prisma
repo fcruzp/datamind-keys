@@ -165,3 +165,140 @@ model SettingsAuditLog {
   @@index([action])
   @@map("settings_audit_logs")
 }
+
+// ===========================================================================
+// DataSource — mirrors BIweb's `data_sources` table.
+//
+// This is NOT a database-connection table. It stores UPLOADED SQLITE FILES
+// (file_name, file_size, file_path, file_type default 'sqlite').
+//
+// `user_id` is TEXT and references `users.id` (the cuid), NOT auth.users.id.
+// Verified empirically: count of data_sources WHERE user_id = users.supabase_id
+// → 0; count WHERE user_id = users.id → 1 (for Boceto Perez).
+//
+// So tenant scoping for this table uses `auth.user.id` (cuid), NOT supabaseId.
+// ===========================================================================
+model DataSource {
+  id           String   @id
+  userId       String?  @map("user_id")
+  name         String
+  fileName     String   @map("file_name")
+  fileSize     Int      @map("file_size")
+  filePath     String   @map("file_path")
+  fileType     String   @default("sqlite") @map("file_type")
+  status       String   @default("uploaded")
+  errorMessage String?  @map("error_message")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp
+  updatedAt    DateTime @map("updated_at") @db.Timestamp
+
+  @@index([userId])
+  @@map("data_sources")
+}
+
+// ===========================================================================
+// Dashboard — mirrors BIweb's `dashboards` table.
+//
+// `user_id` is TEXT and references `users.id` (the cuid), same convention as
+// data_sources. Tenant scoping uses `auth.user.id`.
+//
+// `layout` is TEXT (stores a JSON string serialized by BIweb's frontend).
+// ===========================================================================
+model Dashboard {
+  id          String   @id
+  userId      String?  @map("user_id")
+  name        String
+  description String?
+  layout      String
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamp
+  updatedAt   DateTime @map("updated_at") @db.Timestamp
+
+  widgets     DashboardWidget[]
+
+  @@index([userId])
+  @@map("dashboards")
+}
+
+// ===========================================================================
+// DashboardWidget — mirrors BIweb's `dashboard_widgets` table.
+//
+// `dashboard_id` references `dashboards.id` (both text). We define a Prisma
+// relation so we can `include: { widgets: true }` on Dashboard queries.
+// `data_source_id` is nullable text — references data_sources.id when a widget
+// is bound to a specific datasource.
+// ===========================================================================
+model DashboardWidget {
+  id            String   @id
+  dashboardId   String   @map("dashboard_id")
+  title         String
+  widgetType    String   @map("widget_type")
+  dataSourceId  String?  @map("data_source_id")
+  sqlQuery      String?  @map("sql_query")
+  visualization String?
+  config        String
+  positionX     Int      @default(0) @map("position_x")
+  positionY     Int      @default(0) @map("position_y")
+  width         Int      @default(6)
+  height        Int      @default(4)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamp
+  updatedAt     DateTime @map("updated_at") @db.Timestamp
+
+  dashboard     Dashboard @relation(fields: [dashboardId], references: [id])
+
+  @@index([dashboardId])
+  @@index([dataSourceId])
+  @@map("dashboard_widgets")
+}
+
+// ===========================================================================
+// QueryHistory — mirrors BIweb's `query_histories` table.
+//
+// Records NL→SQL query execution results. `data_source_id` references
+// data_sources.id (text). Tenant scoping is transitive: a query history
+// belongs to the user who owns its datasource.
+//
+// Note: `natural_query`, `sql_query`, and `result_data` are all NOT NULL,
+// so we can only create rows when all three are available. The public API
+// /queries endpoint does NOT log here (it lacks natural_query + result_data).
+// ===========================================================================
+model QueryHistory {
+  id            String   @id
+  dataSourceId  String   @map("data_source_id")
+  sessionId     String?  @map("session_id")
+  naturalQuery  String   @map("natural_query")
+  sqlQuery      String   @map("sql_query")
+  resultData    String   @map("result_data")
+  rowCount      Int      @default(0) @map("row_count")
+  executionTime Int      @default(0) @map("execution_time")
+  status        String   @default("success")
+  errorMessage  String?  @map("error_message")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamp
+
+  @@index([dataSourceId])
+  @@index([createdAt])
+  @@map("query_histories")
+}
+
+// ===========================================================================
+// UserProfile — mirrors BIweb's `user_profiles` table.
+//
+// `user_id` is UUID and references `auth.users.id` (= users.supabase_id).
+// This is DIFFERENT from data_sources/dashboards (which use users.id text).
+// Tenant scoping uses `auth.user.supabaseId`.
+//
+// `tenant_name` is the real tenant concept we were missing — defaults to
+// 'Personal'. This is what /me should return as the user's tenant.
+// ===========================================================================
+model UserProfile {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  tenantName  String   @default("Personal") @map("tenant_name")
+  avatarColor String   @default("from-emerald-500 to-teal-600") @map("avatar_color")
+  role        String   @default("owner")
+  lastLoginAt DateTime? @map("last_login_at") @db.Timestamptz
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.Timestamptz
+
+  @@unique([userId])
+  @@index([userId])
+  @@map("user_profiles")
+}

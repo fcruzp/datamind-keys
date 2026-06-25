@@ -6,9 +6,14 @@ import {
   logApiRequest,
   rateLimitHeaders,
 } from '@/lib/api-auth'
+import { db } from '@/lib/db'
 
 // GET /api/public/v1/dashboards
-// Lists demo dashboards owned by the account. Requires `read` scope.
+// Returns the caller's REAL dashboards from BIweb's `dashboards` table,
+// including their widgets. Tenant-scoped via `userId = auth.user.id`.
+//
+// IMPORTANT: dashboards.user_id is TEXT and references users.id (cuid),
+// same convention as data_sources. Filter with auth.user.id, NOT supabaseId.
 export async function GET(req: Request) {
   const started = Date.now()
   const auth = await authenticateApiKey(req)
@@ -26,41 +31,35 @@ export async function GET(req: Request) {
     )
   }
 
-  // Demo data — in real DataMind BI this would query the `Dashboard` table.
-  const dashboards = [
-    {
-      id: 'dash_revenue_overview',
-      name: 'Revenue Overview',
-      description: 'Monthly revenue, MRR, churn, and LTV across all plans.',
-      widgets: 12,
-      lastEditedAt: new Date(Date.now() - 1000 * 60 * 60 * 5).toISOString(),
-      url: 'https://datamind.mooo.com/dashboards/revenue-overview',
+  // Real tenant-scoped query — only dashboards owned by the API key's user.
+  const rows = await db.dashboard.findMany({
+    where: { userId: auth.user.id },
+    orderBy: { updatedAt: 'desc' },
+    include: {
+      widgets: {
+        orderBy: { positionY: 'asc' },
+      },
     },
-    {
-      id: 'dash_product_engagement',
-      name: 'Product Engagement',
-      description: 'DAU/MAU, feature adoption, session duration heatmaps.',
-      widgets: 18,
-      lastEditedAt: new Date(Date.now() - 1000 * 60 * 60 * 26).toISOString(),
-      url: 'https://datamind.mooo.com/dashboards/product-engagement',
-    },
-    {
-      id: 'dash_support_ops',
-      name: 'Support Operations',
-      description: 'Ticket volume, CSAT, response-time SLA, agent leaderboard.',
-      widgets: 9,
-      lastEditedAt: new Date(Date.now() - 1000 * 60 * 60 * 72).toISOString(),
-      url: 'https://datamind.mooo.com/dashboards/support-ops',
-    },
-    {
-      id: 'dash_infra_health',
-      name: 'Infrastructure Health',
-      description: 'CPU, memory, p99 latency, error budget burn across services.',
-      widgets: 24,
-      lastEditedAt: new Date(Date.now() - 1000 * 60 * 12).toISOString(),
-      url: 'https://datamind.mooo.com/dashboards/infra-health',
-    },
-  ]
+  })
+
+  const dashboards = rows.map((d) => ({
+    id: d.id,
+    name: d.name,
+    description: d.description,
+    widgetCount: d.widgets.length,
+    widgets: d.widgets.map((w) => ({
+      id: w.id,
+      title: w.title,
+      type: w.widgetType,
+      dataSourceId: w.dataSourceId,
+      sqlQuery: w.sqlQuery,
+      visualization: w.visualization,
+      position: { x: w.positionX, y: w.positionY },
+      size: { width: w.width, height: w.height },
+    })),
+    createdAt: d.createdAt.toISOString(),
+    updatedAt: d.updatedAt.toISOString(),
+  }))
 
   const durationMs = Date.now() - started
   await logApiRequest({
