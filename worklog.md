@@ -2237,3 +2237,70 @@ Stage Summary:
   1. The Quickstart curl block will show the correct domain
   2. A copy icon button appears in the top-right of all curl blocks
   3. All links and buttons show the hand cursor
+
+---
+Task ID: 13 (main agent — fix production TDZ crash)
+Agent: main (Z.ai Code)
+Task: User reported a new runtime error in the production deployment at
+datamind-api.mooo.com:
+  "Uncaught ReferenceError: Cannot access 'i' before initialization
+     at 32nm_jwn3appf.js:1:87453
+     at ay (20_0bfwdk1o_x.js:1:63845)
+     at oH (20_0bfwdk1o_x.js:1:81849) ..."
+The minified filenames + the "Cannot access 'i' before initialization"
+message are the signature of a Temporal Dead Zone (TDZ) violation that
+only surfaces in the minified production bundle.
+
+Work Log:
+- Read worklog.md (Tasks 1–12) to understand the full history. The most
+  recent change was Task 12 (commit c8efcec): "Fix curl domain + add copy
+  buttons + cursor-pointer globally" — which introduced a NEW component
+  `src/components/ui/copy-button.tsx`. This was the prime suspect.
+- Inspected copy-button.tsx and found the bug on lines 37–38:
+    copyIcon: Copy = Copy,
+    checkIcon: Check = Check,
+  This is a classic JavaScript TDZ bug. The destructuring
+  `{ copyIcon: Copy = Copy }` creates a LOCAL binding named `Copy` that
+  SHADOWS the imported `Copy` from lucide-react. When `props.copyIcon` is
+  `undefined` (the common case — no caller passes a custom icon), JS
+  evaluates the default `= Copy`, which resolves to the LOCAL `Copy` —
+  still in the TDZ (not yet initialized). Result:
+    ReferenceError: Cannot access 'Copy' before initialization
+  After SWC minification, `Copy`/`Check` are renamed to short identifiers
+  like `i`, producing the exact user-facing error:
+    "Cannot access 'i' before initialization"
+- This is a PRODUCTION-ONLY bug: dev mode does not minify, and the
+  minified names differ, so the error never reproduced locally. The dev
+  server returned 200 and the page rendered fine — but the moment the
+  production bundle loaded `CopyButton` (used in QuickstartCard on the
+  dashboard, NewKeyRevealDialog, and OpenApiExplorer), it threw.
+- Fix: renamed the local destructured bindings so they no longer shadow
+  the imports:
+    copyIcon: CopyIcon = Copy,   // local is CopyIcon, default refs imported Copy ✓
+    checkIcon: CheckIcon = Check, // local is CheckIcon, default refs imported Check ✓
+  Updated the JSX to use `<CopyIcon>` / `<CheckIcon>`.
+- Verified the fix:
+  - `bun run lint` → clean (0 errors)
+  - `bunx tsc --noEmit` (filtered to the 5 affected files) → no errors
+  - Restarted dev server → GET / 200
+  - agent-browser: opened http://localhost:3000, waited for networkidle,
+    checked `errors` → empty, checked `console` → only React DevTools +
+    HMR/Fast Refresh noise (no runtime errors). Screenshot captured.
+  - grep confirmed NO other `copyIcon: X = X` shadowing patterns exist
+    anywhere in src/.
+- Committed as e0680db, pushed to fcruzp/datamind-keys main.
+
+Stage Summary:
+- Root cause: destructuring default-value self-shadowing in CopyButton.
+- Fix: rename local bindings (CopyIcon/CheckIcon) to avoid shadowing the
+  imported lucide-react Copy/Check icons.
+- Production crash `Cannot access 'i' before initialization` is resolved.
+- User needs to: bump CACHEBUST → 12 in Coolify, redeploy. The dashboard
+  will render again and the copy buttons will work.
+
+Unresolved Issues / Risks:
+- The SSL "Not secure" warning on datamind-api.mooo.com (Task 8) is still
+  pending — user needs to reissue the Let's Encrypt cert in Coolify.
+- The frontend UI still doesn't expose `allowedIps` / `rateLimitPerMinute`
+  form fields (Task 11 noted this); the API supports them but users can't
+  set them via the UI yet.
