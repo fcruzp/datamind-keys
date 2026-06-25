@@ -3271,3 +3271,63 @@ Unresolved Issues / Risks:
 - SSL "Not secure" warning still pending (Coolify Let's Encrypt reissue).
 - Phase 2 (write/update via API) not yet implemented — would be the
   next high-value feature for OpenFN/N8N automation.
+
+---
+Task ID: 29 (main agent — setup guide + curl memory)
+Agent: main (Z.ai Code)
+Task: User requested a permanent, repeatable record of (1) how we got
+curl working on Windows PowerShell and (2) the full volume-mount setup
+process from scratch.
+
+Work Log:
+- Created SETUP-GUIDE.md in the repo root — a comprehensive, repeatable
+  guide with 7 parts:
+  A. Architecture overview (diagram + key facts)
+  B. Identify BIweb's storage layout (Supabase SQL + Coolify UI)
+  C. Find the host path via SSH (docker volume ls + inspect + verify)
+  D. Configure the shared volume in datamind-keys (Coolify UI steps)
+  E. Redeploy and verify (CACHEBUST bump + ls /app/data/)
+  F. Test the API from Windows PowerShell (the curl gotcha + solution)
+  G. Troubleshooting (9 common errors with fixes)
+  + Quick reference card at the end
+- THE CURL MEMORY (so we never forget):
+  Windows PowerShell aliases `curl` to `Invoke-WebRequest`, which does
+  NOT accept `-H "Header: value"` syntax. Calling `curl -H "..."`
+  in PowerShell throws: "Cannot bind parameter 'Headers'. Cannot
+  convert the value of type 'System.String' to type
+  'System.Collections.IDictionary'."
+  TWO solutions:
+  1. Use `Invoke-RestMethod` with a $headers hashtable (RECOMMENDED):
+       $headers = @{ "Authorization" = "Bearer dm_live_..." }
+       $body = @{ datasourceId = "..."; sql = "..." } | ConvertTo-Json
+       Invoke-RestMethod -Uri "https://..." -Method Post `
+         -Headers $headers -ContentType "application/json" -Body $body
+  2. Use `curl.exe` (with .exe suffix) to bypass the alias, and escape
+     JSON quotes with backslashes: -d '{\"datasourceId\":\"...\"}'
+  We used approach #1 (Invoke-RestMethod) — works cleanly.
+- Also documented the Coolify v4 volume-prefix gotcha: creating a new
+  "Volume mount" in Coolify UI prefixes the name with the app UUID,
+  so you CANNOT share a named volume that way. Must use "Directory
+  Mount" with the host Mountpoint as Source Path.
+- Also documented the volume-name typo gotcha: the Coolify UI showed
+  `hyvtdbc00tfxcds8pr6o8jl-datamind-data` but the actual Docker volume
+  is `hyvtdbc00txfcds8pr6oj8ji-datamind-data`. Always confirm with
+  `docker volume ls` from the SSH terminal, not from screenshots.
+- Ran bun run lint → clean.
+- Committed SETUP-GUIDE.md + this worklog entry.
+
+Stage Summary:
+- SETUP-GUIDE.md is now the canonical reference for:
+  - Connecting datamind-keys to BIweb's shared SQLite volume from scratch
+  - Testing the /queries API from Windows PowerShell (the curl gotcha)
+  - Troubleshooting 9 common issues
+- Anyone (human or AI agent) can rebuild the setup from this single doc.
+- The guide lives in the repo root, next to ROADMAP.md, so it travels
+  with the code.
+
+Unresolved Issues / Risks:
+- The SETUP-GUIDE hardcodes some values (IP 187.127.249.13, volume name
+  hyvtdbc00txfcds8pr6oj8ji-datamind-data, demo API key) — these will
+  need updating if the server migrates. Marked clearly as examples.
+- SSL "Not secure" warning still pending.
+- Phase 2 (SQLite upload/update via API) not yet started.
