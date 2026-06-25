@@ -119,4 +119,22 @@
   body {
     @apply bg-background text-foreground;
   }
+  /* All interactive elements get a pointer cursor — matches user
+     expectation that clickable things look clickable. Disabled
+     elements are excluded. */
+  a,
+  button:not(:disabled):not([disabled]),
+  [role="button"]:not(:disabled):not([disabled]),
+  summary,
+  label[for],
+  [type="button"]:not(:disabled):not([disabled]),
+  [type="submit"]:not(:disabled):not([disabled]),
+  [type="reset"]:not(:disabled):not([disabled]),
+  [data-cursor="pointer"] {
+    cursor: pointer;
+  }
+  /* Elements marked as not-interactive should show the default cursor */
+  [data-cursor="default"] {
+    cursor: default;
+  }
 }

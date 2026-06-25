@@ -84,7 +84,7 @@ export function ApiKeysManager() {
 
   const handleCopyCurl = React.useCallback(async () => {
     const host =
-      typeof window !== 'undefined' ? window.location.origin : 'https://datamind.mooo.com'
+      typeof window !== 'undefined' ? window.location.origin : 'https://datamind-api.mooo.com'
     const example = buildCurlExample(host)
     try {
       await navigator.clipboard.writeText(example)

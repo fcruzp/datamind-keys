@@ -24,6 +24,8 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { CopyButton } from '@/components/ui/copy-button'
+import { useOrigin } from '@/lib/use-origin'
 import { cn } from '@/lib/utils'
 import type { PortalUser, PortalStats } from './types'
 import { SignInCard } from './sign-in-card'
@@ -110,6 +112,18 @@ function StatCard({
 // ---------------------------------------------------------------------------
 
 function QuickstartCard({ tenantName }: { tenantName: string }) {
+  const origin = useOrigin()
+  const curlExample = `# 1. Generate a key under Settings → API Keys
+#    (visible only ONCE, hashed at rest with SHA-256)
+
+# 2. Call any /api/public/v1/* endpoint with Bearer auth
+curl ${origin}/api/public/v1/me \\
+  -H "Authorization: Bearer dm_live_••••"
+
+# 3. List datasources for tenant: ${tenantName}
+curl ${origin}/api/public/v1/datasources \\
+  -H "Authorization: Bearer dm_live_••••"`
+
   return (
     <Card className="overflow-hidden border-border/60 shadow-sm">
       <CardHeader className="border-b bg-muted/30 py-3 px-4 flex flex-row items-center gap-2">
@@ -120,17 +134,16 @@ function QuickstartCard({ tenantName }: { tenantName: string }) {
         </Badge>
       </CardHeader>
       <CardContent className="p-0">
-        <div className="bg-zinc-950 text-zinc-200 p-4 font-mono text-[11px] leading-relaxed overflow-x-auto">
-          <pre>{`# 1. Generate a key under Settings → API Keys
-#    (visible only ONCE, hashed at rest with SHA-256)
-
-# 2. Call any /api/public/v1/* endpoint with Bearer auth
-curl https://datamind.mooo.com/api/public/v1/me \\
-  -H "Authorization: Bearer dm_live_••••"
-
-# 3. List datasources for tenant: ${tenantName}
-curl https://datamind.mooo.com/api/public/v1/datasources \\
-  -H "Authorization: Bearer dm_live_••••"`}</pre>
+        <div className="relative bg-zinc-950 text-zinc-200 p-4 font-mono text-[11px] leading-relaxed overflow-x-auto">
+          <div className="absolute top-2 right-2 z-10">
+            <CopyButton
+              value={curlExample}
+              label="Copy curl example"
+              iconSize="size-3.5"
+              className="bg-zinc-800/80 backdrop-blur-sm border border-zinc-700/50 text-zinc-300 hover:text-white hover:bg-zinc-700"
+            />
+          </div>
+          <pre>{curlExample}</pre>
         </div>
       </CardContent>
     </Card>

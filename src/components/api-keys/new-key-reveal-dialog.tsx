@@ -22,6 +22,8 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { CopyButton } from '@/components/ui/copy-button'
+import { useOrigin } from '@/lib/use-origin'
 import { ScopeBadgeList } from './scope-badge'
 import type { CreatedApiKey } from './types'
 
@@ -35,6 +37,7 @@ export function NewKeyRevealDialog({
   const [revealed, setRevealed] = React.useState(false)
   const [copied, setCopied] = React.useState(false)
   const [acknowledged, setAcknowledged] = React.useState(false)
+  const origin = useOrigin()
 
   // Reset state every time a new key comes in
   React.useEffect(() => {
@@ -60,7 +63,7 @@ export function NewKeyRevealDialog({
   }
 
   const curlExample = created
-    ? `curl https://datamind.mooo.com/api/public/v1/me \\
+    ? `curl ${origin}/api/public/v1/me \\
   -H "Authorization: Bearer ${created.plaintext}"`
     : ''
 
@@ -180,9 +183,19 @@ export function NewKeyRevealDialog({
               <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground uppercase tracking-wider">
                 <Terminal className="size-3.5" /> Quick test
               </div>
-              <pre className="overflow-x-auto rounded-lg bg-zinc-950 text-zinc-100 p-3 text-xs font-mono leading-relaxed border border-border">
-                <code>{curlExample}</code>
-              </pre>
+              <div className="relative">
+                <pre className="overflow-x-auto rounded-lg bg-zinc-950 text-zinc-100 p-3 pr-10 text-xs font-mono leading-relaxed border border-border">
+                  <code>{curlExample}</code>
+                </pre>
+                <div className="absolute top-2 right-2">
+                  <CopyButton
+                    value={curlExample}
+                    label="Copy curl command"
+                    iconSize="size-3.5"
+                    className="bg-zinc-800/80 backdrop-blur-sm border border-zinc-700/50 text-zinc-300 hover:text-white hover:bg-zinc-700"
+                  />
+                </div>
+              </div>
               <p className="text-xs text-muted-foreground">
                 This endpoint calls <code className="text-foreground">/api/public/v1/me</code>{' '}
                 to verify the key without side-effects.

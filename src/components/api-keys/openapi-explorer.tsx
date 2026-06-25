@@ -18,6 +18,7 @@ import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   Collapsible,
   CollapsibleContent,
@@ -435,9 +436,21 @@ function OperationDetail({
                 ))}
             </div>
           )}
-          <pre className="rounded-md border border-border/60 bg-zinc-950 p-3 text-[11px] font-mono text-zinc-200 overflow-x-auto max-h-72">
-            <code>{response.body || '(empty body)'}</code>
-          </pre>
+          <div className="relative">
+            <pre className="rounded-md border border-border/60 bg-zinc-950 p-3 pr-10 text-[11px] font-mono text-zinc-200 overflow-x-auto max-h-72">
+              <code>{response.body || '(empty body)'}</code>
+            </pre>
+            {response.body && (
+              <div className="absolute top-2 right-2">
+                <CopyButton
+                  value={response.body}
+                  label="Copy response"
+                  iconSize="size-3"
+                  className="bg-zinc-800/80 backdrop-blur-sm border border-zinc-700/50 text-zinc-300 hover:text-white hover:bg-zinc-700"
+                />
+              </div>
+            )}
+          </div>
         </div>
       )}
 

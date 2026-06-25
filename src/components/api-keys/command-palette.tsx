@@ -290,7 +290,7 @@ export function useCommandPalette(
  * Default curl template the "Copy curl example" action copies to clipboard.
  * The caller passes a host so the example is correct in any environment.
  */
-export function buildCurlExample(host = 'https://datamind.mooo.com'): string {
+export function buildCurlExample(host = 'https://datamind-api.mooo.com'): string {
   return `curl ${host}/api/public/v1/me \\
   -H "Authorization: Bearer dm_live_YOUR_KEY_HERE"`
 }
