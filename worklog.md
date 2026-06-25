@@ -2304,3 +2304,61 @@ Unresolved Issues / Risks:
 - The frontend UI still doesn't expose `allowedIps` / `rateLimitPerMinute`
   form fields (Task 11 noted this); the API supports them but users can't
   set them via the UI yet.
+
+---
+Task ID: 14 (main agent — fix dashboard activeKeys stat going stale)
+Agent: main (Z.ai Code)
+Task: User reported a data inconsistency: the "Active keys" stat card on
+the general dashboard shows 0, but the API Keys page shows 1 (which is
+the correct value). The two views should always show the same number.
+
+Work Log:
+- Traced the data flow for both numbers:
+  - **Dashboard stat card** (`dashboard-view.tsx` line 331): reads
+    `stats.activeKeys`, which flows from `PortalShell`'s `authQuery`
+    (queryKey: `['auth-me']`, fed by GET /api/auth/me). This query has
+    `initialData: initial` (the SSR-computed value from page.tsx) and
+    `staleTime: 30_000`. It is only refetched on window focus or when
+    explicitly invalidated.
+  - **API Keys page count** (`api-keys-manager.tsx` line 173): reads
+    `keys.length` from `keysQuery` (queryKey: `['api-keys']`, fed by
+    GET /api/settings/api-keys). This query is invalidated after every
+    create/revoke/edit, so it's always fresh.
+- Root cause: the create/revoke/edit mutations in 3 files invalidated
+  `['api-keys']` and `['api-keys-usage']` but NOT `['auth-me']`. So
+  after creating a key:
+    1. API Keys page refetches `['api-keys']` → shows 1 ✓
+    2. `['auth-me']` is NOT invalidated → `stats.activeKeys` stays at
+       the SSR value (0) ✗
+    3. User navigates back to dashboard → still shows 0 ✗
+- Fix: added `qc.invalidateQueries({ queryKey: ['auth-me'] })` to the
+  `onSuccess` of all three key mutations:
+    1. `create-api-key-dialog.tsx` (create) — activeKeys increases
+    2. `api-keys-manager.tsx` revokeMutation (revoke) — activeKeys decreases
+    3. `edit-api-key-dialog.tsx` (edit label) — doesn't change count,
+       but added for consistency / future-proofing
+- Verified: `bun run lint` → clean. `bunx tsc --noEmit` (filtered to
+  the 3 modified files) → no errors. agent-browser opened
+  http://localhost:3000 → 0 runtime errors, 0 console errors.
+- Committed as dec68c1, pushed to fcruzp/datamind-keys main.
+
+Stage Summary:
+- Dashboard "Active keys" stat card + sidebar badge now refresh in
+  lockstep with the API Keys page after any key mutation (create /
+  revoke / edit).
+- The fix is a one-line addition per mutation (`qc.invalidateQueries`).
+- User needs to: bump CACHEBUST → 13 in Coolify, redeploy. After that,
+  creating a key on the API Keys page and navigating back to the
+  dashboard will show the correct count on both views.
+
+Unresolved Issues / Risks:
+- The `['auth-me']` query has `staleTime: 30_000` (30s). With the
+  invalidation in place, this is fine — invalidation forces a refetch
+  regardless of staleTime. If future code adds a mutation that changes
+  key counts without invalidating `['auth-me']`, the stale issue will
+  recur. A shared `invalidateAllKeyQueries(qc)` helper could prevent
+  this, but it's overkill for 3 call sites.
+- The SSL "Not secure" warning on datamind-api.mooo.com (Task 8) is
+  still pending.
+- The frontend UI still doesn't expose `allowedIps` / `rateLimitPerMinute`
+  form fields (Task 11 noted this).
