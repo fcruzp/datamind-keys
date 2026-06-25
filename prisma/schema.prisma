@@ -11,6 +11,33 @@
 //
 // The Dockerfile runs ONLY `prisma generate` (never `prisma db push`), so
 // this schema is used purely for type generation + query building.
+//
+// ----------------------------------------------------------------------------
+// IMPORTANT — actual column types (verified via information_schema):
+// ----------------------------------------------------------------------------
+// `users.id`                → text (cuid, app-generated)
+// `users.created_at`        → timestamp WITHOUT time zone
+// `users.updated_at`        → timestamp WITHOUT time zone (no default)
+// `api_keys.id`             → uuid (gen_random_uuid)
+// `api_keys.user_id`        → uuid → references auth.users.id (= users.supabase_id)
+//                             ⚠ NOT users.id (text). So we pass supabaseId.
+// `api_keys.scopes`         → jsonb default '[]'
+// `api_keys.allowed_ips`    → jsonb default '[]' (NOT NULL — must be provided!)
+// `api_keys.rate_limit_per_minute` → integer nullable
+// `api_keys.last_used_ip`   → inet
+// `api_keys.revoked_at`     → timestamptz
+// `api_keys.last_used_at`   → timestamptz
+// `api_keys.expires_at`     → timestamptz
+// `api_keys.created_at`     → timestamptz
+// `api_request_logs.id`     → uuid
+// `api_request_logs.api_key_id` → uuid
+// `api_request_logs.ip`     → inet
+// `api_request_logs.created_at` → timestamptz
+//
+// Because users.id (text) and api_keys.user_id (uuid) have DIFFERENT types,
+// there is NO Prisma relation between User ↔ ApiKey. We resolve the user
+// from an API key by looking up `users.supabase_id = api_keys.user_id`
+// (a separate query).
 // ============================================================================
 
 generator client {
@@ -27,6 +54,10 @@ datasource db {
 // User — mirrors BIweb's `users` table (NOT auth.users).
 // In BIweb, this row is created on signup via a trigger. The `supabaseId`
 // field links to auth.users.id (the Supabase Auth UUID).
+//
+// NOTE: `users.id` is a text/cuid — it is NOT used as the foreign key for
+// `api_keys.user_id` (which is a uuid referencing auth.users.id). Use
+// `users.supabaseId` for that.
 // ===========================================================================
 model User {
   id                  String   @id @default(cuid())
@@ -44,35 +75,37 @@ model User {
   onboardingCompleted Boolean  @default(false) @map("onboarding_completed")
   interestArea        String?  @map("interest_area")
 
-  apiKeys ApiKey[]
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp
 
   @@map("users")
 }
 
 // ===========================================================================
 // ApiKey — mirrors BIweb's `api_keys` table.
-// NOTE: BIweb does NOT have `allowed_ips` or `rate_limit_per_minute` columns.
-// Rate limiting is handled in-memory (default 60 req/min). IP allowlisting
-// is not persisted (feature removed for integration compatibility).
+//
+// IMPORTANT: `userId` is a uuid that references auth.users.id (= users.supabase_id),
+// NOT users.id (text/cuid). When creating an API key, pass user.supabaseId
+// as the `userId`, NOT user.id.
+//
+// There is NO Prisma relation between ApiKey ↔ User because the column
+// types differ (uuid vs text). The user is resolved via a separate
+// `db.user.findUnique({ where: { supabaseId: apiKey.userId } })` query.
 // ===========================================================================
 model ApiKey {
-  id         String    @id @default(cuid())
-  userId     String    @map("user_id")
-  keyHash    String    @unique @map("key_hash")
-  keyPrefix  String    @map("key_prefix")
-  label      String
-  scopes     String    @default("[]")
-  revokedAt  DateTime? @map("revoked_at")
-  lastUsedAt DateTime? @map("last_used_at")
-  lastUsedIp String?   @map("last_used_ip")
-  expiresAt  DateTime? @map("expires_at")
-  createdAt  DateTime  @default(now()) @map("created_at")
-
-  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
-  requestLogs ApiRequestLog[]
+  id                 String    @id @default(uuid()) @db.Uuid
+  userId             String    @map("user_id") @db.Uuid
+  keyHash            String    @unique @map("key_hash")
+  keyPrefix          String    @map("key_prefix")
+  label              String
+  scopes             Json      @default("[]")
+  allowedIps         Json      @default("[]") @map("allowed_ips")
+  rateLimitPerMinute Int?      @map("rate_limit_per_minute")
+  revokedAt          DateTime? @map("revoked_at") @db.Timestamptz
+  lastUsedAt         DateTime? @map("last_used_at") @db.Timestamptz
+  lastUsedIp         String?   @map("last_used_ip") @db.Inet
+  expiresAt          DateTime? @map("expires_at") @db.Timestamptz
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz
 
   @@index([userId])
   @@index([keyHash])
@@ -81,19 +114,22 @@ model ApiKey {
 
 // ===========================================================================
 // ApiRequestLog — mirrors BIweb's `api_request_logs` table.
+//
+// `apiKeyId` is a uuid (matches api_keys.id which is now uuid). There is no
+// Prisma relation because the schema intentionally avoids FK enforcement at
+// the Prisma layer (BIweb's table doesn't define an actual FK constraint
+// between these two tables).
 // ===========================================================================
 model ApiRequestLog {
-  id         String   @id @default(cuid())
-  apiKeyId   String   @map("api_key_id")
+  id         String   @id @default(uuid()) @db.Uuid
+  apiKeyId   String   @map("api_key_id") @db.Uuid
   endpoint   String
   method     String
   statusCode Int      @map("status_code")
   durationMs Int      @map("duration_ms")
   rowCount   Int?     @map("row_count")
-  ip         String?
-  createdAt  DateTime @default(now()) @map("created_at")
-
-  apiKey ApiKey @relation(fields: [apiKeyId], references: [id], onDelete: Cascade)
+  ip         String?  @db.Inet
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
 
   @@index([apiKeyId, createdAt])
   @@index([createdAt])
@@ -109,6 +145,9 @@ model ApiRequestLog {
 // IMPORTANT: `user_id` references auth.users(id) — the Supabase Auth UUID,
 // NOT users.id (cuid). When writing audit entries, pass the Supabase UUID
 // (SessionUser.supabaseId), not the Prisma User.id.
+//
+// `api_key_id` is now a uuid (matches api_keys.id which is now uuid), so
+// callers CAN pass the API key's id when writing audit entries.
 // ===========================================================================
 model SettingsAuditLog {
   id          String   @id @default(uuid()) @db.Uuid

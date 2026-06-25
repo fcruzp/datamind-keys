@@ -12,6 +12,10 @@ import type { AuthMeResponse } from '@/components/portal/types'
 // mutations.
 //
 // If no Supabase session exists, PortalShell shows a Sign In card.
+//
+// NOTE: api_keys.user_id is a uuid = users.supabase_id (NOT users.id text/cuid).
+// All api_keys queries filter by user.supabaseId. There is no Prisma relation
+// between ApiKey ↔ ApiRequestLog, so log queries are two-step.
 // ---------------------------------------------------------------------------
 
 // Force dynamic rendering — this page depends on the Supabase session cookie
@@ -53,25 +57,38 @@ export default async function Home() {
   let lastLogAt: { createdAt: Date } | null = null
 
   try {
-    ;[activeKeys, revokedKeys, requests7d, lastLogAt] = await Promise.all([
+    // Step 1: counts of api_keys for the user (filter by supabaseId).
+    ;[activeKeys, revokedKeys] = await Promise.all([
       db.apiKey.count({
-        where: { userId: user.id, revokedAt: null },
+        where: { userId: user.supabaseId, revokedAt: null },
       }),
       db.apiKey.count({
-        where: { userId: user.id, revokedAt: { not: null } },
-      }),
-      db.apiRequestLog.count({
-        where: {
-          apiKey: { userId: user.id },
-          createdAt: { gte: since7d },
-        },
-      }),
-      db.apiRequestLog.findFirst({
-        where: { apiKey: { userId: user.id } },
-        orderBy: { createdAt: 'desc' },
-        select: { createdAt: true },
+        where: { userId: user.supabaseId, revokedAt: { not: null } },
       }),
     ])
+
+    // Step 2: fetch the user's key IDs (for filtering api_request_logs).
+    const userKeys = await db.apiKey.findMany({
+      where: { userId: user.supabaseId },
+      select: { id: true },
+    })
+    const keyIds = userKeys.map((k) => k.id)
+
+    if (keyIds.length > 0) {
+      ;[requests7d, lastLogAt] = await Promise.all([
+        db.apiRequestLog.count({
+          where: {
+            apiKeyId: { in: keyIds },
+            createdAt: { gte: since7d },
+          },
+        }),
+        db.apiRequestLog.findFirst({
+          where: { apiKeyId: { in: keyIds } },
+          orderBy: { createdAt: 'desc' },
+          select: { createdAt: true },
+        }),
+      ])
+    }
   } catch (e) {
     console.error('[/] stats query failed:', e)
   }

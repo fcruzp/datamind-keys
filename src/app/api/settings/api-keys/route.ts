@@ -3,12 +3,14 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import {
+  allowedIpsToJson,
   auditContext,
   generateApiKey,
   getDemoUser,
   maskApiKey,
+  parseAllowedIps,
   parseScopes,
-  serializeScopes,
+  scopesToJson,
   writeAuditLog,
   type ApiScope,
 } from '@/lib/api-auth'
@@ -17,6 +19,9 @@ import { withDbSafe } from '@/lib/api-wrapper'
 // ---------------------------------------------------------------------------
 // GET /api/settings/api-keys
 // Lists active (non-revoked) keys for the current user. Never returns plaintext.
+//
+// NOTE: api_keys.user_id is a uuid = users.supabase_id (NOT users.id).
+// We filter by user.supabaseId.
 // ---------------------------------------------------------------------------
 
 export const GET = withDbSafe<NextRequest>(async (req) => {
@@ -24,7 +29,7 @@ export const GET = withDbSafe<NextRequest>(async (req) => {
 
   const keys = await db.apiKey.findMany({
     where: {
-      userId: user.id,
+      userId: user.supabaseId,
       revokedAt: null,
     },
     orderBy: { createdAt: 'desc' },
@@ -33,6 +38,8 @@ export const GET = withDbSafe<NextRequest>(async (req) => {
       label: true,
       keyPrefix: true,
       scopes: true,
+      allowedIps: true,
+      rateLimitPerMinute: true,
       lastUsedAt: true,
       lastUsedIp: true,
       expiresAt: true,
@@ -47,6 +54,8 @@ export const GET = withDbSafe<NextRequest>(async (req) => {
       keyMasked: maskApiKey(k.keyPrefix),
       keyPrefix: k.keyPrefix,
       scopes: parseScopes(k.scopes),
+      allowedIps: parseAllowedIps(k.allowedIps),
+      rateLimitPerMinute: k.rateLimitPerMinute,
       lastUsedAt: k.lastUsedAt,
       lastUsedIp: k.lastUsedIp,
       expiresAt: k.expiresAt,
@@ -58,6 +67,9 @@ export const GET = withDbSafe<NextRequest>(async (req) => {
 // ---------------------------------------------------------------------------
 // POST /api/settings/api-keys
 // Creates a new key. Returns the plaintext ONE TIME ONLY with 201 Created.
+//
+// NOTE: api_keys.user_id is a uuid. We pass user.supabaseId (the Supabase
+// Auth UUID) as the userId — NOT user.id (the cuid from users.id).
 // ---------------------------------------------------------------------------
 
 const createSchema = z.object({
@@ -69,6 +81,18 @@ const createSchema = z.object({
   scopes: z
     .array(z.enum(['read', 'execute', 'admin']))
     .min(1, 'At least one scope is required'),
+  allowedIps: z
+    .array(z.string().trim().min(1))
+    .max(50, 'At most 50 IP allowlist entries')
+    .optional()
+    .default([]),
+  rateLimitPerMinute: z
+    .number()
+    .int()
+    .min(1, 'Rate limit must be at least 1/min')
+    .max(10000, 'Rate limit must be at most 10000/min')
+    .nullable()
+    .optional(),
   expiresInDays: z
     .number()
     .int()
@@ -100,26 +124,24 @@ export const POST = withDbSafe<NextRequest>(async (req) => {
     )
   }
 
-  const { label, scopes, expiresInDays } = parsed.data
+  const { label, scopes, allowedIps, rateLimitPerMinute, expiresInDays } = parsed.data
   const user = await getDemoUser(req)
 
-  // Diagnostic: log the user state so we can see if user.id is valid
+  // Diagnostic: log the user state so we can see if user.supabaseId is valid
   console.log('[POST /api/settings/api-keys] user:', {
     id: user.id,
     supabaseId: user.supabaseId,
     email: user.email,
-    idLength: user.id.length,
   })
 
-  // If user.id is empty, the user row wasn't created in the DB — all
-  // writes will fail with FK constraint. Return a clear error.
-  if (!user.id) {
+  // If user.supabaseId is empty, we can't create the api_keys row (user_id
+  // is NOT NULL uuid). Return a clear error.
+  if (!user.supabaseId) {
     return NextResponse.json(
       {
         error:
-          'Your account exists in Supabase Auth but not in the users table. ' +
-          'This usually means the users table is missing or the DB connection ' +
-          'uses a role without insert permissions. ' +
+          'Your account is missing a Supabase Auth UUID. ' +
+          'This usually means the Supabase session is malformed. ' +
           'Visit /api/debug/db-health for diagnostics.',
         errorDetail: {
           userId: '(empty)',
@@ -131,9 +153,10 @@ export const POST = withDbSafe<NextRequest>(async (req) => {
     )
   }
 
-  // Cap active keys per user to prevent runaway growth
+  // Cap active keys per user to prevent runaway growth.
+  // Filter by supabaseId (api_keys.user_id is the supabase UUID).
   const activeCount = await db.apiKey.count({
-    where: { userId: user.id, revokedAt: null },
+    where: { userId: user.supabaseId, revokedAt: null },
   })
   if (activeCount >= 25) {
     return NextResponse.json(
@@ -151,38 +174,44 @@ export const POST = withDbSafe<NextRequest>(async (req) => {
     : null
 
   console.log('[POST /api/settings/api-keys] creating key:', {
-    userId: user.id,
+    userId: user.supabaseId,
     keyPrefix: prefix,
     label,
   })
 
+  // Create the key.
+  // - userId: supabaseId (uuid) — NOT users.id (text/cuid)
+  // - scopes: Json → pass the array directly (Prisma serializes to jsonb)
+  // - allowedIps: Json → pass the array directly
   const created = await db.apiKey.create({
     data: {
-      userId: user.id,
+      userId: user.supabaseId,
       keyHash: hash,
       keyPrefix: prefix,
       label,
-      scopes: serializeScopes(scopes as ApiScope[]),
+      scopes: scopesToJson(scopes as ApiScope[]),
+      allowedIps: allowedIpsToJson(allowedIps),
+      rateLimitPerMinute: rateLimitPerMinute ?? null,
       expiresAt,
     },
   })
 
   console.log('[POST /api/settings/api-keys] key created:', created.id)
 
-  // Audit: record creation (no plaintext, no hash — just metadata)
-  // NOTE: userId must be the Supabase Auth UUID (user.supabaseId), NOT
-  // user.id (cuid), because settings_audit_logs.user_id is a uuid column
-  // referencing auth.users(id). apiKeyId is set to null because api_keys.id
-  // is a cuid (text) which can't be stored in the uuid column.
+  // Audit: record creation (no plaintext, no hash — just metadata).
+  // - userId: supabaseId (uuid) for settings_audit_logs.user_id
+  // - apiKeyId: created.id (uuid) — now matches the column type!
   const ctx = auditContext(req)
   await writeAuditLog({
     userId: user.supabaseId,
     action: 'api_key.create',
-    apiKeyId: null,
+    apiKeyId: created.id,
     apiKeyLabel: created.label,
     diff: {
       label: created.label,
       scopes: parseScopes(created.scopes),
+      allowedIps: parseAllowedIps(created.allowedIps),
+      rateLimitPerMinute: created.rateLimitPerMinute,
       expiresAt: created.expiresAt?.toISOString() ?? null,
       keyPrefix: created.keyPrefix,
     },
@@ -197,6 +226,8 @@ export const POST = withDbSafe<NextRequest>(async (req) => {
       plaintext, // ← returned ONCE. Never retrievable again.
       keyMasked: maskApiKey(prefix),
       scopes: parseScopes(created.scopes),
+      allowedIps: parseAllowedIps(created.allowedIps),
+      rateLimitPerMinute: created.rateLimitPerMinute,
       expiresAt: created.expiresAt,
       createdAt: created.createdAt,
     },

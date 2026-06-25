@@ -142,30 +142,41 @@ export async function GET() {
   }
 
   // --- 4. Write test (only if user is logged in + api_keys table exists) ----
-  if (result.auth.hasSession && result.auth.userId && result.tables.api_keys?.readable) {
-    // First, try with the default Prisma behavior (cuid for id).
-    // If that fails with P2023 (UUID error), we know the id column is uuid.
+  // NOTE: api_keys.id is uuid (gen_random_uuid), api_keys.user_id is uuid
+  // referencing auth.users.id (= users.supabase_id). So we MUST pass the
+  // Supabase UUID as user_id — NOT the users.id (text/cuid).
+  if (result.auth.hasSession && result.auth.userSupabaseId && result.tables.api_keys?.readable) {
     try {
       const { generateApiKey, serializeScopes } = await import('@/lib/api-auth')
       const { hash, prefix } = generateApiKey()
 
-      // Use a raw SQL insert with gen_random_uuid() to bypass Prisma's
-      // @default(cuid()). This tells us if the ONLY issue is the id type.
+      // Use a raw SQL insert with gen_random_uuid() for the id, and pass the
+      // user's Supabase UUID as user_id. The scopes column is jsonb, so we
+      // cast the JSON string explicitly.
       const uuidResult = await db.$queryRaw<{ id: string }[]>`
-        INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label, scopes, created_at)
-        VALUES (gen_random_uuid(), ${result.auth.userId}, ${hash}, ${prefix}, '__healthcheck__', ${serializeScopes(['read'])}, NOW())
+        INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label, scopes, allowed_ips, created_at)
+        VALUES (
+          gen_random_uuid(),
+          ${result.auth.userSupabaseId}::uuid,
+          ${hash},
+          ${prefix},
+          '__healthcheck__',
+          ${serializeScopes(['read'])}::jsonb,
+          '[]'::jsonb,
+          NOW()
+        )
         RETURNING id
       `
       const insertedId = uuidResult[0]?.id as string
-      // Clean up immediately
-      await db.$executeRaw`DELETE FROM api_keys WHERE id = ${insertedId}::text`
+      // Clean up immediately. id is uuid, so cast the parameter to uuid.
+      await db.$executeRaw`DELETE FROM api_keys WHERE id = ${insertedId}::uuid`
 
-      result.writeTest = { ok: true, triedWith: 'gen_random_uuid() via raw SQL' }
+      result.writeTest = { ok: true, triedWith: 'gen_random_uuid() + supabaseId via raw SQL' }
     } catch (e: unknown) {
       const err = e as { code?: string; message?: string; meta?: unknown }
       result.writeTest = {
         ok: false,
-        triedWith: 'gen_random_uuid() via raw SQL',
+        triedWith: 'gen_random_uuid() + supabaseId via raw SQL',
         error: `${err?.code ?? ''}: ${err?.message?.slice(0, 400) ?? 'Unknown'}`,
       }
     }

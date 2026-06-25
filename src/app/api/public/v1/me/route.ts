@@ -10,6 +10,12 @@ import { db } from '@/lib/db'
 
 // GET /api/public/v1/me
 // Demo endpoint to validate an API key. Requires `read` scope.
+//
+// NOTE: api_keys.user_id is a uuid = users.supabase_id. All api_keys queries
+// filter by auth.user.supabaseId. There is no Prisma relation between
+// ApiKey ↔ ApiRequestLog, so log queries are two-step:
+//   1. Find the user's key IDs
+//   2. Query api_request_logs WHERE api_key_id IN (keyIds)
 export async function GET(req: Request) {
   const started = Date.now()
   const auth = await authenticateApiKey(req)
@@ -29,15 +35,29 @@ export async function GET(req: Request) {
 
   const ip = getClientIp(req)
 
-  // Count active keys + total request logs as a tiny dashboard for the caller
-  const [activeKeys, totalRequests] = await Promise.all([
-    db.apiKey.count({
-      where: { userId: auth.user.id, revokedAt: null },
-    }),
-    db.apiRequestLog.count({
-      where: { apiKey: { userId: auth.user.id } },
-    }),
-  ])
+  // Count active keys + total request logs as a tiny dashboard for the caller.
+  // - api_keys.user_id is a uuid = auth.user.supabaseId
+  // - For api_request_logs, do a two-step query (no Prisma relation).
+  let activeKeys = 0
+  let totalRequests = 0
+  try {
+    activeKeys = await db.apiKey.count({
+      where: { userId: auth.user.supabaseId, revokedAt: null },
+    })
+
+    const userKeys = await db.apiKey.findMany({
+      where: { userId: auth.user.supabaseId },
+      select: { id: true },
+    })
+    const keyIds = userKeys.map((k) => k.id)
+    if (keyIds.length > 0) {
+      totalRequests = await db.apiRequestLog.count({
+        where: { apiKeyId: { in: keyIds } },
+      })
+    }
+  } catch (e) {
+    console.error('[/api/public/v1/me] stats query failed:', e)
+  }
 
   const durationMs = Date.now() - started
   await logApiRequest({

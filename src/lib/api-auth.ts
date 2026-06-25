@@ -6,11 +6,27 @@ import { getCurrentUser, type SessionUser } from '@/lib/session'
 // ===========================================================================
 // API authentication + authorization layer
 // ===========================================================================
-// FULL INTEGRATION: The `api_keys` table is shared with BIweb and does NOT
-// have `allowed_ips` or `rate_limit_per_minute` columns. Those features have
-// been removed from persistence:
-//   - Rate limiting is now in-memory only, using the global default (60/min).
-//   - IP allowlisting is removed (always allows).
+// FULL INTEGRATION: The `api_keys` table is shared with BIweb. It DOES have
+// the `allowed_ips` (jsonb, NOT NULL) and `rate_limit_per_minute` (integer
+// nullable) columns — verified via information_schema.
+//
+// Schema notes (verified against the actual Supabase DB):
+//   - `api_keys.id`                → uuid (gen_random_uuid)
+//   - `api_keys.user_id`           → uuid → references auth.users.id
+//                                    (= users.supabase_id, NOT users.id)
+//   - `api_keys.scopes`            → jsonb default '[]'
+//   - `api_keys.allowed_ips`       → jsonb default '[]' (NOT NULL)
+//   - `api_keys.rate_limit_per_minute` → integer nullable
+//   - `api_keys.last_used_ip`      → inet
+//   - `api_keys.revoked_at`        → timestamptz
+//   - `api_keys.last_used_at`      → timestamptz
+//   - `api_keys.expires_at`        → timestamptz
+//   - `api_keys.created_at`        → timestamptz
+//
+// Because users.id (text/cuid) and api_keys.user_id (uuid) differ in type,
+// there is NO Prisma relation between User ↔ ApiKey. We resolve the user
+// from an API key via a separate `db.user.findUnique({ where: { supabaseId:
+// apiKey.userId } })` query.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -22,9 +38,10 @@ export type ApiScope = 'read' | 'execute' | 'admin'
 export const ALL_SCOPES: ApiScope[] = ['read', 'execute', 'admin']
 
 export interface AuthenticatedUser {
-  /** users.id (cuid) — used as FK for api_keys.user_id */
+  /** users.id (cuid) — NOT used for api_keys (those use supabaseId/uuid). */
   id: string
-  /** users.supabase_id (UUID) — used for settings_audit_logs.user_id */
+  /** users.supabase_id (UUID) — used as api_keys.user_id (uuid) and
+   *  settings_audit_logs.user_id (uuid). */
   supabaseId: string
   email: string
   name: string | null
@@ -40,6 +57,10 @@ export interface AuthenticatedApiKey {
   scopes: ApiScope[]
   prefix: string
   lastUsedAt: Date | null
+  /** IP allowlist (empty array = allow all IPs). */
+  allowedIps: string[]
+  /** Per-key rate limit (null = use global default). */
+  rateLimitPerMinute: number | null
 }
 
 export interface AuthSuccess {
@@ -136,20 +157,63 @@ export function maskApiKey(prefix: string): string {
 // Scope helpers
 // ---------------------------------------------------------------------------
 
-export function parseScopes(scopesJson: string): ApiScope[] {
-  try {
-    const parsed = JSON.parse(scopesJson) as unknown
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((s): s is ApiScope =>
-      typeof s === 'string' && ALL_SCOPES.includes(s as ApiScope),
-    )
-  } catch {
-    return []
+/**
+ * Parses scopes from a Json column value (Prisma returns jsonb as a parsed
+ * JS value — array or object). Also accepts a JSON string for backwards
+ * compatibility (raw SQL or older rows).
+ */
+export function parseScopes(scopesJson: unknown): ApiScope[] {
+  let parsed: unknown = scopesJson
+  if (typeof scopesJson === 'string') {
+    try {
+      parsed = JSON.parse(scopesJson)
+    } catch {
+      return []
+    }
   }
+  if (!Array.isArray(parsed)) return []
+  return parsed.filter((s): s is ApiScope =>
+    typeof s === 'string' && ALL_SCOPES.includes(s as ApiScope),
+  )
 }
 
+/**
+ * Parses the `allowed_ips` jsonb column (Prisma returns it as a parsed
+ * array). Also accepts a JSON string for backwards compatibility.
+ */
+export function parseAllowedIps(json: unknown): string[] {
+  let parsed: unknown = json
+  if (typeof json === 'string') {
+    try {
+      parsed = JSON.parse(json)
+    } catch {
+      return []
+    }
+  }
+  if (!Array.isArray(parsed)) return []
+  return parsed.filter((s): s is string => typeof s === 'string' && s.length > 0)
+}
+
+/**
+ * Serializes scopes to a JSON string (used by raw SQL inserts only).
+ * For Prisma writes (Json column), pass the array directly.
+ */
 export function serializeScopes(scopes: ApiScope[]): string {
   return JSON.stringify([...new Set(scopes)])
+}
+
+/**
+ * Returns a deduped array of scopes for storage as a Prisma Json value.
+ */
+export function scopesToJson(scopes: ApiScope[]): ApiScope[] {
+  return [...new Set(scopes)]
+}
+
+/**
+ * Cleans an IP allowlist for storage as a Prisma Json value.
+ */
+export function allowedIpsToJson(ips: string[]): string[] {
+  return ips.filter((ip) => typeof ip === 'string' && ip.length > 0)
 }
 
 /**
@@ -196,9 +260,14 @@ export function getClientIp(req: Request | NextRequest): string | null {
 /**
  * Validates an incoming Bearer token against the DB.
  * - Rejects revoked / expired keys
+ * - Enforces IP allowlist (if `allowed_ips` is non-empty)
  * - Updates lastUsedAt + lastUsedIp as a side effect
  *
  * Returns discriminated union — callers should check `result.ok`.
+ *
+ * NOTE: api_keys.user_id is a uuid that references auth.users.id, NOT
+ * users.id (text/cuid). There is no Prisma relation, so we resolve the
+ * user with a separate `db.user.findUnique({ where: { supabaseId } })`.
  */
 export async function authenticateApiKey(req: Request): Promise<AuthResult> {
   const token = extractBearerToken(req)
@@ -218,9 +287,10 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
   }
 
   const hash = hashApiKey(token)
+  // No `include: { user: true }` because the User ↔ ApiKey relation was
+  // removed (types differ: text vs uuid). Fetch the key first.
   const apiKey = await db.apiKey.findUnique({
     where: { keyHash: hash },
-    include: { user: true },
   })
 
   if (!apiKey) {
@@ -233,9 +303,31 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
     return { ok: false, error: 'API key has expired.', status: 401 }
   }
 
-  // Rate limit (in-memory token bucket per key, global default 60/min)
-  const limit = DEFAULT_RATE_LIMIT_PER_MINUTE
-  const rate = checkRateLimit(apiKey.id)
+  // Resolve the user from the API key's user_id (which is the supabase UUID).
+  const dbUser = await db.user.findUnique({
+    where: { supabaseId: apiKey.userId },
+  })
+  if (!dbUser) {
+    return { ok: false, error: 'API key owner not found.', status: 401 }
+  }
+
+  // IP allowlist: if non-empty, the request IP must be in the list.
+  const allowedIps = parseAllowedIps(apiKey.allowedIps)
+  if (allowedIps.length > 0) {
+    const clientIp = getClientIp(req)
+    if (!clientIp || !allowedIps.includes(clientIp)) {
+      return {
+        ok: false,
+        error: `IP ${clientIp ?? '(unknown)'} is not in this key's allowlist.`,
+        status: 403,
+      }
+    }
+  }
+
+  // Rate limit (in-memory token bucket per key).
+  // Per-key limit takes precedence; fall back to global default.
+  const limit = apiKey.rateLimitPerMinute ?? DEFAULT_RATE_LIMIT_PER_MINUTE
+  const rate = checkRateLimit(apiKey.id, limit)
   if (!rate.ok) {
     return {
       ok: false,
@@ -262,11 +354,11 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
   return {
     ok: true,
     user: {
-      id: apiKey.user.id,
-      supabaseId: apiKey.user.supabaseId,
-      email: apiKey.user.email,
-      name: apiKey.user.name,
-      role: apiKey.user.role,
+      id: dbUser.id,
+      supabaseId: dbUser.supabaseId,
+      email: dbUser.email,
+      name: dbUser.name,
+      role: dbUser.role,
     },
     apiKey: {
       id: apiKey.id,
@@ -274,6 +366,8 @@ export async function authenticateApiKey(req: Request): Promise<AuthResult> {
       scopes: parseScopes(apiKey.scopes),
       prefix: apiKey.keyPrefix,
       lastUsedAt: apiKey.lastUsedAt,
+      allowedIps,
+      rateLimitPerMinute: apiKey.rateLimitPerMinute,
     },
     rateLimit: {
       limit,
@@ -339,6 +433,8 @@ export const DEFAULT_RATE_LIMIT_PER_MINUTE = 60
 interface RateBucket {
   tokens: number
   lastRefill: number
+  /** Capacity snapshot so we can detect when the per-key limit changes. */
+  capacity: number
 }
 
 const DEFAULT_REFILL_INTERVAL_MS = 60_000 // 1 minute
@@ -356,18 +452,20 @@ globalForRate.__rateBuckets = buckets
  * Returns { ok: true } if the request is allowed, or { ok: false, retryAfter }
  * with seconds-to-wait if the bucket is empty.
  *
- * Uses the global default (60 req/min). Per-key custom limits are not
- * persisted in integrated mode (BIweb's api_keys table has no such column).
+ * Pass the per-key capacity (from api_keys.rate_limit_per_minute); falls
+ * back to DEFAULT_RATE_LIMIT_PER_MINUTE when null/undefined.
  */
 export function checkRateLimit(
   apiKeyId: string,
+  capacity: number = DEFAULT_RATE_LIMIT_PER_MINUTE,
 ): { ok: true; remaining: number } | { ok: false; retryAfter: number; remaining: 0 } {
-  const capacity = DEFAULT_RATE_LIMIT_PER_MINUTE
   const now = Date.now()
 
   let bucket = buckets.get(apiKeyId)
-  if (!bucket) {
-    bucket = { tokens: capacity, lastRefill: now }
+  // Create or reset the bucket if capacity changed (e.g. user updated the
+  // per-key limit) — otherwise stale token math produces wrong results.
+  if (!bucket || bucket.capacity !== capacity) {
+    bucket = { tokens: capacity, lastRefill: now, capacity }
     buckets.set(apiKeyId, bucket)
   }
 
@@ -407,6 +505,9 @@ export function pruneRateBuckets(maxSize = 10_000): void {
 // NOTE: settings_audit_logs.user_id is a UUID referencing auth.users(id).
 // Callers must pass the Supabase Auth UUID (SessionUser.supabaseId), NOT
 // the Prisma User.id (cuid).
+//
+// settings_audit_logs.api_key_id is a uuid nullable column. Since api_keys.id
+// is now uuid (gen_random_uuid), callers CAN pass the API key's id.
 // ---------------------------------------------------------------------------
 
 export type AuditAction = 'api_key.create' | 'api_key.update' | 'api_key.revoke'
@@ -415,7 +516,7 @@ export interface AuditEntry {
   /** Supabase Auth UUID — NOT users.id. Used for settings_audit_logs.user_id. */
   userId: string
   action: AuditAction
-  /** users.id (cuid) of the API key — stored as uuid (nullable) */
+  /** api_keys.id (uuid) — now matches the column type. Nullable. */
   apiKeyId?: string | null
   apiKeyLabel?: string | null
   /** Will be stored as jsonb. */

@@ -27,9 +27,10 @@ export const SESSION_COOKIE = 'dm_session_email'
 // ---------------------------------------------------------------------------
 
 export interface SessionUser {
-  /** users.id (cuid) — used as FK for api_keys.user_id */
+  /** users.id (cuid) — NOT used for api_keys (those use supabaseId/uuid). */
   id: string
-  /** users.supabase_id (UUID) — used for settings_audit_logs.user_id */
+  /** users.supabase_id (UUID) — used as api_keys.user_id (uuid) and
+   *  settings_audit_logs.user_id (uuid). */
   supabaseId: string
   email: string
   name: string | null
