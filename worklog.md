@@ -3048,3 +3048,45 @@ Unresolved Issues / Risks:
 - SSL "Not secure" warning still pending.
 - Phase 2 (upload/update) not yet implemented — next milestone after
   Phase 1 is verified working.
+
+---
+Task ID: 25 (main agent — Phase 1.1 step-by-step consultation)
+Agent: main (Z.ai Code)
+Task: User wants to work step-by-step on finding BIweb's host path for
+the shared volume configuration. User suggested the path might be in
+the Supabase DB (data_sources.file_path). Provide ONE focused
+instruction at a time instead of dumping many steps at once.
+
+Work Log:
+- Read worklog to understand full context (Tasks 1-24): project is
+  datamind-keys API Keys Manager, Phase 1 live SQL execution is
+  code-complete but blocked on Coolify shared volume config.
+- Reviewed the storage architecture from Task 24:
+  - BIweb writes SQLite to /home/z/my-project/upload/{file_name} (container path)
+  - datamind-keys is in a separate container, can't access BIweb's FS
+  - Need the HOST path to mount the same volume in both containers
+- User's suggestion is correct: data_sources.file_path in Supabase
+  is the right first place to look. It will reveal the exact path
+  format BIweb uses internally.
+- Provided a single, focused instruction: run a SELECT on
+  data_sources in Supabase SQL Editor to inspect the file_path
+  column format. Waiting for user to paste back the result before
+  proceeding to step 2.
+- Did NOT make code changes — this is a consultation step. No
+  sandbox changes needed.
+
+Stage Summary:
+- Step 1 of the step-by-step approach is delivered: one SQL query
+  for the user to run in their Supabase dashboard.
+- Next step (step 2) depends on what file_path format the user
+  reports back:
+  - If absolute container path → need Coolify persistent storage
+    config (host path)
+  - If relative path → need BIweb's working directory
+  - If Storage path → revisit the Supabase Storage download approach
+- No deploy needed, no code changes. Pure consultation.
+
+Unresolved Issues / Risks:
+- Waiting on user to run the SQL query and report file_path format.
+- Phase 1 (live SQL execution) still blocked on shared volume config.
+- SSL "Not secure" warning still pending.
