@@ -20,10 +20,20 @@ WORKDIR /app
 # Cache-bust: change this value in Coolify (1 → 2 → 3...) each time you push
 # new code to the repo, to force Docker to re-run git clone and pull the
 # latest commit instead of using a cached layer.
+#
+# IMPORTANT: We reference $CACHEBUST in the RUN below. Per Docker docs, an ARG
+# that is declared but NOT referenced in any RUN command does NOT invalidate
+# the build cache. Referencing it here guarantees that bumping CACHEBUST in
+# Coolify forces git clone to re-run and pull the latest commit.
 ARG CACHEBUST=6
 
-# Clone the public repo (no credentials needed — repo is public)
-RUN git clone --depth 1 https://github.com/fcruzp/datamind-keys.git .
+# Clone the public repo (no credentials needed — repo is public).
+# The `echo $CACHEBUST` makes the layer's cache key depend on CACHEBUST, so
+# changing it always busts the cache. The `git rev-parse HEAD` logs which
+# commit was actually cloned so you can verify the deploy in build logs.
+RUN echo "CACHEBUST=$CACHEBUST" && \
+    git clone --depth 1 https://github.com/fcruzp/datamind-keys.git . && \
+    echo "Deployed commit: $(git rev-parse HEAD)"
 
 # Install dependencies (npm works fine with bun.lock present)
 RUN npm install
