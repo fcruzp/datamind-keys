@@ -118,6 +118,9 @@ export function CreateApiKeyDialog({
     onSuccess: (created) => {
       qc.invalidateQueries({ queryKey: ['api-keys'] })
       qc.invalidateQueries({ queryKey: ['api-keys-usage'] })
+      // Refresh auth/me so the dashboard "Active keys" stat card + sidebar
+      // badge stay in sync with the real key count after creation.
+      qc.invalidateQueries({ queryKey: ['auth-me'] })
       setOpen(false)
       toast.success(`API key “${created.label}” created`)
       onCreated(created)

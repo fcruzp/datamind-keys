@@ -132,6 +132,9 @@ export function ApiKeysManager() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['api-keys'] })
       qc.invalidateQueries({ queryKey: ['api-keys-usage'] })
+      // Refresh auth/me so the dashboard "Active keys" stat card + sidebar
+      // badge stay in sync after a key is revoked (activeKeys decreases).
+      qc.invalidateQueries({ queryKey: ['auth-me'] })
       toast.success('API key revoked')
     },
     onError: (err: Error) => toast.error(err.message),

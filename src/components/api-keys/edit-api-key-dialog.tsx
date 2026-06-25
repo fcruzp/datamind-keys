@@ -61,6 +61,9 @@ export function EditApiKeyDialog({
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['api-keys'] })
+      // Refresh auth/me too — keeps the dashboard stats consistent even
+      // though editing the label doesn't change the active count.
+      qc.invalidateQueries({ queryKey: ['auth-me'] })
       setOpen(false)
       toast.success('API key updated')
     },
