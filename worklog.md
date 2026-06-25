@@ -2014,3 +2014,43 @@ Unresolved Issues / Risks:
      DIRECT_URL marked as "Available at Buildtime" in Coolify)
   c) If RLS is blocking → need to use the service_role key in the DATABASE_URL
      or add an RLS policy that allows the postgres role to insert
+
+---
+Task ID: 10 (main agent — root cause P2023 UUID error)
+Agent: main (Z.ai Code)
+Task: User ran /api/debug/db-health. Result: DB connected, auth works,
+all 4 tables exist + readable, BUT writeTest fails with:
+"P2023: Inconsistent column data: Error creating UUID, invalid character:
+expected an optional prefix of `urn:uuid:` followed by [0-9a-fA-F-], found `m` at 2"
+
+Work Log:
+- Analyzed the P2023 error: Postgres is trying to cast a cuid (starts with
+  "cm...") to UUID. The "m" at position 1 is not a valid hex char.
+- This means one of the api_keys columns is type `uuid` in the actual DB,
+  but our Prisma schema generates `@default(cuid())` for the id.
+- The user.id is `cmp3avcho0000ms01l2ym2986` (cuid) and users table reads
+  work fine → users.id is text. So the issue is specifically api_keys.id
+  (and possibly api_request_logs.id).
+- Updated /api/debug/db-health to:
+  1. Query information_schema.columns for ALL columns of all 4 tables —
+     shows exact data_type (text vs uuid) + column_default.
+  2. Write test now uses raw SQL with gen_random_uuid() instead of Prisma's
+     @default(cuid()). If this succeeds, we confirm the id column is uuid.
+- Committed: a49ed95
+- Pushed to GitHub main.
+
+Stage Summary:
+- Diagnostic v2 deployed. User needs to:
+  1. Bump CACHEBUST → 9 in Coolify
+  2. Redeploy
+  3. Open https://datamind-api.mooo.com/api/debug/db-health again
+  4. Send me the full JSON — especially the new `columnTypes` section
+     and the `writeTest` result
+- Once I see the column types, I'll update the Prisma schema to use
+  @default(uuid()) @db.Uuid for the id columns that are actually uuid.
+
+Unresolved Issues / Risks:
+- Don't know yet which columns are uuid vs text (waiting for columnTypes)
+- Hypothesis: api_keys.id and api_request_logs.id are uuid, users.id is text
+- If api_keys.user_id is also uuid (referencing users.id text), that's a
+  broken FK in the actual DB — but unlikely since the user was found
