@@ -2362,3 +2362,76 @@ Unresolved Issues / Risks:
   still pending.
 - The frontend UI still doesn't expose `allowedIps` / `rateLimitPerMinute`
   form fields (Task 11 noted this).
+
+---
+Task ID: 15 (main agent — fix Docker cache-bust that blocked deploys)
+Agent: main (Z.ai Code)
+Task: User reported the TDZ error STILL occurs after login, with the
+EXACT same stack trace as before (same chunk filename
+32nm_jwn3appf.js, same line:col 1:87453). This means the deployed
+bundle did not change despite my fix (commit e0680db) being pushed.
+
+Work Log:
+- Verified my CopyButton TDZ fix is correct in the repo:
+  - src/components/ui/copy-button.tsx lines 37-38 now read
+    `copyIcon: CopyIcon = Copy,` / `checkIcon: CheckIcon = Check,`
+    (local bindings renamed, no shadowing of imported Copy/Check).
+  - Confirmed commits e0680db + dec68c1 are pushed to origin/main.
+  - Searched all of src/ for other `: X = X` shadowing patterns →
+    found NONE. The CopyButton was the only one.
+- Key diagnostic: the chunk filename `32nm_jwn3appf.js` is a content
+  hash in Next.js production builds. If the source changed, the hash
+  MUST change. The hash being identical before and after the "redeploy"
+  proves the deployed bundle is the OLD one — my fix never shipped.
+- Inspected the Dockerfile and found the root cause:
+    ARG CACHEBUST=6          ← declared
+    RUN git clone ...         ← NEVER references $CACHEBUST
+  Per Docker docs: "An ARG instruction that's defined but not used in
+  any RUN command has NO effect on the build cache." So bumping
+  CACHEBUST in Coolify did NOT invalidate the cached `git clone` layer.
+  Docker kept reusing the old cloned source (from the c8efcec build),
+  so e0680db's fix never made it into the bundle.
+- Fix: referenced `$CACHEBUST` in the git clone RUN command:
+    RUN echo "CACHEBUST=$CACHEBUST" && \
+        git clone --depth 1 https://github.com/fcruzp/datamind-keys.git . && \
+        echo "Deployed commit: $(git rev-parse HEAD)"
+  The `echo $CACHEBUST` makes the layer's cache key depend on the ARG
+  value, so changing it ALWAYS busts the cache and forces a fresh clone.
+  The `git rev-parse HEAD` prints the actual deployed commit hash in
+  Coolify build logs, so the user can verify which commit shipped.
+- This cascades correctly: git clone layer changes → npm install layer
+  invalidated → prisma generate invalidated → COPY from deps invalidated
+  → npm run build invalidated → NEW bundle with NEW chunk hashes.
+- Committed as 265f1b7, pushed to fcruzp/datamind-keys main.
+
+Stage Summary:
+- The Docker cache-bust was BROKEN since the first Dockerfile version.
+  The ARG was declared but never referenced, so it had zero effect on
+  Docker's layer cache. This explains why some deploys "worked" (cache
+  had been evicted naturally) and others didn't (cache hit = old code).
+- With this fix, bumping CACHEBUST in Coolify now GUARANTEED invalidates
+  the git clone layer and pulls the latest commit.
+- User needs to:
+  1. Bump CACHEBUST → 14 in Coolify (any new value triggers the bust)
+  2. IMPORTANT: For THIS deploy only, also enable "Disable build cache"
+     / "--no-cache" in Coolify's build settings if available, to clear
+     any lingering old layers from before the fix. After this deploy,
+     normal CACHEBUST bumps will work reliably.
+  3. Redeploy
+  4. Check the Coolify build logs for "Deployed commit: <hash>" — it
+     should show 265f1b7 (or later). If it shows an older commit, the
+     cache is still stale.
+  5. After deploy, hard-refresh the browser (Ctrl+Shift+R) to clear
+     any cached browser assets.
+  6. The TDZ error should be gone. The chunk filename will be DIFFERENT
+     from 32nm_jwn3appf.js (proving the new bundle shipped).
+
+Unresolved Issues / Risks:
+- If the user's Coolify has a persistent Docker build cache from before
+  this fix, the first redeploy might still hit a stale layer for
+  npm install or npm run build (even though git clone is now busted).
+  A --no-cache build for the first deploy after this fix eliminates
+  that risk.
+- The SSL "Not secure" warning (Task 8) is still pending.
+- The frontend UI still doesn't expose allowedIps / rateLimitPerMinute
+  form fields (Task 11 noted this).
