@@ -2672,3 +2672,51 @@ Unresolved Issues / Risks:
 - Docker cache-bust fix (Task 15) still pending deploy for the TDZ
   dashboard crash (independent of API testing).
 - SSL "Not secure" warning still pending (Task 8).
+
+---
+Task ID: 20 (main agent — fix OpenFN state.data capture after request())
+Agent: main (Z.ai Code)
+Task: User re-ran with the request() fix (Task 19). POST /queries now
+returns 200 OK (the request worked!), but the logging crashed with
+"TypeError: Cannot read properties of undefined (reading '0')" on
+state.queryResult.rows[0].
+
+Work Log:
+- Analyzed the run log:
+  - GET /me           → 200 ✓
+  - GET /datasources  → 200 ✓
+  - GET /dashboards   → 200 ✓
+  - POST /queries     → 200 ✓ ← THE REQUEST WORKED!
+  - Then crash: "Cannot read properties of undefined (reading '0')" at
+    state.queryResult.rows[0]
+- Root cause: I assumed request() mutates state in place and writes the
+  response body to state.data. It does NOT. request() returns a function
+  (state) => Promise<NEW_STATE>. The resolved value is a NEW state
+  object with .data populated. Reading the OLD `state.data` after the
+  await gives undefined (stale closure — the old state was never mutated).
+- Fix: capture the return value of await request(...)(state) into a new
+  variable and read .data from THAT:
+    const nextState = await request('POST', path, opts)(state);
+    state.queryResult = nextState.data;  // ← not state.data
+- Updated openfn/test-all-endpoints.js with the capture pattern.
+- Committed as c03261b, pushed to fcruzp/datamind-keys main.
+
+Stage Summary:
+- The API call itself is confirmed working: POST /queries → 200 in 351ms.
+  The server received the body correctly (sql, datasourceId, limit),
+  authenticated the Bearer token, validated the execute scope, ran the
+  sandboxed SELECT, and returned the result.
+- The crash was purely client-side: reading state.data (stale) instead
+  of nextState.data (fresh return value from request()).
+- The user needs to update STEP 4 in their OpenFn Job with the new
+  capture pattern (const nextState = await request(...)(state)), then
+  re-run. Should now show 4/4 endpoints OK with query results printed.
+
+Unresolved Issues / Risks:
+- This is the 4th iteration on STEP 4. The pattern is now:
+    request('POST', path, { body: {obj}, headers: {ct:json} })(state)
+    → returns Promise<newState> where newState.data = response body
+  This matches the user's working Government Payments example.
+- Docker cache-bust fix (Task 15) still pending for the TDZ dashboard
+  crash (independent of API testing).
+- SSL "Not secure" warning still pending (Task 8).
