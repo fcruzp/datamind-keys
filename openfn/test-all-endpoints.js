@@ -152,7 +152,11 @@ fn(state => {
 // await request(...)(state). The response body lands in state.data.
 fn(async (state) => {
   try {
-    await request('POST', '/api/public/v1/queries', {
+    // request() returns a function (state) => Promise<state>. The resolved
+    // value is the NEW state object with state.data populated by the
+    // response body. We MUST capture the return value — reading the old
+    // `state` after the await gives stale data (state.data is undefined).
+    const nextState = await request('POST', '/api/public/v1/queries', {
       body: {
         sql: 'SELECT 1 AS one',
         datasourceId: 'demo',
@@ -163,8 +167,8 @@ fn(async (state) => {
       },
     })(state);
 
-    // request() wrote its response body into state.data.
-    state.queryResult = state.data;
+    // The response body is in nextState.data (not state.data).
+    state.queryResult = nextState.data;
 
     if (!state.queryResult || !state.queryResult.ok) {
       console.error('✗ /queries did not return ok:');
