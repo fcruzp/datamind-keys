@@ -2720,3 +2720,97 @@ Unresolved Issues / Risks:
 - Docker cache-bust fix (Task 15) still pending for the TDZ dashboard
   crash (independent of API testing).
 - SSL "Not secure" warning still pending (Task 8).
+
+---
+Task ID: 21 (main agent — tenant isolation audit of public API outputs)
+Agent: main (Z.ai Code)
+Task: User confirmed the OpenFn workflow succeeded (4/4 endpoints OK,
+status: success). User asked: "VERIFICA SI LOS OUTPUTS SOLO TRAE
+INFORMACION DEL TENANT. EL USUARIO QUE USE PARA ESO FUE Boceto Perez".
+
+Work Log:
+- Audited each of the 4 public API route handlers against the user's
+  actual run output to determine if the data returned is tenant-scoped
+  to Boceto Perez (bocettoapp@gmail.com) or shared/global.
+- Reviewed the Prisma schema to check what tables actually exist.
+
+Findings (per endpoint):
+
+1. GET /api/public/v1/me — ✅ TENANT-SCOPED (genuinely Boceto's data)
+   - Authenticates the Bearer token → resolves to Boceto's user record
+   - Returns Boceto's user.id, email, name
+   - account.activeKeys = db.apiKey.count({ where: { userId:
+     auth.user.supabaseId } }) → filtered by Boceto's UUID → returned 2
+   - account.totalApiRequests = db.apiRequestLog.count filtered by
+     Boceto's key IDs → returned 82
+   - NO other tenant can see these numbers. Genuine tenant isolation. ✓
+
+2. GET /api/public/v1/datasources — ❌ HARDCODED DEMO DATA
+   - The route handler (lines 30-59) defines a CONSTANT array of 3
+     datasources (Production Postgres, BigQuery Analytics, Legacy MySQL)
+   - NO database query, NO `where: { userId }` filter
+   - Every authenticated user sees the EXACT SAME 3 datasources
+   - Code comment confirms: "Demo data — in real DataMind BI this would
+     query the DataSource table"
+   - NOT tenant-scoped. Same for all tenants. ✗
+
+3. GET /api/public/v1/dashboards — ❌ HARDCODED DEMO DATA
+   - Same pattern: constant array of 4 dashboards (lines 30-63)
+   - NO database query, NO tenant filter
+   - Every user sees the same 4 dashboards (Revenue Overview, Product
+     Engagement, Support Operations, Infrastructure Health)
+   - NOT tenant-scoped. Same for all tenants. ✗
+
+4. POST /api/public/v1/queries — ❌ SYNTHETIC DEMO DATA
+   - Rows are synthesized with Array.from + Math.random (lines 66-71)
+   - The `sql` and `datasourceId` are echoed back but NOT executed
+   - NO database query, NO tenant filter
+   - NOT tenant-scoped. Random data, same for all tenants. ✗
+
+Root cause: the Prisma schema only has 4 tables (users, api_keys,
+api_request_logs, settings_audit_logs). There is NO DataSource model
+and NO Dashboard model. So these endpoints CAN'T query real per-tenant
+data — they return demo data to prove the API plumbing works.
+
+What IS tenant-scoped (the security/auth layer — solid):
+- Authentication: API key → resolves to Boceto's user record
+- Rate limiting: per-key token bucket (Boceto's key gets 60/min)
+- Audit logging: every request logged to api_request_logs with Boceto's
+  apiKeyId
+- The /me endpoint: returns Boceto's user info + account stats
+
+What is NOT tenant-scoped (the data layer — demo data):
+- /datasources: hardcoded array, same for all users
+- /dashboards: hardcoded array, same for all users
+- /queries: synthesized random rows, same for all users
+
+What it would take to make them tenant-specific:
+1. Create DataSource and Dashboard tables in the shared Supabase DB
+   (or check if BIweb already has them — it might, since BIweb is the
+   "parent" BI app)
+2. Add Prisma models with a userId/tenantId foreign key
+3. Change route handlers from hardcoded arrays to:
+   db.dataSource.findMany({ where: { userId: auth.user.supabaseId } })
+4. For /queries, actually execute the SQL against the tenant's
+   datasource (with sandboxing/RLS)
+
+Stage Summary:
+- Honest answer to user: only /me is truly tenant-scoped. The other 3
+  endpoints return hardcoded demo data that is IDENTICAL for every
+  authenticated user.
+- The AUTH layer is solid (key → user → tenant resolution works, rate
+  limiting + audit logging are per-key). The DATA layer is demo.
+- This is by design — the code comments explicitly say "Demo data — in
+  real DataMind BI this would query the X table."
+- For production use, the datasources/dashboards/queries endpoints need
+  to be wired to real per-tenant tables (which may exist in BIweb's
+  schema or need to be created).
+
+Unresolved Issues / Risks:
+- Need to check if BIweb (fcruzp/BIweb) already has DataSource/Dashboard
+  tables in its Prisma schema that we could mirror (like we did with
+  users/api_keys).
+- If BIweb has them, we add the models + change the route handlers.
+- If not, we need to design + create those tables (a bigger task).
+- Docker cache-bust fix (Task 15) still pending for TDZ dashboard crash.
+- SSL "Not secure" warning still pending (Task 8).
