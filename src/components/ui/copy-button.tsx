@@ -34,8 +34,8 @@ export const CopyButton = React.forwardRef<
     label = 'Copy',
     iconSize = 'size-3.5',
     showToast = true,
-    copyIcon: Copy = Copy,
-    checkIcon: Check = Check,
+    copyIcon: CopyIcon = Copy,
+    checkIcon: CheckIcon = Check,
     className,
     onClick,
     ...props
@@ -74,7 +74,7 @@ export const CopyButton = React.forwardRef<
       )}
       {...props}
     >
-      {copied ? <Check className={cn(iconSize)} /> : <Copy className={cn(iconSize)} />}
+      {copied ? <CheckIcon className={cn(iconSize)} /> : <CopyIcon className={cn(iconSize)} />}
     </button>
   )
 })
