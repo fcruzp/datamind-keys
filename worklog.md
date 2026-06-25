@@ -2549,3 +2549,51 @@ Unresolved Issues / Risks:
   up and serving API traffic; the TDZ crash was a client-side
   (dashboard) issue, not an API issue, so API testing works regardless.
 - SSL "Not secure" warning still pending (Task 8).
+
+---
+Task ID: 18 (main agent — fix OpenFN POST with raw fetch)
+Agent: main (Z.ai Code)
+Task: User re-ran the workflow with the JSON.stringify fix (Task 17).
+Still failed: POST /queries → 422 "sql: expected string, received
+undefined". Both approaches (object body AND stringified body + explicit
+content-type) produce the same 422 from @openfn/language-http v7.3.1.
+
+Work Log:
+- Diagnosed: the adaptor's post() in v7.3.1 has a persistent bug where
+  the `body` option — whether an object or a JSON.stringify'd string —
+  is NOT delivered to the server correctly. The server receives valid
+  JSON (req.json() doesn't throw → not a 400) but the parsed object has
+  no top-level `sql` field (→ 422 from Zod).
+- After two failed attempts with the adaptor's post(), switched to raw
+  fetch() inside an async fn() block. This bypasses the adaptor's body
+  serialization entirely and gives full control over:
+    1. Authorization header — set manually from state.configuration.token
+    2. Content-Type header — set to application/json
+    3. The exact JSON body string — JSON.stringify({...})
+- The user's note about "don't use fn() for HTTP calls" applies
+  specifically to the ADAPTOR's get()/post() operations (which silently
+  drop credential-injected headers when wrapped in fn()). Raw fetch()
+  is unaffected because we set the auth header MANUALLY — we don't rely
+  on the adaptor to inject it.
+- The 3 GET endpoints still use the adaptor's get() at top level (they
+  work correctly there). Only POST /queries switches to raw fetch().
+- Updated openfn/test-all-endpoints.js with the fetch-based approach +
+  a clear comment explaining why we deviated from the adaptor's post().
+- Committed as 9f6a40c, pushed to fcruzp/datamind-keys main.
+
+Stage Summary:
+- Root cause: @openfn/language-http v7.3.1 post() body serialization bug
+  (both object and stringified-string bodies arrive at the server without
+  the expected top-level fields).
+- Fix: use raw fetch() inside fn(async state => {...}) with manual auth.
+- The user needs to update STEP 4 in their OpenFn Job with the new
+  fn(async state => {...}) block, then re-run.
+- No server-side redeploy needed — the DataMind BI API hasn't changed.
+- The existing API key still works (it passed /me validation in the
+  last run with scopes read+execute+admin).
+
+Unresolved Issues / Risks:
+- The Docker cache-bust fix (Task 15) — user should still deploy it to
+  fix the TDZ crash on the dashboard, but it's independent of the API
+  testing (the API works regardless).
+- SSL "Not secure" warning still pending (Task 8).
